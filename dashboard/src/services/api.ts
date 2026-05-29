@@ -74,6 +74,14 @@ export interface MessageResponse {
   timestamp: number;
 }
 
+export interface MediaMessagePayload {
+  url?: string;
+  base64?: string;
+  mimetype?: string;
+  filename?: string;
+  caption?: string;
+}
+
 export interface HealthStatus {
   status: 'ok' | 'error';
   timestamp?: string;
@@ -270,25 +278,25 @@ export const messageApi = {
       method: 'POST',
       body: JSON.stringify({ chatId, text }),
     }),
-  sendImage: (sessionId: string, chatId: string, url: string, caption?: string) =>
+  sendImage: (sessionId: string, chatId: string, media: MediaMessagePayload) =>
     request<MessageResponse>(`/sessions/${sessionId}/messages/send-image`, {
       method: 'POST',
-      body: JSON.stringify({ chatId, url, caption }),
+      body: JSON.stringify({ chatId, ...media }),
     }),
-  sendVideo: (sessionId: string, chatId: string, url: string, caption?: string) =>
+  sendVideo: (sessionId: string, chatId: string, media: MediaMessagePayload) =>
     request<MessageResponse>(`/sessions/${sessionId}/messages/send-video`, {
       method: 'POST',
-      body: JSON.stringify({ chatId, url, caption }),
+      body: JSON.stringify({ chatId, ...media }),
     }),
-  sendAudio: (sessionId: string, chatId: string, url: string) =>
+  sendAudio: (sessionId: string, chatId: string, media: MediaMessagePayload) =>
     request<MessageResponse>(`/sessions/${sessionId}/messages/send-audio`, {
       method: 'POST',
-      body: JSON.stringify({ chatId, url }),
+      body: JSON.stringify({ chatId, ...media }),
     }),
-  sendDocument: (sessionId: string, chatId: string, url: string, filename?: string) =>
+  sendDocument: (sessionId: string, chatId: string, media: MediaMessagePayload) =>
     request<MessageResponse>(`/sessions/${sessionId}/messages/send-document`, {
       method: 'POST',
-      body: JSON.stringify({ chatId, url, filename }),
+      body: JSON.stringify({ chatId, ...media }),
     }),
 };
 

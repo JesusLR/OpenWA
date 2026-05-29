@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Send, CheckCircle, XCircle, Loader2 } from 'lucide-react';
-import { messageApi } from '../services/api';
+import { messageApi, type MediaMessagePayload } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useRole } from '../hooks/useRole';
 import { useSessionsQuery, useSessionGroupsQuery } from '../hooks/queries';
@@ -17,10 +17,39 @@ interface ApiResponse {
 
 const messageTypes = ['text', 'image', 'video', 'audio', 'document'] as const;
 
+const mediaAcceptByType: Record<typeof messageTypes[number], string> = {
+  text: '',
+  image: 'image/*',
+  video: 'video/*',
+  audio: 'audio/*',
+  document: '*/*',
+};
+
+const readFileAsDataUrl = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result);
+        return;
+      }
+
+      reject(new Error('Unable to read the selected file'));
+    };
+
+    reader.onerror = () => {
+      reject(reader.error || new Error('Unable to read the selected file'));
+    };
+
+    reader.readAsDataURL(file);
+  });
+
 export function MessageTester() {
   const { t } = useTranslation();
   useDocumentTitle(t('messageTester.title'));
   const { canWrite } = useRole();
+  const mediaFileInputRef = useRef<HTMLInputElement>(null);
   const { data: allSessions = [], isLoading: loadingSessions } = useSessionsQuery();
   const sessions = allSessions.filter(s => s.status === 'ready');
   const [session, setSession] = useState('');
@@ -29,7 +58,7 @@ export function MessageTester() {
   const [selectedGroup, setSelectedGroup] = useState('');
   const [messageType, setMessageType] = useState<typeof messageTypes[number]>('text');
   const [content, setContent] = useState('');
-  const [mediaUrl, setMediaUrl] = useState('');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState<ApiResponse | null>(null);
 
@@ -53,6 +82,21 @@ export function MessageTester() {
     }
   }, [groups, selectedGroup, recipientType]);
 
+  useEffect(() => {
+    setSelectedFile(null);
+    if (mediaFileInputRef.current) {
+      mediaFileInputRef.current.value = '';
+    }
+  }, [messageType]);
+
+  const handleMediaFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    setSelectedFile(event.target.files?.[0] ?? null);
+  };
+
+  const openMediaFilePicker = () => {
+    mediaFileInputRef.current?.click();
+  };
+
   const handleSend = async () => {
     const targetId = recipientType === 'group' ? selectedGroup : recipient;
     if (!session || !targetId) return;
@@ -65,14 +109,33 @@ export function MessageTester() {
       let result;
       if (messageType === 'text') {
         result = await messageApi.sendText(session, chatId, content);
-      } else if (messageType === 'image') {
-        result = await messageApi.sendImage(session, chatId, mediaUrl, content);
-      } else if (messageType === 'video') {
-        result = await messageApi.sendVideo(session, chatId, mediaUrl, content);
-      } else if (messageType === 'audio') {
-        result = await messageApi.sendAudio(session, chatId, mediaUrl);
       } else {
-        result = await messageApi.sendDocument(session, chatId, mediaUrl, content);
+        if (!selectedFile) {
+          throw new Error(t('messageTester.noFileSelected'));
+        }
+
+        const dataUrl = await readFileAsDataUrl(selectedFile);
+        const base64 = dataUrl.split(',')[1] || '';
+
+        const mediaPayload: MediaMessagePayload = {
+          base64,
+          mimetype: selectedFile.type || 'application/octet-stream',
+          filename: selectedFile.name,
+          caption: messageType === 'audio' ? undefined : content || undefined,
+        };
+
+        if (messageType === 'image') {
+          result = await messageApi.sendImage(session, chatId, mediaPayload);
+        } else if (messageType === 'video') {
+          result = await messageApi.sendVideo(session, chatId, mediaPayload);
+        } else if (messageType === 'audio') {
+          result = await messageApi.sendAudio(session, chatId, mediaPayload);
+        } else {
+          result = await messageApi.sendDocument(session, chatId, {
+            ...mediaPayload,
+            filename: content || selectedFile.name,
+          });
+        }
       }
 
       setResponse({
@@ -126,12 +189,13 @@ export function MessageTester() {
             <label>{t('messageTester.recipientType')}</label>
             <div className="toggle-group">
               <button
+                type="button"
                 className={recipientType === 'personal' ? 'active' : ''}
                 onClick={() => setRecipientType('personal')}
               >
                 {t('messageTester.personal')}
               </button>
-              <button className={recipientType === 'group' ? 'active' : ''} onClick={() => setRecipientType('group')}>
+              <button type="button" className={recipientType === 'group' ? 'active' : ''} onClick={() => setRecipientType('group')}>
                 {t('messageTester.group')}
               </button>
             </div>
@@ -174,6 +238,7 @@ export function MessageTester() {
             <div className="toggle-group">
               {messageTypes.map(type => (
                 <button
+                  type="button"
                   key={type}
                   className={messageType === type ? 'active' : ''}
                   onClick={() => setMessageType(type)}
@@ -197,13 +262,25 @@ export function MessageTester() {
           ) : (
             <>
               <div className="form-group">
-                <label>{t('messageTester.mediaUrl')}</label>
-                <input
-                  type="text"
-                  value={mediaUrl}
-                  onChange={e => setMediaUrl(e.target.value)}
-                  placeholder="https://example.com/file.jpg"
-                />
+                <label>{t('messageTester.mediaFile')}</label>
+                <div className="media-picker">
+                  <input
+                    ref={mediaFileInputRef}
+                    className="media-file-input"
+                    type="file"
+                    accept={mediaAcceptByType[messageType]}
+                    onChange={handleMediaFileChange}
+                  />
+                  <div className="media-picker-actions">
+                    <button type="button" className="media-picker-btn" onClick={openMediaFilePicker}>
+                      {t('messageTester.chooseFile')}
+                    </button>
+                    <span className="media-picker-name">
+                      {selectedFile ? selectedFile.name : t('messageTester.noFileChosen')}
+                    </span>
+                  </div>
+                </div>
+                <span className="hint">{t('messageTester.fileHint')}</span>
               </div>
               {messageType !== 'audio' && (
                 <div className="form-group">
@@ -224,7 +301,13 @@ export function MessageTester() {
           <button
             className="send-btn"
             onClick={handleSend}
-            disabled={!canWrite || isLoading || !session || (recipientType === 'group' ? !selectedGroup : !recipient)}
+            disabled={
+              !canWrite ||
+              isLoading ||
+              !session ||
+              (recipientType === 'group' ? !selectedGroup : !recipient) ||
+              (messageType !== 'text' && !selectedFile)
+            }
           >
             {isLoading ? <Loader2 className="animate-spin" size={18} /> : <Send size={18} />}
             {isLoading ? t('messageTester.sending') : canWrite ? t('messageTester.send') : t('messageTester.viewOnly')}

@@ -343,6 +343,10 @@
     },
     "messageContent": "תוכן ההודעה",
     "messagePlaceholder": "יש להזין כאן את ההודעה...",
+    "mediaFile": "קובץ מדיה",
+    "chooseFile": "בחירת קובץ",
+    "noFileChosen": "לא נבחר קובץ",
+    "fileHint": "יש לבחור קובץ מקומי במקום להזין כתובת URL.",
     "mediaUrl": "כתובת המדיה",
     "caption": "כיתוב",
     "filename": "שם קובץ",
@@ -359,7 +363,8 @@
       "messageId": "מזהה הודעה",
       "error": "שגיאה"
     },
-    "sendFailed": "שליחת ההודעה נכשלה"
+    "sendFailed": "שליחת ההודעה נכשלה",
+    "noFileSelected": "יש לבחור קובץ תחילה"
   },
   "infrastructure": {
     "title": "תשתית",

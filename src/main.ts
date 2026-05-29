@@ -2,6 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import helmet from 'helmet';
+import * as bodyParser from 'body-parser';
 import { AppModule } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
 import * as dotenv from 'dotenv';
@@ -65,7 +66,11 @@ STORAGE_PATH=./data/media
 }
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
+
+  // Allow media uploads encoded as JSON base64 payloads.
+  app.use(bodyParser.json({ limit: '25mb' }));
+  app.use(bodyParser.urlencoded({ limit: '25mb', extended: true }));
 
   // Enable shutdown hooks for graceful shutdown
   app.enableShutdownHooks();
