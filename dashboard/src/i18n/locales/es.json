@@ -1,7 +1,7 @@
 {
   "common": {
-    "appName": "OpenWA",
-    "appSubtitle": "API de WhatsApp",
+    "appName": "PDS WhatsApp API",
+    "appSubtitle": "Gestionado por OpenWA",
     "loading": "Cargando...",
     "save": "Guardar",
     "cancel": "Cancelar",
@@ -78,7 +78,7 @@
     "connectionError": "No se pudo conectar al servidor. Intentalo de nuevo.",
     "help": "Necesitas ayuda?",
     "viewDocs": "Ver documentacion",
-    "footer": "Hecho con amor por Yudhi Armyndharis y la comunidad OpenWA",
+    "footer": "Hecho con amor por Yudhi Armyndharis y la comunidad OpenWA en colaboracion con Jesus Lira para PDS.",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

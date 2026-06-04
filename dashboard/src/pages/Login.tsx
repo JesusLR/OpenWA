@@ -51,8 +51,9 @@ export function Login({ onLogin }: LoginProps) {
   return (
     <div className="login-container">
       <div className="login-card">
-        <div className="login-logo">
-          <img src="/openwa_logo.webp" alt="OpenWA" className="logo-icon" />
+        <div className="login-logo login-hero">
+          <img src="/logo_pds.png" alt="OpenWA" className="logo-icon" />
+          <p className="logo-tagline">{t('common.appSubtitle')}</p>
           <span className="version-info">
             {t('login.version', {
               version: __APP_VERSION__,
@@ -60,40 +61,42 @@ export function Login({ onLogin }: LoginProps) {
             })}
           </span>
         </div>
-        <form onSubmit={handleSubmit} className="login-form">
-          <div className="input-group">
-            <label htmlFor="apiKey">{t('login.apiKey')}</label>
-            <div className="input-wrapper">
-              <input
-                id="apiKey"
-                type={showKey ? 'text' : 'password'}
-                value={apiKey}
-                onChange={e => setApiKey(e.target.value)}
-                placeholder={t('login.apiKeyPlaceholder')}
-                className={error ? 'error' : ''}
-              />
-              <button type="button" className="toggle-visibility" onClick={() => setShowKey(!showKey)}>
-                {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
-              </button>
+        <div className="login-content">
+          <form onSubmit={handleSubmit} className="login-form">
+            <div className="input-group">
+              <label htmlFor="apiKey">{t('login.apiKey')}</label>
+              <div className="input-wrapper">
+                <input
+                  id="apiKey"
+                  type={showKey ? 'text' : 'password'}
+                  value={apiKey}
+                  onChange={e => setApiKey(e.target.value)}
+                  placeholder={t('login.apiKeyPlaceholder')}
+                  className={error ? 'error' : ''}
+                />
+                <button type="button" className="toggle-visibility" onClick={() => setShowKey(!showKey)}>
+                  {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
+                </button>
+              </div>
+              {error && <span className="error-message">{error}</span>}
             </div>
-            {error && <span className="error-message">{error}</span>}
-          </div>
 
-          <button type="submit" className="connect-btn" disabled={isLoading}>
-            {isLoading ? t('login.connecting') : t('login.connect')}
-          </button>
-        </form>
+            <button type="submit" className="connect-btn" disabled={isLoading}>
+              {isLoading ? t('login.connecting') : t('login.connect')}
+            </button>
+          </form>
 
-        <p className="login-help">
-          {t('login.help')}{' '}
-          <a
-            href="https://github.com/rmyndharis/OpenWA/blob/main/docs/01-project-overview.md"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            {t('login.viewDocs')}
-          </a>
-        </p>
+          <p className="login-help">
+            {t('login.help')}{' '}
+            <a
+              href="https://github.com/rmyndharis/OpenWA/blob/main/docs/01-project-overview.md"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {t('login.viewDocs')}
+            </a>
+          </p>
+        </div>
       </div>
 
       <footer className="login-footer">
