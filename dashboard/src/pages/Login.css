@@ -45,8 +45,8 @@
 }
 
 .logo-icon {
-  width: min(92%, 340px);
-  max-height: 250px;
+  width: min(86%, 300px);
+  max-height: 220px;
   height: auto;
   object-fit: contain;
   filter: drop-shadow(0 14px 24px rgba(37, 211, 102, 0.26));
@@ -230,8 +230,8 @@
   }
 
   .logo-icon {
-    width: min(92%, 260px);
-    max-height: 195px;
+    width: min(88%, 230px);
+    max-height: 170px;
   }
 
   .login-content {
