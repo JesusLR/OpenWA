@@ -144,6 +144,8 @@ async function bootstrap() {
       },
       disableErrorMessages: process.env.NODE_ENV === 'production', // Hide details in prod
     }),
+  );
+
   // Global Exception Filter
   app.useGlobalFilters(new HttpExceptionFilter());
 
