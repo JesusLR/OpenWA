@@ -6,11 +6,13 @@ import { MessageService } from './message.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
 import { SessionService } from '../session/session.service';
 import { HookManager } from '../../core/hooks';
+import { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 
 const mockEngineResult = { id: 'wa-msg-1', timestamp: 1706868000 };
 
 function createMockEngine() {
   return {
+    getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
     sendTextMessage: jest.fn().mockResolvedValue(mockEngineResult),
     sendImageMessage: jest.fn().mockResolvedValue(mockEngineResult),
     sendVideoMessage: jest.fn().mockResolvedValue(mockEngineResult),

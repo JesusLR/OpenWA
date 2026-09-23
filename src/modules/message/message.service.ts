@@ -1,9 +1,9 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SessionService } from '../session/session.service';
 import { SendTextMessageDto, SendMediaMessageDto, MessageResponseDto } from './dto';
-import { MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
+import { MediaInput, EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
 import { HookManager } from '../../core/hooks';
 
@@ -15,6 +15,8 @@ export interface GetMessagesOptions {
 
 @Injectable()
 export class MessageService {
+  private readonly logger = new Logger(MessageService.name);
+
   constructor(
     @InjectRepository(Message, 'data')
     private readonly messageRepository: Repository<Message>,
@@ -50,17 +52,25 @@ export class MessageService {
       const result = await engine.sendTextMessage(finalDto.chatId, finalDto.text);
 
       // Update with actual WhatsApp message ID and status
-      message.waMessageId = result.id;
-      message.status = MessageStatus.SENT;
-      message.timestamp = result.timestamp;
-      await this.messageRepository.save(message);
+      try {
+        message.waMessageId = result.id;
+        message.status = MessageStatus.SENT;
+        message.timestamp = result.timestamp;
+        await this.messageRepository.save(message);
+      } catch (dbError) {
+        this.logger.error(`Failed to update message status in DB after send: ${String(dbError)}`);
+      }
 
       // Execute hook after successful send
-      await this.hookManager.execute(
-        'message:sent',
-        { sessionId, result, input: finalDto },
-        { sessionId, source: 'MessageService' },
-      );
+      try {
+        await this.hookManager.execute(
+          'message:sent',
+          { sessionId, result, input: finalDto },
+          { sessionId, source: 'MessageService' },
+        );
+      } catch (hookError) {
+        this.logger.error(`Failed to execute message:sent hook: ${String(hookError)}`);
+      }
 
       return {
         messageId: result.id,
@@ -68,15 +78,23 @@ export class MessageService {
       };
     } catch (error) {
       // Mark as failed
-      message.status = MessageStatus.FAILED;
-      await this.messageRepository.save(message);
+      try {
+        message.status = MessageStatus.FAILED;
+        await this.messageRepository.save(message);
+      } catch (dbError) {
+        // Ignore DB save error on failure cleanup
+      }
 
       // Execute hook on failure
-      await this.hookManager.execute(
-        'message:failed',
-        { sessionId, error: error instanceof Error ? error.message : String(error), input: finalDto },
-        { sessionId, source: 'MessageService' },
-      );
+      try {
+        await this.hookManager.execute(
+          'message:failed',
+          { sessionId, error: error instanceof Error ? error.message : String(error), input: finalDto },
+          { sessionId, source: 'MessageService' },
+        );
+      } catch (hookError) {
+        // Ignore hook error on failure cleanup
+      }
 
       throw error;
     }
@@ -470,6 +488,12 @@ export class MessageService {
     const engine = this.sessionService.getEngine(sessionId);
     if (!engine) {
       throw new BadRequestException(`Session '${sessionId}' is not active. Start the session first.`);
+    }
+    if (typeof engine.getStatus === 'function') {
+      const status = engine.getStatus();
+      if (status !== EngineStatus.READY) {
+        throw new BadRequestException(`Session '${sessionId}' is not ready (current status: ${status}).`);
+      }
     }
     return engine;
   }

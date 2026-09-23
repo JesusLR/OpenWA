@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import * as bodyParser from 'body-parser';
 import { AppModule } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
+import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -143,7 +144,8 @@ async function bootstrap() {
       },
       disableErrorMessages: process.env.NODE_ENV === 'production', // Hide details in prod
     }),
-  );
+  // Global Exception Filter
+  app.useGlobalFilters(new HttpExceptionFilter());
 
   // Swagger documentation
   const config = new DocumentBuilder()

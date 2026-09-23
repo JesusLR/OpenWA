@@ -43,6 +43,9 @@ export class HttpExceptionFilter implements ExceptionFilter {
       }
     } else if (exception instanceof Error) {
       message = exception.message;
+      console.error('[HttpExceptionFilter] Uncaught Error:', exception.stack || exception.message);
+    } else {
+      console.error('[HttpExceptionFilter] Uncaught Exception:', exception);
     }
 
     const errorResponse: ApiResponse = {

@@ -272,10 +272,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
     this.ensureReady();
     const msg = await this.client!.sendMessage(chatId, text);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -316,10 +313,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       caption: media.caption,
     });
 
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async getContacts(): Promise<Contact[]> {
@@ -391,10 +385,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       address: location.address || '',
     });
     const msg = await this.client!.sendMessage(chatId, loc);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
@@ -411,10 +402,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, vcard, {
       parseVCards: true,
     });
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -434,10 +422,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, messageMedia, {
       sendMediaAsSticker: true,
     });
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult> {
@@ -452,10 +437,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     const msg = await quotedMsg.reply(text);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
@@ -469,10 +451,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     await msgToForward.forward(toChatId);
-    // forward() returns void, so we generate a result based on original message
     return {
       id: `fwd_${messageId}`,
-      timestamp: Date.now(),
+      timestamp: Math.floor(Date.now() / 1000),
     };
   }
 
@@ -914,6 +895,25 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   /* eslint-enable @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
+
+  private extractMessageResult(msg: unknown): MessageResult {
+    let id = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    let timestamp = Math.floor(Date.now() / 1000);
+
+    if (msg && typeof msg === 'object') {
+      const msgObj = msg as { id?: string | { _serialized?: string; id?: string }; timestamp?: number };
+      if (typeof msgObj.id === 'string') {
+        id = msgObj.id;
+      } else if (msgObj.id && typeof msgObj.id === 'object') {
+        id = msgObj.id._serialized || msgObj.id.id || JSON.stringify(msgObj.id);
+      }
+      if (typeof msgObj.timestamp === 'number') {
+        timestamp = msgObj.timestamp;
+      }
+    }
+
+    return { id, timestamp };
+  }
 
   private ensureReady(): void {
     if (this.status !== EngineStatus.READY || !this.client) {
