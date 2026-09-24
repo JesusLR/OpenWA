@@ -269,9 +269,47 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.pushName;
   }
 
+  private async resolveChatId(chatId: string): Promise<string> {
+    if (!this.client) return chatId;
+
+    // Direct group chat
+    if (chatId.endsWith('@g.us')) {
+      return chatId;
+    }
+
+    try {
+      const cleanDigits = chatId.replace('@c.us', '').replace(/\D/g, '');
+
+      let numberId = await this.client.getNumberId(cleanDigits);
+
+      if (!numberId && cleanDigits.startsWith('521') && cleanDigits.length === 13) {
+        const altDigits = '52' + cleanDigits.substring(3);
+        numberId = await this.client.getNumberId(altDigits);
+      } else if (!numberId && cleanDigits.length === 10) {
+        numberId = await this.client.getNumberId('52' + cleanDigits);
+        if (!numberId) {
+          numberId = await this.client.getNumberId('521' + cleanDigits);
+        }
+      }
+
+      if (numberId && numberId._serialized) {
+        return numberId._serialized;
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to resolve getNumberId for ${chatId}: ${String(error)}`);
+    }
+
+    if (chatId.startsWith('521') && chatId.endsWith('@c.us') && chatId.length === 18) {
+      return '52' + chatId.substring(3);
+    }
+
+    return chatId;
+  }
+
   async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
     this.ensureReady();
-    const msg = await this.client!.sendMessage(chatId, text);
+    const targetChatId = await this.resolveChatId(chatId);
+    const msg = await this.client!.sendMessage(targetChatId, text);
     return this.extractMessageResult(msg);
   }
 
@@ -293,6 +331,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   private async sendMediaMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.ensureReady();
+    const targetChatId = await this.resolveChatId(chatId);
 
     let messageMedia: MessageMedia;
 
@@ -302,14 +341,20 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         messageMedia = await MessageMedia.fromUrl(media.data);
       } else {
         // Base64
-        messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
+        let cleanData = media.data;
+        const dataUriMatch = media.data.match(/^data:([^;]+);base64,(.*)$/);
+        if (dataUriMatch) {
+          media.mimetype = dataUriMatch[1] || media.mimetype;
+          cleanData = dataUriMatch[2];
+        }
+        messageMedia = new MessageMedia(media.mimetype, cleanData, media.filename);
       }
     } else {
       // Buffer
       messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
     }
 
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
+    const msg = await this.client!.sendMessage(targetChatId, messageMedia, {
       caption: media.caption,
     });
 
