@@ -1,49 +1,84 @@
+import { Suspense } from 'react';
+import { lazyWithRetry as lazy } from '../utils/lazyWithRetry';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { MessageSquare, Send, Webhook, Activity, ArrowUpRight, ArrowDownRight, Loader2 } from 'lucide-react';
+import { MessageSquare, Send, Webhook, Activity, Loader2 } from 'lucide-react';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
-import { useSessionsQuery, useSessionStatsQuery, useWebhooksQuery, useStopSessionMutation } from '../hooks/queries';
+import { useRole } from '../hooks/useRole';
+import { useToast } from '../hooks/useToast';
+import {
+  useSessionsQuery,
+  useSessionStatsQuery,
+  useWebhooksQuery,
+  useStopSessionMutation,
+  useStatsOverviewQuery,
+} from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
+import { isSessionStarted } from '../utils/sessionActions';
 import './Dashboard.css';
+
+// recharts is heavy (~116 kB gzip); load the analytics section on demand so it never bloats the
+// main/login bundle, and only for an admin key: /stats/messages refuses every other role.
+const DashboardCharts = lazy(() => import('../components/DashboardCharts').then(m => ({ default: m.DashboardCharts })));
 
 export function Dashboard() {
   const { t } = useTranslation();
   useDocumentTitle(t('dashboard.title'));
   const navigate = useNavigate();
-  const { data: sessions = [], isLoading: loadingSessions, error: sessionsError } = useSessionsQuery();
+  const { canWrite, isAdmin } = useRole();
+  const toast = useToast();
+  const {
+    data: sessions = [],
+    isLoading: loadingSessions,
+    error: sessionsError,
+    isLoadingError: sessionsNeverLoaded,
+  } = useSessionsQuery();
   const { data: stats } = useSessionStatsQuery();
-  const { data: webhooks = [] } = useWebhooksQuery();
+  // GET /webhooks is OPERATOR-only and /stats/overview ADMIN-only. A key without the role is not sent
+  // them, since the gateway audits every refusal as a failed authentication; their cards show the
+  // unavailable placeholder.
+  const { data: webhooks, isError: webhooksFailed } = useWebhooksQuery(canWrite);
+  const { data: overview } = useStatsOverviewQuery(isAdmin);
   const stopMutation = useStopSessionMutation();
+  const unavailable = '—';
+  const messagesToday = overview ? overview.messages.today.sent + overview.messages.today.received : unavailable;
+  const totalMessages = overview ? overview.messages.sent + overview.messages.received : unavailable;
   const loading = loadingSessions;
-  const error = sessionsError instanceof Error
-    ? sessionsError.message
-    : sessionsError
-      ? t('dashboard.loadError')
-      : null;
-  const webhookCount = webhooks.length;
+  // Only a read that never succeeded replaces the page: a failed background refetch keeps its cached
+  // data (as the webhook card below does), so the last good view stays on screen.
+  const error = sessionsNeverLoaded
+    ? sessionsError instanceof Error
+      ? sessionsError.message
+      : t('dashboard.loadError')
+    : null;
+  // A viewer is not sent the webhook read, and a failed read is not zero webhooks either.
+  // A failed background refetch keeps the cached list, which still counts.
+  const webhookCount = !canWrite || (webhooksFailed && !webhooks) ? unavailable : (webhooks ?? []).length;
 
   const handleDisconnect = async (id: string) => {
     try {
       await stopMutation.mutateAsync(id);
     } catch (err) {
-      console.error('Failed to disconnect:', err);
+      toast.error(t('dashboard.disconnectFailed'), err instanceof Error ? err.message : undefined);
     }
   };
 
   const statsCards = [
     {
+      // `stats.active` counts running engines — which includes initializing/qr_ready/connecting — so
+      // it overstates what an operator reads as "connected". READY is the only status where the
+      // session can actually send and receive.
       label: t('dashboard.stats.activeSessions'),
-      value: stats?.active ?? 0,
+      value: stats?.ready ?? 0,
       icon: MessageSquare,
-      trend: `+${stats?.ready ?? 0}`,
-      trendUp: true,
+      detail: stats ? t('dashboard.stats.sessionsDetail', { running: stats.active, total: stats.total }) : undefined,
     },
-    { label: t('dashboard.stats.messagesToday'), value: '—', icon: Send, trend: '0', trendUp: null },
-    { label: t('dashboard.stats.webhooksConfigured'), value: webhookCount, icon: Webhook, trend: '0', trendUp: null },
-    { label: t('dashboard.stats.apiCalls'), value: '—', icon: Activity, trend: '0', trendUp: null },
+    { label: t('dashboard.stats.messagesToday'), value: messagesToday, icon: Send },
+    { label: t('dashboard.stats.webhooksConfigured'), value: webhookCount, icon: Webhook },
+    { label: t('dashboard.stats.totalMessages'), value: totalMessages, icon: Activity },
   ];
 
-  const formatLastActive = (date?: string) => {
+  const formatLastActive = (date?: string | null) => {
     if (!date) return t('common.never');
     const diff = Date.now() - new Date(date).getTime();
     if (diff < 60000) return t('common.justNow');
@@ -68,7 +103,9 @@ export function Dashboard() {
   if (error) {
     return (
       <div className="dashboard" style={{ padding: '2rem' }}>
-        <div style={{ background: '#FEE2E2', padding: '1rem', borderRadius: '8px', color: '#DC2626' }}>
+        <div
+          style={{ background: 'rgba(239, 68, 68, 0.12)', padding: '1rem', borderRadius: '8px', color: 'var(--error)' }}
+        >
           {t('dashboard.errorPrefix', { message: error })}
         </div>
       </div>
@@ -88,7 +125,7 @@ export function Dashboard() {
       />
 
       <div className="stats-grid">
-        {statsCards.map(({ label, value, icon: Icon, trend, trendUp }) => (
+        {statsCards.map(({ label, value, icon: Icon, detail }) => (
           <div key={label} className="stat-card">
             <Icon className="stat-watermark" />
             <div className="stat-header">
@@ -96,15 +133,16 @@ export function Dashboard() {
               <Icon size={20} className="stat-icon" />
             </div>
             <div className="stat-value">{typeof value === 'number' ? value.toLocaleString() : value}</div>
-            {trend !== '0' && (
-              <div className={`stat-trend ${trendUp ? 'up' : 'down'}`}>
-                {trendUp ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
-                {trend}
-              </div>
-            )}
+            {detail && <div className="stat-detail">{detail}</div>}
           </div>
         ))}
       </div>
+
+      {isAdmin && (
+        <Suspense fallback={null}>
+          <DashboardCharts />
+        </Suspense>
+      )}
 
       <section className="sessions-section">
         <div className="section-header">
@@ -142,7 +180,8 @@ export function Dashboard() {
                   <button className="btn-sm" onClick={() => navigate('/sessions')}>
                     {t('dashboard.view')}
                   </button>
-                  {['ready', 'initializing', 'connecting', 'qr_ready'].includes(session.status) && (
+                  {/* Stopping a session is an operator write; a read-only key would only collect a 403. */}
+                  {canWrite && isSessionStarted(session) && (
                     <button className="btn-sm danger" onClick={() => handleDisconnect(session.id)}>
                       {t('dashboard.disconnect')}
                     </button>

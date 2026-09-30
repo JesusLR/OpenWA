@@ -1,8 +1,7 @@
 import { EventEmitter } from 'events';
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
-import * as qrcode from 'qrcode';
-import * as path from 'path';
+import { MessageMedia, type Client, type Message } from 'whatsapp-web.js';
 import {
+  CallLinkType,
   IWhatsAppEngine,
   EngineStatus,
   EngineEventCallbacks,
@@ -12,29 +11,65 @@ import {
   Contact,
   Group,
   GroupInfo,
-  GroupParticipant,
+  GroupMemberAddMode,
+  GroupMembershipRequest,
+  ParticipantOperationResult,
   LocationInput,
+  PollInput,
   ContactCard,
   MessageReaction,
   Label,
   Channel,
   ChannelMessage,
   Status,
-  TextStatusOptions,
+  StatusPostOptions,
   StatusResult,
   Catalog,
   Product,
   ProductQueryOptions,
   PaginatedProducts,
+  ChatSummary,
+  ChatState,
+  LabelInput,
+  CustomLinkPreview,
+  GroupJoinInfo,
 } from '../interfaces/whatsapp-engine.interface';
+import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { resolveAuthTimeoutMs } from '../engine-init-timeout';
+import { isChannelJid } from '../identity/wa-id';
+import { LidMappingStore } from '../identity/lid-mapping-store.service';
 import { createLogger } from '../../common/services/logger.service';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
+import { WwebjsGroups } from './wwebjs-groups';
+import { type WwebjsEngineHost } from './wwebjs-host';
+import { registerWwebjsMessageEvents } from './wwebjs-message-events';
+import { WwebjsMessaging, declaredOnlyMedia } from './wwebjs-messaging';
+import { WwebjsContacts } from './wwebjs-contacts';
+import { WwebjsProfile } from './wwebjs-profile';
+import { WwebjsLabels } from './wwebjs-labels';
+import { WwebjsChannels } from './wwebjs-channels';
+import { WwebjsStatus } from './wwebjs-status';
+import { WwebjsChats } from './wwebjs-chats';
+import { WwebjsCatalog } from './wwebjs-catalog';
+import { registerWwebjsGroupEvents } from './wwebjs-group-events';
+import { WwebjsOnboardingWatcher } from './wwebjs-onboarding';
+import { WwebjsLifecycle } from './wwebjs-lifecycle';
+import { WwebjsReadyReconcile } from './wwebjs-reconcile';
+import { WwebjsStuckAuth } from './wwebjs-stuck-auth';
+import { WwebjsCalls } from './wwebjs-calls';
 import {
-  GroupChat,
-  MessageWithReactions,
-  BusinessClient,
-  WwjsChannelData,
-  GroupCreateResult,
-} from '../types/whatsapp-web-js.types';
+  capInboundMedia,
+  coerceDeclaredSize,
+  inboundMediaConcurrency,
+  inboundMediaMaxBytes,
+  inboundMediaTimeoutMs,
+  isMediaDownloadEnabled,
+  runUnderGlobalMediaGate,
+  withInboundDownloadTimeout,
+} from './inbound-media-cap';
+import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
+import { readWid } from '../types/whatsapp-web-js.types';
 
 export interface WhatsAppWebJsConfig {
   sessionId: string;
@@ -42,1035 +77,894 @@ export interface WhatsAppWebJsConfig {
   puppeteer?: {
     headless?: boolean;
     args?: string[];
+    executablePath?: string;
+    /** Per-CDP-command budget handed to Puppeteer. Must be positive — see wwebjs-lifecycle. */
+    protocolTimeoutMs?: number;
   };
   // Phase 3: Proxy per session
   proxy?: {
     url: string;
     type: 'http' | 'https' | 'socks4' | 'socks5';
   };
+  // Shared lid<->phone table. Threaded in so the wwjs engine can persist the `phone -> lid` pairs it
+  // learns while resolving sends, letting the message read-path bridge `@c.us`/`@lid` rows (#583 R3).
+  lidMappingStore?: LidMappingStore;
 }
 
+// WhatsApp Web version resolution (the #488 auto-resolve) lives in a dependency-free module so infra
+// status can import it without loading whatsapp-web.js (engine lazy-loading). The lifecycle delegate
+// imports resolveWebVersionPin for use in initialize().
+
+// resolveAuthTimeoutMs now lives in ../engine-init-timeout, next to the outer init deadline derived
+// from it: that deadline is engine-agnostic, so deriving it here made the session lifecycle import
+// this adapter just to size a timeout. Re-exported because callers still reach it through the engine
+// they are configuring.
+export { resolveAuthTimeoutMs };
+
+// extractLinkedParentJID moved to ./wwebjs-groups with the group operations; re-exported because
+// existing callers (the adapter spec) still import it from here.
+export { extractLinkedParentJID } from './wwebjs-groups';
+
+// Messaging helpers moved to ./wwebjs-messaging with the messaging operations; re-exported because
+// existing callers (the adapter spec) still import them from here.
+export { isHttpUrl, loadRemoteMedia, extractWwebjsCall, wwebjsAckToDeliveryStatus } from './wwebjs-messaging';
+
+// Proxy launch helpers moved to ./wwebjs-proxy; re-exported because existing callers (the adapter
+// spec) still import them from here.
+export { isSupportedProxyUrl, buildProxyLaunchConfig } from './wwebjs-proxy';
+
+// The onboarding-modal probe moved to ./wwebjs-onboarding with its label resolution; re-exported
+// because existing callers (the adapter spec) still import it from here.
+export { probeOnboardingModal, collectDialogDiagnostics } from './wwebjs-onboarding';
+
+// Connection lifecycle moved to ./wwebjs-lifecycle (with the navigation re-inject constants) and the
+// readiness reconciliation to ./wwebjs-reconcile; re-exported because existing callers (the adapter
+// spec) still import them from here.
+export {
+  isExecutionContextDestroyedError,
+  NAVIGATION_REINJECT_GRACE_MS,
+  NAVIGATION_EPISODE_CAP_MS,
+} from './wwebjs-lifecycle';
+export { READY_RECONCILE_TIMEOUT_MS, READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS } from './wwebjs-reconcile';
+
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
-  private client: Client | null = null;
-  private status: EngineStatus = EngineStatus.DISCONNECTED;
-  private qrCode: string | null = null;
-  private phoneNumber: string | null = null;
-  private pushName: string | null = null;
+  private readonly logger = createLogger('WhatsAppWebJsAdapter');
+  // Bound concurrent inbound media downloads: downloadMedia() materialises the full base64 blob, so an
+  // unbounded burst could stack many multi-MB allocations.
+  // The queue is UNBOUNDED. A cap equal to the active slots made admission a constant
+  // (active + queued) whatever the batch size, so a burst lost the media of everything past the
+  // eighth — the same defect repaired on the Baileys side. Parking costs one held Message per
+  // waiting download, and only the download runs inside the limiter: each message awaits its own
+  // capInboundMediaFor, so a parked one delays itself and a text message never enters the gate.
+  private readonly inboundLimiter = new ConcurrencyLimiter(inboundMediaConcurrency());
+
   private callbacks: EngineEventCallbacks = {};
+  private readonly host: WwebjsEngineHost;
+  private readonly groups: WwebjsGroups;
+  private readonly messaging: WwebjsMessaging;
+  private readonly contacts: WwebjsContacts;
+  private readonly profile: WwebjsProfile;
+  private readonly labels: WwebjsLabels;
+  private readonly channels: WwebjsChannels;
+  private readonly statuses: WwebjsStatus;
+  private readonly chats: WwebjsChats;
+  private readonly catalog: WwebjsCatalog;
+  private readonly lifecycle: WwebjsLifecycle;
+  private readonly reconcile: WwebjsReadyReconcile;
+  private readonly stuckAuth: WwebjsStuckAuth;
+  private readonly calls: WwebjsCalls;
+  private readonly onboardingWatcher: WwebjsOnboardingWatcher;
+
+  // Connection-lifecycle state is owned by the lifecycle delegate (./wwebjs-lifecycle); these
+  // accessors alias it by reference so the host closures below — and an unmodified spec poking
+  // `adapter.client` / `adapter.status` / `adapter.tearingDown` / … through a cast — keep working
+  // byte-identically. The live-call cache below is the same pattern for ./wwebjs-calls.
+  private get client(): Client | null {
+    return this.lifecycle.client;
+  }
+  private set client(value: Client | null) {
+    this.lifecycle.client = value;
+  }
+  private get status(): EngineStatus {
+    return this.lifecycle.status;
+  }
+  private set status(value: EngineStatus) {
+    this.lifecycle.status = value;
+  }
+  private get qrCode(): string | null {
+    return this.lifecycle.qrCode;
+  }
+  private get tearingDown(): boolean {
+    return this.lifecycle.tearingDown;
+  }
+  private set tearingDown(value: boolean) {
+    this.lifecycle.tearingDown = value;
+  }
+  private get logoutInitiated(): boolean {
+    return this.lifecycle.logoutInitiated;
+  }
+  private set logoutInitiated(value: boolean) {
+    this.lifecycle.logoutInitiated = value;
+  }
+  private get disconnectReported(): boolean {
+    return this.lifecycle.disconnectReported;
+  }
+  private set disconnectReported(value: boolean) {
+    this.lifecycle.disconnectReported = value;
+  }
+  /** Ringing call ids and their expiry, owned by the calls delegate, which uses them to announce each
+   *  call once; lifecycle teardown clears them. The adapter keeps this alias for the spec, which reads
+   *  `adapter.liveCalls` through a cast. */
+  private get liveCalls(): Map<string, number> {
+    return this.calls.liveCalls;
+  }
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
-  }
-
-  private readonly logger = createLogger('WhatsAppWebJsAdapter');
-
-  async initialize(callbacks: EngineEventCallbacks): Promise<void> {
-    this.callbacks = callbacks;
-    this.setStatus(EngineStatus.INITIALIZING);
-
-    try {
-      // Build puppeteer args, including proxy if configured
-      const puppeteerArgs = this.config.puppeteer?.args || [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-      ];
-
-      // Add proxy configuration if provided
-      if (this.config.proxy) {
-        puppeteerArgs.push(`--proxy-server=${this.config.proxy.url}`);
-        this.logger.log(
-          `Using proxy: ${this.config.proxy.type}://${this.config.proxy.url.replace(/:[^:@]*@/, ':***@')}`,
-        );
-      }
-
-      this.client = new Client({
-        authStrategy: new LocalAuth({
-          clientId: this.config.sessionId,
-          dataPath: path.resolve(this.config.sessionDataPath),
-        }),
-        puppeteer: {
-          headless: this.config.puppeteer?.headless ?? true,
-          args: puppeteerArgs,
-        },
-      });
-
-      this.setupEventHandlers();
-      await this.client.initialize();
-    } catch (error) {
-      this.setStatus(EngineStatus.FAILED);
-      throw error;
-    }
-  }
-
-  private setupEventHandlers(): void {
-    if (!this.client) return;
-
-    // eslint-disable-next-line @typescript-eslint/no-misused-promises
-    this.client.on('qr', async (qr: string) => {
-      try {
-        this.qrCode = await qrcode.toDataURL(qr);
-        this.setStatus(EngineStatus.QR_READY);
-        this.callbacks.onQRCode?.(this.qrCode);
-      } catch (error) {
-        this.logger.error('Error generating QR code', String(error));
-      }
-    });
-
-    this.client.on('authenticated', () => {
-      this.setStatus(EngineStatus.AUTHENTICATING);
-      this.qrCode = null;
-    });
-
-    this.client.on('ready', () => {
-      try {
-        const info = this.client?.info;
-        this.phoneNumber = info?.wid?.user || null;
-        this.pushName = info?.pushname || null;
-        this.setStatus(EngineStatus.READY);
-        this.callbacks.onReady?.(this.phoneNumber || '', this.pushName || '');
-      } catch (error) {
-        this.logger.error('Error getting client info', String(error));
-        this.setStatus(EngineStatus.READY);
-        this.callbacks.onReady?.('', '');
-      }
-    });
-
-    // eslint-disable-next-line @typescript-eslint/no-misused-promises
-    this.client.on('message', async msg => {
-      try {
-        const incomingMessage: IncomingMessage = {
-          id: msg.id._serialized,
-          from: msg.from,
-          to: msg.to,
-          chatId: msg.from,
-          body: msg.body,
-          type: msg.type,
-          timestamp: msg.timestamp,
-          fromMe: msg.fromMe,
-          isGroup: msg.from.endsWith('@g.us'),
-        };
-
-        // Handle media
-        if (msg.hasMedia) {
-          try {
-            const media = await msg.downloadMedia();
-            if (media) {
-              incomingMessage.media = {
-                mimetype: media.mimetype,
-                filename: media.filename || undefined,
-                data: media.data,
-              };
-            }
-          } catch (error) {
-            this.logger.error('Error downloading media', String(error));
-          }
-        }
-
-        // Handle quoted message
-        if (msg.hasQuotedMsg) {
-          try {
-            const quoted = await msg.getQuotedMessage();
-            incomingMessage.quotedMessage = {
-              id: quoted.id._serialized,
-              body: quoted.body,
-            };
-          } catch (error) {
-            this.logger.error('Error getting quoted message', String(error));
-          }
-        }
-
-        this.callbacks.onMessage?.(incomingMessage);
-      } catch (error) {
-        this.logger.error('Error processing incoming message', String(error));
-      }
-    });
-
-    this.client.on('message_ack', (msg, ack) => {
-      this.callbacks.onMessageAck?.(msg.id._serialized, ack);
-    });
-
-    this.client.on('disconnected', reason => {
-      this.setStatus(EngineStatus.DISCONNECTED);
-      this.callbacks.onDisconnected?.(reason);
-    });
-
-    this.client.on('auth_failure', () => {
-      this.setStatus(EngineStatus.FAILED);
-      this.callbacks.onDisconnected?.('Authentication failed');
-    });
-  }
-
-  private setStatus(status: EngineStatus): void {
-    this.status = status;
-    this.callbacks.onStateChanged?.(status);
-    this.emit('stateChanged', status);
-  }
-
-  async disconnect(): Promise<void> {
-    if (this.client) {
-      try {
-        // Use destroy instead of logout to preserve session data
-        // This allows reconnecting without needing to scan QR again
-        await this.client.destroy();
-      } catch (error) {
-        this.logger.warn('Destroy client failed:', String(error));
-        // Already destroyed or not initialized - ignore
-      }
-      this.client = null;
-      this.setStatus(EngineStatus.DISCONNECTED);
-    }
-  }
-
-  async logout(): Promise<void> {
-    if (this.client) {
-      try {
-        // Logout clears session data - user will need to scan QR again
-        await this.client.logout();
-      } catch (error) {
-        this.logger.warn('Logout failed:', String(error));
-        // Fall back to destroy if logout fails
-        try {
-          await this.client.destroy();
-        } catch (destroyError) {
-          this.logger.warn('Client destroy also failed during logout fallback', String(destroyError));
-        }
-      }
-      this.client = null;
-      this.setStatus(EngineStatus.DISCONNECTED);
-    }
-  }
-
-  async destroy(): Promise<void> {
-    if (this.client) {
-      await this.client.destroy();
-      this.client = null;
-      this.setStatus(EngineStatus.DISCONNECTED);
-    }
-  }
-
-  getStatus(): EngineStatus {
-    return this.status;
-  }
-
-  getQRCode(): string | null {
-    return this.qrCode;
-  }
-
-  getPhoneNumber(): string | null {
-    return this.phoneNumber;
-  }
-
-  getPushName(): string | null {
-    return this.pushName;
-  }
-
-  private async resolveChatId(chatId: string): Promise<string> {
-    if (!this.client) return chatId;
-
-    // Direct group chat
-    if (chatId.endsWith('@g.us')) {
-      return chatId;
-    }
-
-    try {
-      const cleanDigits = chatId.replace('@c.us', '').replace(/\D/g, '');
-
-      let numberId = await this.client.getNumberId(cleanDigits);
-
-      if (!numberId && cleanDigits.startsWith('521') && cleanDigits.length === 13) {
-        const altDigits = '52' + cleanDigits.substring(3);
-        numberId = await this.client.getNumberId(altDigits);
-      } else if (!numberId && cleanDigits.length === 10) {
-        numberId = await this.client.getNumberId('52' + cleanDigits);
-        if (!numberId) {
-          numberId = await this.client.getNumberId('521' + cleanDigits);
-        }
-      }
-
-      if (numberId && numberId._serialized) {
-        return numberId._serialized;
-      }
-    } catch (error) {
-      this.logger.warn(`Failed to resolve getNumberId for ${chatId}: ${String(error)}`);
-    }
-
-    if (chatId.startsWith('521') && chatId.endsWith('@c.us') && chatId.length === 18) {
-      return '52' + chatId.substring(3);
-    }
-
-    return chatId;
-  }
-
-  async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
-    this.ensureReady();
-    const targetChatId = await this.resolveChatId(chatId);
-    const msg = await this.client!.sendMessage(targetChatId, text);
-    return this.extractMessageResult(msg);
-  }
-
-  async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media);
-  }
-
-  async sendVideoMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media);
-  }
-
-  async sendAudioMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media, { sendAudioAsVoice: false });
-  }
-
-  async sendDocumentMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    // WhatsApp Web revienta dentro del frontend ("Data passed to getter must
-    // include an id property...") cuando el documento no lleva filename o lleva
-    // un filename sin extensión. Normalizamos aquí para no depender del caller.
-    const normalized: MediaInput = {
-      ...media,
-      filename: this.ensureDocumentFilename(media.filename, media.mimetype),
+    // API-surface clusters live in ./wwebjs-* delegates; the public methods below forward to them.
+    // The host is one object literal shared by every delegate, and closures (not a `this` reference)
+    // keep the delegates' surface exactly this narrow. Built in the constructor, not as a field
+    // initializer: `config` is a parameter property, which field initializers read before assignment.
+    this.host = {
+      ensureReady: () => this.ensureReady(),
+      getClient: () => this.client!,
+      logger: this.logger,
+      isPageTransportError: error => this.isPageTransportError(error),
+      reportIfPageTransportError: (error, context) => this.reportIfPageTransportError(error, context),
+      ensureNotChannelRecipient: chatId => this.ensureNotChannelRecipient(chatId),
+      getNumberId: number => this.getNumberId(number),
+      capInboundMediaFor: (msg, maxBytesOverride) => this.capInboundMediaFor(msg, maxBytesOverride),
+      config: this.config,
+      getCallbacks: () => this.callbacks,
+      getSelfWid: () => this.client?.info?.wid?._serialized,
     };
-    return this.sendMediaMessage(chatId, normalized, { sendMediaAsDocument: true });
+    this.groups = new WwebjsGroups(this.host);
+    this.messaging = new WwebjsMessaging(this.host);
+    this.contacts = new WwebjsContacts(this.host);
+    this.profile = new WwebjsProfile(this.host);
+    this.labels = new WwebjsLabels(this.host);
+    this.channels = new WwebjsChannels(this.host);
+    this.statuses = new WwebjsStatus(this.host);
+    this.chats = new WwebjsChats(this.host, this.messaging);
+    this.catalog = new WwebjsCatalog(this.host);
+    // Lifecycle collaborators, each with its own narrow host slice of closures. Constructed before
+    // the lifecycle delegate, whose host closes over them; every closure reads adapter state live,
+    // so construction order carries no initialization requirements.
+    this.reconcile = new WwebjsReadyReconcile({
+      logger: this.logger,
+      config: this.config,
+      getClient: () => this.client,
+      getStatus: () => this.status,
+      setStatus: status => this.lifecycle.setStatus(status),
+      getCallbacks: () => this.callbacks,
+      markReadyFromClientInfo: () => this.lifecycle.markReadyFromClientInfo(),
+      wasFreshPairing: () => this.lifecycle.qrShown,
+      recoverFromStuckAuth: () => this.recoverFromStuckAuth(),
+    });
+    this.stuckAuth = new WwebjsStuckAuth({
+      logger: this.logger,
+      config: this.config,
+      getClient: () => this.client,
+      setClient: client => (this.lifecycle.client = client),
+      setStatus: status => this.lifecycle.setStatus(status),
+      getCallbacks: () => this.callbacks,
+    });
+    this.calls = new WwebjsCalls({
+      logger: this.logger,
+      isTearingDown: () => this.tearingDown,
+      getCallbacks: () => this.callbacks,
+    });
+    this.onboardingWatcher = new WwebjsOnboardingWatcher({
+      logger: this.logger,
+      config: this.config,
+      getClient: () => this.client,
+      getStatus: () => this.status,
+      setStatus: status => this.lifecycle.setStatus(status),
+      isTearingDown: () => this.tearingDown,
+      isDisconnectReported: () => this.disconnectReported,
+      getCallbacks: () => this.callbacks,
+    });
+    this.lifecycle = new WwebjsLifecycle({
+      logger: this.logger,
+      config: this.config,
+      getCallbacks: () => this.callbacks,
+      emitState: status => this.emit('stateChanged', status),
+      scheduleReadyReconcile: () => this.reconcile.scheduleReadyReconcile(),
+      clearReadyReconcile: () => this.reconcile.clearReadyReconcile(),
+      startOnboardingWatcher: () => this.onboardingWatcher.startOnboardingWatcher(),
+      clearOnboardingWatcher: () => this.onboardingWatcher.clearOnboardingWatcher(),
+      clearLiveCalls: () => this.calls.clearLiveCalls(),
+      clearLocalAuth: () => this.clearLocalAuth(),
+      attachDomainEvents: client => this.attachDomainEvents(client),
+    });
   }
 
   /**
-   * Garantiza un filename con extensión para documentos.
-   * Sin esto WA Web falla con: "Data passed to getter must include an id
-   * property (it's how we memoize) but got undefined".
+   * Download inbound media safely. downloadMedia() can't be size-bounded at the source, so (1) pre-gate
+   * on the sender-declared size and skip the download entirely when it exceeds the cap, and (2) run the
+   * download through the concurrency limiter for backpressure. Resolves an envelope whenever it has one
+   * to build: the payload, or the declared-only marker when no blob is available.
    */
-  private ensureDocumentFilename(filename: string | undefined, mimetype: string): string {
-    const clean = (filename || '').trim().replace(/^"|"$/g, '');
-    const ext = this.extensionForMimetype(mimetype);
-    if (!clean) {
-      return `document.${ext}`;
+  private async capInboundMediaFor(
+    msg: Message,
+    maxBytesOverride?: number,
+  ): Promise<IncomingMessage['media'] | undefined> {
+    if (!isMediaDownloadEnabled()) {
+      return declaredOnlyMedia(msg);
     }
-    // Quita rutas que a veces manda el cliente (C:\fakepath\doc.pdf)
-    const base = clean.split(/[\\/]/).pop() || clean;
-    if (base.includes('.')) {
-      return base;
-    }
-    return `${base}.${ext}`;
-  }
-
-  private extensionForMimetype(mimetype: string): string {
-    const mime = (mimetype || '').split(';')[0].trim().toLowerCase();
-    const map: Record<string, string> = {
-      'application/pdf': 'pdf',
-      'application/msword': 'doc',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-      'application/vnd.ms-excel': 'xls',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-      'application/vnd.ms-powerpoint': 'ppt',
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
-      'application/zip': 'zip',
-      'application/x-rar-compressed': 'rar',
-      'application/json': 'json',
-      'text/plain': 'txt',
-      'text/csv': 'csv',
-      'text/html': 'html',
-      'image/jpeg': 'jpg',
-      'image/png': 'png',
-      'image/gif': 'gif',
-      'image/webp': 'webp',
-      'video/mp4': 'mp4',
-      'audio/mpeg': 'mp3',
-      'audio/ogg': 'ogg',
-    };
-    if (map[mime]) return map[mime];
-    const parts = mime.split('/');
-    if (parts.length === 2 && parts[1]) {
-      // image/jpeg -> jpeg (válido), application/octet-stream -> bin
-      if (parts[1] === 'octet-stream') return 'bin';
-      return parts[1].split('+')[0];
-    }
-    return 'bin';
-  }
-
-  private async sendMediaMessage(
-    chatId: string,
-    media: MediaInput,
-    options: Record<string, any> = {},
-  ): Promise<MessageResult> {
-    this.ensureReady();
-    const targetChatId = await this.resolveChatId(chatId);
-    const isDocument = Boolean(options.sendMediaAsDocument);
-
-    let messageMedia: MessageMedia;
-
-    if (typeof media.data === 'string') {
-      if (media.data.startsWith('http://') || media.data.startsWith('https://')) {
-        // URL: no perder el filename normalizado (fromUrl lo deduciría de la URL
-        // y podría quedar sin extensión -> revienta WA Web con el error del getter).
-        messageMedia = await MessageMedia.fromUrl(media.data, {
-          filename: isDocument
-            ? this.ensureDocumentFilename(media.filename, media.mimetype)
-            : media.filename,
-          unsafeMime: true,
-        });
-        // fromUrl deduce el mimetype del Content-Type; si quedó genérico y el
-        // caller dio uno explícito, respetar el del caller.
-        if (
-          media.mimetype &&
-          media.mimetype !== 'application/octet-stream' &&
-          (!messageMedia.mimetype || messageMedia.mimetype === 'application/octet-stream')
-        ) {
-          messageMedia.mimetype = media.mimetype;
-        }
-      } else {
-        // Base64 (puro o data URI)
-        let cleanData = media.data.trim();
-        let mimetype = media.mimetype;
-        const dataUriMatch = cleanData.match(/^data:([^;]+);base64,([\s\S]*)$/);
-        if (dataUriMatch) {
-          mimetype = dataUriMatch[1] || mimetype;
-          cleanData = dataUriMatch[2].replace(/\s/g, '');
-        }
-        if (!cleanData) {
-          throw new Error('Media data is empty');
-        }
-        messageMedia = new MessageMedia(
-          mimetype,
-          cleanData,
-          isDocument ? this.ensureDocumentFilename(media.filename, mimetype) : media.filename,
-        );
-      }
-    } else {
-      // Buffer
-      if (media.data.length === 0) {
-        throw new Error('Media data is empty');
-      }
-      messageMedia = new MessageMedia(
-        media.mimetype,
-        media.data.toString('base64'),
-        isDocument ? this.ensureDocumentFilename(media.filename, media.mimetype) : media.filename,
-      );
-    }
-
-    // Cinturón y tirantes: el documento SIEMPRE debe llevar filename con extensión.
-    if (isDocument) {
-      messageMedia.filename = this.ensureDocumentFilename(
-        messageMedia.filename || media.filename,
-        messageMedia.mimetype || media.mimetype,
-      );
-    }
-    if (!messageMedia.mimetype) {
-      messageMedia.mimetype = media.mimetype;
-    }
-
-    let msg: unknown;
-    try {
-      msg = await this.client!.sendMessage(targetChatId, messageMedia, {
-        caption: media.caption,
-        ...options,
+    // Read the id once, through readWid: a bare `_serialized` read yields undefined on the WA Web build
+    // that renamed it to `$1` (#747), which is the same build whose page-side rename makes these
+    // downloads fail. The warnings below are the diagnostic for it, so they must carry a real id.
+    const msgId = readWid(msg.id);
+    const maxBytes = maxBytesOverride ?? inboundMediaMaxBytes();
+    const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
+    const declared = coerceDeclaredSize(data?.size);
+    if (declared > maxBytes) {
+      this.logger.warn('Inbound media declared size exceeds the cap; skipped download', {
+        msgId,
+        sizeBytes: declared,
+        maxBytes,
       });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      if (detail.includes('getter must include an id')) {
-        throw new Error(
-          `WhatsApp Web rechazó el ${isDocument ? 'documento' : 'medio'} para ${targetChatId} ` +
-            `(getter id error). Verifica que el chat exista y esté sincronizado, y que el archivo ` +
-            `lleve filename con extensión y mimetype válido ` +
-            `(filename="${messageMedia.filename}", mimetype="${messageMedia.mimetype}"). ` +
-            `Original: ${detail}`,
-        );
-      }
-      throw error;
+      return declaredOnlyMedia(msg);
     }
-
-    // sendMessage devuelve undefined cuando el chat no existe (Client.js retorna
-    // null si getChat falla). Antes esto se enmascaraba con un id inventado.
-    if (!msg) {
-      throw new Error(
-        `No se pudo enviar el ${isDocument ? 'documento' : 'medio'}: chat ${targetChatId} no encontrado. ` +
-          `Verifica el chatId y que la sesión esté sincronizada.`,
-      );
-    }
-
-    return this.extractMessageResult(msg);
-  }
-
-  async getContacts(): Promise<Contact[]> {
-    this.ensureReady();
-    const contacts = await this.client!.getContacts();
-
-    return contacts.map(c => ({
-      id: c.id._serialized,
-      name: c.name || undefined,
-      pushName: c.pushname || undefined,
-      number: c.number,
-      isMyContact: c.isMyContact,
-      isBlocked: c.isBlocked,
-    }));
-  }
-
-  async getContactById(contactId: string): Promise<Contact | null> {
-    this.ensureReady();
-    try {
-      const contact = await this.client!.getContactById(contactId);
-      return {
-        id: contact.id._serialized,
-        name: contact.name || undefined,
-        pushName: contact.pushname || undefined,
-        number: contact.number,
-        isMyContact: contact.isMyContact,
-        isBlocked: contact.isBlocked,
-      };
-    } catch (error) {
-      this.logger.warn(`Failed to get contact: ${contactId}`, String(error));
-      return null;
-    }
-  }
-
-  async checkNumberExists(number: string): Promise<boolean> {
-    this.ensureReady();
-    const numberId = await this.client!.getNumberId(number);
-    return numberId !== null;
-  }
-
-  async getGroups(): Promise<Group[]> {
-    this.ensureReady();
-    const chats = await this.client!.getChats();
-
-    // Filter only group chats
-    const groups = chats.filter(chat => chat.isGroup);
-
-    return groups.map(g => {
-      const groupChat = g as unknown as GroupChat;
-      return {
-        id: g.id._serialized,
-        name: g.name,
-        participantsCount: groupChat.participants?.length,
-        isAdmin: groupChat.participants?.some(
-          p => p.isAdmin && p.id._serialized === this.client?.info?.wid?._serialized,
-        ),
-      };
+    // msg.downloadMedia() can't be aborted, so freeing the slot the moment the wall-clock deadline fires
+    // would admit a fresh download while the abandoned one is still materialising in heap — letting the
+    // number of in-flight downloads exceed inboundMediaConcurrency(). Instead, HOLD the slot until the real
+    // download settles; the caller still unblocks on the timeout race and emits the message without media.
+    // boundedReady adopts the timeout-bounded race (a Promise resolving a Promise flattens), so awaiting it
+    // unblocks the caller once the task is admitted AND the deadline-or-download settles — yielding the
+    // media or null on timeout.
+    let resolveBounded: (value: MessageMedia | null | PromiseLike<MessageMedia | null>) => void = () => undefined;
+    const boundedReady = new Promise<MessageMedia | null>(resolve => {
+      resolveBounded = resolve;
     });
+    // Set when the caller's wait below expires. A task still queued at that point has nobody left to
+    // read its result, so once admitted it gives the slot straight back instead of pulling a full
+    // base64 blob over CDP and holding the slot for it: after a burst, that backlog is what made
+    // later messages miss their own deadline. A download that already started is unaffected.
+    let abandoned = false;
+    const downloadInSlot = (): Promise<void> => {
+      if (abandoned) {
+        resolveBounded(null);
+        return Promise.resolve();
+      }
+      // downloadMedia() is async, so a page-side throw (a detached target, a WA Web field rename) arrives
+      // as a rejection, which boundedReady adopts and rethrows past the only exit that builds the marker,
+      // leaving every call site to emit with no media field at all. It is the same "no usable media"
+      // outcome as the timeout below, so it takes the same null sentinel.
+      const download = msg.downloadMedia().catch((error: unknown) => {
+        this.logger.warn('Inbound media download failed; emitting the omitted marker', {
+          msgId,
+          error: String(error),
+        });
+        return null;
+      });
+      resolveBounded(
+        withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () =>
+          this.logger.warn(
+            'Inbound media download timed out (MEDIA_DOWNLOAD_TIMEOUT_MS); emitting message without media',
+            {
+              msgId,
+            },
+          ),
+        ),
+      );
+      // Keep the slot occupied until the underlying download truly settles, not the timeout race.
+      return download.then(
+        () => undefined,
+        () => undefined,
+      );
+    };
+    // Per-session slot first, then the process-wide one, so a session parks at most its own
+    // INBOUND_MEDIA_CONCURRENCY waiters on the shared gate. Both are held until the download settles.
+    const slotHeld = this.inboundLimiter.run(() => runUnderGlobalMediaGate(downloadInSlot));
+    // Defensive only, and deliberately kept. `run()` rejects on a full queue (gone — the queue is
+    // unbounded) or on close(), which nothing calls on this limiter; the task itself swallows both
+    // download outcomes. So nothing is expected here — but an unhandled rejection from a
+    // fire-and-forget promise is not an acceptable way to find that out.
+    void slotHeld.catch((error: unknown) => {
+      this.logger.warn('Inbound media slot holder rejected unexpectedly; emitting message without media', {
+        msgId,
+        error: String(error),
+      });
+      resolveBounded(null);
+    });
+    // The caller's wait spans the QUEUE as well as the download, and BOTH are unbounded: the queue by
+    // design now, and the wait for a slot because a slot is held until its download really settles —
+    // which a hung page never does. The inner race only starts once this message is admitted, so it
+    // cannot cover the waiting. Without a bound here, a burst behind stuck slots parks forever and
+    // those messages are never emitted AT ALL — strictly worse than the media loss this change set
+    // out to fix. The old queue cap provided that degradation by rejecting; this restores it without
+    // shedding at a fixed batch size.
+    const media = await withInboundDownloadTimeout(boundedReady, inboundMediaTimeoutMs(), () => {
+      abandoned = true;
+      this.logger.warn(
+        'Inbound media did not arrive within MEDIA_DOWNLOAD_TIMEOUT_MS; emitting message without media',
+        {
+          msgId,
+        },
+      );
+    });
+    if (!media) {
+      return declaredOnlyMedia(msg);
+    }
+    const capped = capInboundMedia({
+      mimetype: media.mimetype,
+      filename: media.filename || undefined,
+      sizeBytes: Buffer.byteLength(media.data, 'base64'),
+      toBase64: () => media.data,
+    });
+    if (capped.omitted) {
+      this.logger.warn('Inbound media exceeds MEDIA_DOWNLOAD_MAX_BYTES; dropped payload, kept envelope', {
+        msgId,
+        sizeBytes: capped.sizeBytes,
+      });
+    }
+    return capped;
+  }
+
+  // ----- Lifecycle (./wwebjs-lifecycle and its sibling collaborators) -----
+
+  async initialize(callbacks: EngineEventCallbacks): Promise<void> {
+    this.callbacks = callbacks;
+    return this.lifecycle.initialize();
+  }
+
+  private setupEventHandlers(): void {
+    this.lifecycle.setupEventHandlers();
+  }
+
+  private attachPuppeteerLifecycleListeners(): void {
+    this.lifecycle.attachPuppeteerLifecycleListeners();
+  }
+
+  private isPageTransportError(error: unknown): boolean {
+    return this.lifecycle.isPageTransportError(error);
+  }
+
+  private reportIfPageTransportError(error: unknown, context: string): void {
+    this.lifecycle.reportIfPageTransportError(error, context);
+  }
+
+  async disconnect(): Promise<void> {
+    return this.lifecycle.disconnect();
+  }
+
+  async logout(): Promise<void> {
+    return this.lifecycle.logout();
+  }
+
+  async destroy(): Promise<void> {
+    return this.lifecycle.destroy();
+  }
+
+  async forceDestroy(): Promise<void> {
+    return this.lifecycle.forceDestroy();
+  }
+
+  getStatus(): EngineStatus {
+    return this.lifecycle.getStatus();
+  }
+
+  async probeLiveness(): Promise<boolean> {
+    return this.lifecycle.probeLiveness();
+  }
+
+  getQRCode(): string | null {
+    return this.lifecycle.getQRCode();
+  }
+
+  async requestPairingCode(phoneNumber: string): Promise<string> {
+    return this.lifecycle.requestPairingCode(phoneNumber);
+  }
+
+  getPhoneNumber(): string | null {
+    return this.lifecycle.getPhoneNumber();
+  }
+
+  getPushName(): string | null {
+    return this.lifecycle.getPushName();
+  }
+
+  private recoverFromStuckAuth(): Promise<void> {
+    return this.stuckAuth.recoverFromStuckAuth();
+  }
+
+  private clearLocalAuth(): Promise<void> {
+    return this.stuckAuth.clearLocalAuth();
+  }
+
+  private reportActionRequired(reason: string): void {
+    this.onboardingWatcher.reportActionRequired(reason);
+  }
+
+  /**
+   * Register the message/group/call domain events on a freshly built client — the one seam the
+   * lifecycle's setupEventHandlers() uses for everything that is pure payload mapping. The
+   * connection-state events (qr/authenticated/ready/disconnected/auth_failure) stay in the
+   * lifecycle module: they drive the latches these registrars never touch.
+   */
+  private attachDomainEvents(client: Client): void {
+    registerWwebjsMessageEvents(client, this.host);
+    registerWwebjsGroupEvents(client, this.host);
+    client.on('call', call => this.calls.handleIncomingCall(call));
+  }
+
+  /**
+   * whatsapp-web.js exposes no way to observe another party's presence: WAWebPresenceChatAction
+   * offers only sendPresenceAvailable/sendPresenceUnavailable, which publish the ACCOUNT's own
+   * presence, and the library surfaces no presence event at all.
+   *
+   * Declared here inline rather than in a delegate on purpose. The parity gate reads method bodies
+   * off the prototype, so a throw hidden behind a delegate call is invisible to it and the
+   * `not-available` matrix row would go unverified; inline, the gate checks it.
+   */
+  createChannel(name: string, description?: string): Promise<Channel> {
+    return this.channels.createChannel(name, description);
+  }
+
+  deleteChannel(channelId: string): Promise<void> {
+    return this.channels.deleteChannel(channelId);
+  }
+
+  muteChannel(channelId: string, mute: boolean): Promise<void> {
+    return this.channels.muteChannel(channelId, mute);
+  }
+
+  demoteChannelAdmin(channelId: string, userId: string): Promise<void> {
+    return this.channels.demoteChannelAdmin(channelId, userId);
+  }
+
+  transferChannelOwnership(channelId: string, newOwnerId: string): Promise<void> {
+    return this.channels.transferChannelOwnership(channelId, newOwnerId);
+  }
+
+  getChatsByLabel(labelId: string): Promise<ChatSummary[]> {
+    return this.labels.getChatsByLabel(labelId);
+  }
+
+  /**
+   * whatsapp-web.js 1.34.7 can read labels and assign them, but cannot create, rename, recolour or
+   * delete one — `index.d.ts` exposes getLabels / getLabelById / getChatLabels / getChatsByLabelId /
+   * addOrRemoveLabels and nothing that edits the label itself.
+   *
+   * Inline rather than delegated so the parity gate, which reads bodies off the prototype, can
+   * verify the matrix row (see docs/29).
+   */
+  // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
+  async upsertLabel(_label: LabelInput): Promise<void> {
+    throw new EngineNotSupportedError('upsertLabel');
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
+  async deleteLabel(_labelId: string): Promise<void> {
+    throw new EngineNotSupportedError('deleteLabel');
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
+  async subscribeToPresence(_chatId: string): Promise<void> {
+    throw new EngineNotSupportedError('subscribeToPresence');
+  }
+
+  createCallLink(type: CallLinkType, startTime: number): Promise<string> {
+    return this.profile.createCallLink(type, startTime);
+  }
+
+  /** Always EngineNotSupportedError (HTTP 501): a rejection did not stop a live call ringing. See
+   *  ./wwebjs-calls. */
+  async rejectCall(callId: string): Promise<void> {
+    return this.calls.rejectCall(callId);
+  }
+
+  sendTextMessage(
+    chatId: string,
+    text: string,
+    mentions?: string[],
+    options?: { linkPreview?: boolean; customPreview?: CustomLinkPreview },
+  ): Promise<MessageResult> {
+    return this.messaging.sendTextMessage(chatId, text, mentions, options);
+  }
+
+  sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
+    return this.messaging.sendImageMessage(chatId, media);
+  }
+
+  sendVideoMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
+    return this.messaging.sendVideoMessage(chatId, media);
+  }
+
+  sendAudioMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
+    return this.messaging.sendAudioMessage(chatId, media);
+  }
+
+  sendDocumentMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
+    return this.messaging.sendDocumentMessage(chatId, media);
+  }
+
+  getContacts(): Promise<Contact[]> {
+    return this.contacts.getContacts();
+  }
+
+  getContactById(contactId: string): Promise<Contact | null> {
+    return this.contacts.getContactById(contactId);
+  }
+
+  getNumberId(number: string): Promise<string | null> {
+    return this.contacts.getNumberId(number);
+  }
+
+  checkNumberExists(number: string): Promise<boolean> {
+    return this.contacts.checkNumberExists(number);
+  }
+
+  resolveContactPhone(contactId: string): Promise<string | null> {
+    return this.contacts.resolveContactPhone(contactId);
+  }
+
+  getGroups(): Promise<Group[]> {
+    return this.groups.getGroups();
   }
 
   // ============= Phase 3: Extended Messaging =============
 
-  async sendLocationMessage(chatId: string, location: LocationInput): Promise<MessageResult> {
-    this.ensureReady();
-    // Import Location class dynamically from whatsapp-web.js
-    const { Location } = await import('whatsapp-web.js');
-    const loc = new Location(location.latitude, location.longitude, {
-      name: location.description || '',
-      address: location.address || '',
-    });
-    const msg = await this.client!.sendMessage(chatId, loc);
-    return this.extractMessageResult(msg);
+  sendLocationMessage(chatId: string, location: LocationInput): Promise<MessageResult> {
+    return this.messaging.sendLocationMessage(chatId, location);
   }
 
-  async sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
-    this.ensureReady();
-    // Create vCard format
-    const vcard = [
-      'BEGIN:VCARD',
-      'VERSION:3.0',
-      `FN:${contact.name}`,
-      `TEL;type=CELL;type=VOICE;waid=${contact.number}:+${contact.number}`,
-      'END:VCARD',
-    ].join('\n');
-
-    const msg = await this.client!.sendMessage(chatId, vcard, {
-      parseVCards: true,
-    });
-    return this.extractMessageResult(msg);
+  sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
+    return this.messaging.sendContactMessage(chatId, contact);
   }
 
-  async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    this.ensureReady();
-    let messageMedia: MessageMedia;
-
-    if (typeof media.data === 'string') {
-      if (media.data.startsWith('http://') || media.data.startsWith('https://')) {
-        messageMedia = await MessageMedia.fromUrl(media.data);
-      } else {
-        messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
-      }
-    } else {
-      messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
-    }
-
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
-      sendMediaAsSticker: true,
-    });
-    return this.extractMessageResult(msg);
+  sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
+    return this.messaging.sendStickerMessage(chatId, media);
   }
 
-  async replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult> {
-    this.ensureReady();
-    // Find the message to quote
-    const chat = await this.client!.getChatById(chatId);
-    const messages = await chat.fetchMessages({ limit: 100 });
-    const quotedMsg = messages.find(m => m.id._serialized === quotedMsgId);
-
-    if (!quotedMsg) {
-      throw new Error(`Message ${quotedMsgId} not found`);
-    }
-
-    const msg = await quotedMsg.reply(text);
-    return this.extractMessageResult(msg);
+  sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult> {
+    return this.messaging.sendPollMessage(chatId, poll);
   }
 
-  async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(fromChatId);
-    const messages = await chat.fetchMessages({ limit: 100 });
-    const msgToForward = messages.find(m => m.id._serialized === messageId);
+  replyToMessage(chatId: string, quotedMsgId: string, text: string, mentions?: string[]): Promise<MessageResult> {
+    return this.messaging.replyToMessage(chatId, quotedMsgId, text, mentions);
+  }
 
-    if (!msgToForward) {
-      throw new Error(`Message ${messageId} not found`);
-    }
-
-    await msgToForward.forward(toChatId);
-    return {
-      id: `fwd_${messageId}`,
-      timestamp: Math.floor(Date.now() / 1000),
-    };
+  forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
+    return this.messaging.forwardMessage(fromChatId, toChatId, messageId);
   }
 
   // ============= Phase 3: Group Management =============
 
-  async getGroupInfo(groupId: string): Promise<GroupInfo | null> {
-    this.ensureReady();
-    try {
-      const chat = await this.client!.getChatById(groupId);
-      if (!chat.isGroup) {
-        return null;
-      }
-      const groupChat = chat as unknown as GroupChat;
-      const participants: GroupParticipant[] = (groupChat.participants || []).map(p => ({
-        id: String(p.id._serialized),
-        number: String(p.id.user),
-        name: p.name ? String(p.name) : undefined,
-        isAdmin: Boolean(p.isAdmin),
-        isSuperAdmin: Boolean(p.isSuperAdmin),
-      }));
-
-      return {
-        id: chat.id._serialized,
-        name: chat.name,
-        description: groupChat.description ? String(groupChat.description) : undefined,
-        owner: groupChat.owner?._serialized ? String(groupChat.owner._serialized) : undefined,
-        createdAt: groupChat.createdAt,
-        participants,
-        isReadOnly: Boolean(groupChat.isReadOnly),
-        isAnnounce: Boolean(groupChat.isAnnounce),
-      };
-    } catch (error) {
-      this.logger.warn(`Failed to get group: ${groupId}`, String(error));
-      return null;
-    }
+  getGroupInfo(groupId: string): Promise<GroupInfo | null> {
+    return this.groups.getGroupInfo(groupId);
   }
 
-  async createGroup(name: string, participants: string[]): Promise<Group> {
-    this.ensureReady();
-    // Ensure participant IDs are in correct format
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    const result = await this.client!.createGroup(name, participantIds);
-
-    const groupId = String((result as unknown as GroupCreateResult).gid._serialized);
-    return {
-      id: groupId,
-      name: name,
-      participantsCount: participants.length,
-    };
+  createGroup(name: string, participants: string[]): Promise<Group> {
+    return this.groups.createGroup(name, participants);
   }
 
-  async addParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).addParticipants(participantIds);
+  addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.groups.addParticipants(groupId, participants);
   }
 
-  async removeParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).removeParticipants(participantIds);
+  removeParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.groups.removeParticipants(groupId, participants);
   }
 
-  async promoteParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).promoteParticipants(participantIds);
+  promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.groups.promoteParticipants(groupId, participants);
   }
 
-  async demoteParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).demoteParticipants(participantIds);
+  demoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.groups.demoteParticipants(groupId, participants);
   }
 
-  async leaveGroup(groupId: string): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    await (chat as unknown as GroupChat).leave();
+  leaveGroup(groupId: string): Promise<void> {
+    return this.groups.leaveGroup(groupId);
   }
 
-  async setGroupSubject(groupId: string, subject: string): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    await (chat as unknown as GroupChat).setSubject(subject);
+  setGroupSubject(groupId: string, subject: string): Promise<void> {
+    return this.groups.setGroupSubject(groupId, subject);
   }
 
-  async setGroupDescription(groupId: string, description: string): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    await (chat as unknown as GroupChat).setDescription(description);
+  setGroupDescription(groupId: string, description: string): Promise<void> {
+    return this.groups.setGroupDescription(groupId, description);
   }
 
   // Reactions (Phase 3)
-  async reactToMessage(chatId: string, messageId: string, emoji: string): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(chatId);
-    const messages = await chat.fetchMessages({ limit: 100 });
-    const message = messages.find(m => m.id._serialized === messageId);
-    if (!message) {
-      throw new Error(`Message ${messageId} not found in chat ${chatId}`);
-    }
-    await (message as MessageWithReactions).react(emoji);
-    this.logger.log(`Reacted to message ${messageId} with ${emoji || '(removed)'}`);
+  reactToMessage(chatId: string, messageId: string, emoji: string): Promise<void> {
+    return this.messaging.reactToMessage(chatId, messageId, emoji);
   }
 
-  async getMessageReactions(chatId: string, messageId: string): Promise<MessageReaction[]> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(chatId);
-    const messages = await chat.fetchMessages({ limit: 100 });
-    const message = messages.find(m => m.id._serialized === messageId);
-    if (!message) {
-      throw new Error(`Message ${messageId} not found in chat ${chatId}`);
-    }
-    const msgWithReactions = message as MessageWithReactions;
-    if (!msgWithReactions.hasReaction) {
-      return [];
-    }
-    const reactions = await msgWithReactions.getReactions();
-    if (!reactions) {
-      return [];
-    }
-    // Map reactions to our interface format
-    const result: MessageReaction[] = [];
-
-    for (const r of reactions) {
-      result.push({
-        emoji: String(r.id),
-        senders: (r.senders || []).map(s => ({
-          senderId: String(s.senderId),
-          emoji: String(s.reaction),
-          timestamp: Number(s.timestamp),
-        })),
-      });
-    }
-    return result;
+  getMessageReactions(chatId: string, messageId: string): Promise<MessageReaction[]> {
+    return this.messaging.getMessageReactions(chatId, messageId);
   }
 
   // Labels (Phase 3) - WhatsApp Business only
-  async getLabels(): Promise<Label[]> {
-    this.ensureReady();
-    const labels = await (this.client as unknown as BusinessClient).getLabels();
-    if (!labels) {
-      return [];
-    }
-
-    return labels.map(label => ({
-      id: String(label.id),
-      name: String(label.name),
-      hexColor: String(label.hexColor),
-    }));
+  getLabels(): Promise<Label[]> {
+    return this.labels.getLabels();
   }
 
-  async getLabelById(labelId: string): Promise<Label | null> {
-    this.ensureReady();
-    const label = await (this.client as unknown as BusinessClient).getLabelById(labelId);
-    if (!label) {
-      return null;
-    }
-    return {
-      id: String(label.id),
-      name: String(label.name),
-      hexColor: String(label.hexColor),
-    };
+  getLabelById(labelId: string): Promise<Label | null> {
+    return this.labels.getLabelById(labelId);
   }
 
-  async getChatLabels(chatId: string): Promise<Label[]> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(chatId);
-    const labels = await (chat as unknown as GroupChat).getLabels();
-    if (!labels) {
-      return [];
-    }
-
-    return labels.map(label => ({
-      id: String(label.id),
-      name: String(label.name),
-      hexColor: String(label.hexColor),
-    }));
+  getChatLabels(chatId: string): Promise<Label[]> {
+    return this.labels.getChatLabels(chatId);
   }
 
-  async addLabelToChat(chatId: string, labelId: string): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(chatId);
-    await (chat as unknown as GroupChat).addLabel(labelId);
-    this.logger.log(`Added label ${labelId} to chat ${chatId}`);
+  addLabelToChat(chatId: string, labelId: string): Promise<void> {
+    return this.labels.addLabelToChat(chatId, labelId);
   }
 
-  async removeLabelFromChat(chatId: string, labelId: string): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(chatId);
-    await (chat as unknown as GroupChat).removeLabel(labelId);
-    this.logger.log(`Removed label ${labelId} from chat ${chatId}`);
+  removeLabelFromChat(chatId: string, labelId: string): Promise<void> {
+    return this.labels.removeLabelFromChat(chatId, labelId);
   }
 
   // Channels/Newsletter (Phase 3)
-  async getSubscribedChannels(): Promise<Channel[]> {
-    this.ensureReady();
-    const channels = await (this.client as unknown as BusinessClient).getChannels();
-    if (!channels) {
-      return [];
-    }
-    return channels.map((ch: WwjsChannelData) => ({
-      id: String(typeof ch.id === 'object' ? ch.id._serialized : ch.id),
-      name: String(ch.name || ''),
-      description: ch.description ? String(ch.description) : undefined,
-      inviteCode: ch.inviteCode ? String(ch.inviteCode) : undefined,
-      subscriberCount: ch.subscriberCount ? Number(ch.subscriberCount) : undefined,
-      verified: ch.verified ? Boolean(ch.verified) : undefined,
-    }));
+  getSubscribedChannels(): Promise<Channel[]> {
+    return this.channels.getSubscribedChannels();
   }
 
-  async getChannelById(channelId: string): Promise<Channel | null> {
-    this.ensureReady();
-    try {
-      const ch = await (this.client as unknown as BusinessClient).getChannelById(channelId);
-      if (!ch) {
-        return null;
-      }
-      return {
-        id: String(typeof ch.id === 'object' ? ch.id._serialized : ch.id),
-        name: String(ch.name || ''),
-        description: ch.description ? String(ch.description) : undefined,
-        inviteCode: ch.inviteCode ? String(ch.inviteCode) : undefined,
-        subscriberCount: ch.subscriberCount ? Number(ch.subscriberCount) : undefined,
-        verified: ch.verified ? Boolean(ch.verified) : undefined,
-      };
-    } catch (error) {
-      this.logger.warn(`Failed to get channel: ${channelId}`, String(error));
-      return null;
-    }
+  getChannelById(channelId: string): Promise<Channel | null> {
+    return this.channels.getChannelById(channelId);
   }
 
-  async subscribeToChannel(inviteCode: string): Promise<Channel> {
-    this.ensureReady();
-    const ch = await (this.client as unknown as BusinessClient).subscribeToChannel(inviteCode);
-    this.logger.log(`Subscribed to channel with invite code: ${inviteCode}`);
-    return {
-      id: String(typeof ch.id === 'object' ? ch.id._serialized : ch.id),
-      name: String(ch.name || ''),
-      description: ch.description ? String(ch.description) : undefined,
-    };
+  subscribeToChannel(_inviteCode: string): Promise<Channel> {
+    return this.channels.subscribeToChannel(_inviteCode);
   }
 
-  async unsubscribeFromChannel(channelId: string): Promise<void> {
-    this.ensureReady();
-    await (this.client as unknown as BusinessClient).unsubscribeFromChannel(channelId);
-    this.logger.log(`Unsubscribed from channel: ${channelId}`);
+  unsubscribeFromChannel(channelId: string): Promise<void> {
+    return this.channels.unsubscribeFromChannel(channelId);
   }
 
-  async getChannelMessages(channelId: string, limit: number = 50): Promise<ChannelMessage[]> {
-    this.ensureReady();
-    try {
-      const ch = await (this.client as unknown as BusinessClient).getChannelById(channelId);
-      if (!ch) {
-        throw new Error(`Channel ${channelId} not found`);
-      }
-      const messages = await ch.fetchMessages({ limit });
-      if (!messages) {
-        return [];
-      }
-      return messages.map(msg => ({
-        id: String(typeof msg.id === 'object' ? msg.id._serialized : msg.id),
-        body: String(msg.body || ''),
-        timestamp: Number(msg.timestamp),
-        hasMedia: Boolean(msg.hasMedia),
-        mediaUrl: msg.mediaUrl ? String(msg.mediaUrl) : undefined,
-      }));
-    } catch (error) {
-      this.logger.error(`Failed to get channel messages: ${String(error)}`);
-      return [];
-    }
+  getChannelMessages(channelId: string, limit: number = 50): Promise<ChannelMessage[]> {
+    return this.channels.getChannelMessages(channelId, limit);
   }
 
   // ========== Gap Quick Wins Implementation ==========
 
+  getChatHistory(
+    chatId: string,
+    limit: number = 50,
+    includeMedia: boolean = false,
+    mediaMaxBytes?: number,
+    signal?: AbortSignal,
+  ): Promise<IncomingMessage[]> {
+    return this.messaging.getChatHistory(chatId, limit, includeMedia, mediaMaxBytes, signal);
+  }
+
   // Delete Message
-  async deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(chatId);
-    const messages = await chat.fetchMessages({ limit: 100 });
-    const message = messages.find(m => m.id._serialized === messageId || m.id.id === messageId);
-    if (!message) {
-      throw new Error(`Message ${messageId} not found in chat ${chatId}`);
-    }
-    await message.delete(forEveryone);
-    this.logger.log(`Deleted message ${messageId} from chat ${chatId} (forEveryone: ${forEveryone})`);
+  starMessage(chatId: string, messageId: string, star: boolean): Promise<void> {
+    return this.messaging.starMessage(chatId, messageId, star);
+  }
+
+  pinMessage(chatId: string, messageId: string, durationSeconds: number): Promise<void> {
+    return this.messaging.pinMessage(chatId, messageId, durationSeconds);
+  }
+
+  votePoll(chatId: string, pollMessageId: string, options: string[]): Promise<void> {
+    return this.messaging.votePoll(chatId, pollMessageId, options);
+  }
+
+  // whatsapp-web.js has no interactive button-reply send path; the parameters are not named so the
+  // method reads as the 501 it is, and TypeScript accepts the narrower signature for the interface.
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async clickButton(): Promise<MessageResult> {
+    throw new EngineNotSupportedError('clickButton');
+  }
+
+  unpinMessage(chatId: string, messageId: string): Promise<void> {
+    return this.messaging.unpinMessage(chatId, messageId);
+  }
+
+  deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {
+    return this.messaging.deleteMessage(chatId, messageId, forEveryone);
+  }
+
+  // Edit Message
+  editMessage(chatId: string, messageId: string, body: string, mentions?: string[]): Promise<MessageResult> {
+    return this.messaging.editMessage(chatId, messageId, body, mentions);
   }
 
   // Get Profile Picture
-  async getProfilePicture(contactId: string): Promise<string | null> {
-    this.ensureReady();
-    try {
-      const url = await this.client!.getProfilePicUrl(contactId);
-      return url || null;
-    } catch (error) {
-      this.logger.warn(`Failed to get profile picture for ${contactId}: ${String(error)}`);
-      return null;
-    }
+  getProfilePicture(contactId: string): Promise<string | null> {
+    return this.contacts.getProfilePicture(contactId);
   }
 
   // Block Contact
-  async blockContact(contactId: string): Promise<void> {
-    this.ensureReady();
-    const contact = await this.client!.getContactById(contactId);
-    await contact.block();
-    this.logger.log(`Blocked contact ${contactId}`);
+  blockContact(contactId: string): Promise<void> {
+    return this.contacts.blockContact(contactId);
+  }
+
+  upsertContact(contactId: string, firstName: string, lastName?: string): Promise<void> {
+    return this.contacts.upsertContact(contactId, firstName, lastName);
+  }
+
+  deleteContact(contactId: string): Promise<void> {
+    return this.contacts.deleteContact(contactId);
   }
 
   // Unblock Contact
-  async unblockContact(contactId: string): Promise<void> {
-    this.ensureReady();
-    const contact = await this.client!.getContactById(contactId);
-    await contact.unblock();
-    this.logger.log(`Unblocked contact ${contactId}`);
+  unblockContact(contactId: string): Promise<void> {
+    return this.contacts.unblockContact(contactId);
+  }
+
+  getBlockedContacts(): Promise<string[]> {
+    return this.contacts.getBlockedContacts();
+  }
+
+  // ========== Profile (own account) ==========
+
+  setProfileName(name: string): Promise<void> {
+    return this.profile.setProfileName(name);
+  }
+
+  setProfileStatus(status: string): Promise<void> {
+    return this.profile.setProfileStatus(status);
+  }
+
+  deleteProfilePicture(): Promise<void> {
+    return this.profile.deleteProfilePicture();
+  }
+
+  setProfilePicture(media: MediaInput): Promise<void> {
+    return this.profile.setProfilePicture(media);
   }
 
   // Get Group Invite Code
-  async getGroupInviteCode(groupId: string): Promise<string> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error(`${groupId} is not a group`);
-    }
-    const inviteCode = await (chat as unknown as GroupChat).getInviteCode();
-    this.logger.log(`Got invite code for group ${groupId}`);
-    return String(inviteCode);
+  getGroupInviteCode(groupId: string): Promise<string> {
+    return this.groups.getGroupInviteCode(groupId);
   }
 
   // Revoke Group Invite Code
-  async revokeGroupInviteCode(groupId: string): Promise<string> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error(`${groupId} is not a group`);
-    }
-    const newCode = await (chat as unknown as GroupChat).revokeInvite();
-    this.logger.log(`Revoked invite code for group ${groupId}, new code generated`);
-    return String(newCode);
+  revokeGroupInviteCode(groupId: string): Promise<string> {
+    return this.groups.revokeGroupInviteCode(groupId);
+  }
+
+  // Join Group via Invite Code
+  getGroupJoinInfo(inviteCode: string): Promise<GroupJoinInfo> {
+    return this.groups.getGroupJoinInfo(inviteCode);
+  }
+
+  joinGroupViaInviteCode(inviteCode: string): Promise<string> {
+    return this.groups.joinGroupViaInviteCode(inviteCode);
+  }
+
+  // Set "only admins can send messages" (announce)
+  setGroupMessagesAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
+    return this.groups.setGroupMessagesAdminsOnly(groupId, adminsOnly);
+  }
+
+  // Set "only admins can edit group info" (locked/restrict)
+  setGroupInfoAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
+    return this.groups.setGroupInfoAdminsOnly(groupId, adminsOnly);
+  }
+
+  setGroupMemberAddMode(groupId: string, mode: GroupMemberAddMode): Promise<void> {
+    return this.groups.setGroupMemberAddMode(groupId, mode);
+  }
+
+  setGroupPicture(groupId: string, media: MediaInput): Promise<void> {
+    return this.groups.setGroupPicture(groupId, media);
+  }
+
+  deleteGroupPicture(groupId: string): Promise<void> {
+    return this.groups.deleteGroupPicture(groupId);
+  }
+
+  setGroupEphemeral(groupId: string, durationSec: number): Promise<void> {
+    return this.groups.setGroupEphemeral(groupId, durationSec);
+  }
+
+  getGroupMembershipRequests(groupId: string): Promise<GroupMembershipRequest[]> {
+    return this.groups.getGroupMembershipRequests(groupId);
+  }
+
+  approveGroupMembershipRequests(groupId: string, participants?: string[]): Promise<ParticipantOperationResult[]> {
+    return this.groups.approveGroupMembershipRequests(groupId, participants);
+  }
+
+  rejectGroupMembershipRequests(groupId: string, participants?: string[]): Promise<ParticipantOperationResult[]> {
+    return this.groups.rejectGroupMembershipRequests(groupId, participants);
   }
 
   // ========== Status/Stories (Phase 3) ==========
   // Note: These are stub implementations - whatsapp-web.js has limited Status API support
-  /* eslint-disable @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
 
-  async getContactStatuses(): Promise<Status[]> {
-    this.ensureReady();
-    // whatsapp-web.js has limited Status API support
-    // This is a stub that can be enhanced when the library adds support
-    this.logger.warn('getContactStatuses not fully implemented in whatsapp-web.js');
-    return [];
+  getContactStatuses(): Promise<Status[]> {
+    return this.statuses.getContactStatuses();
   }
 
-  async getContactStatus(_contactId: string): Promise<Status[]> {
-    this.ensureReady();
-    this.logger.warn('getContactStatus not fully implemented in whatsapp-web.js');
-    return [];
+  getContactStatus(contactId: string): Promise<Status[]> {
+    return this.statuses.getContactStatus(contactId);
   }
 
-  async postTextStatus(_text: string, _options?: TextStatusOptions): Promise<StatusResult> {
-    this.ensureReady();
-    // whatsapp-web.js doesn't have native status posting
-    // This would require using the underlying WhatsApp Web API directly
-    throw new Error('postTextStatus not yet implemented in whatsapp-web.js adapter');
+  postTextStatus(text: string, options: StatusPostOptions): Promise<StatusResult> {
+    return this.statuses.postTextStatus(text, options);
   }
 
-  async postImageStatus(_media: MediaInput, _caption?: string): Promise<StatusResult> {
-    this.ensureReady();
-    throw new Error('postImageStatus not yet implemented in whatsapp-web.js adapter');
+  postImageStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
+    return this.statuses.postImageStatus(media, options);
   }
 
-  async postVideoStatus(_media: MediaInput, _caption?: string): Promise<StatusResult> {
-    this.ensureReady();
-    throw new Error('postVideoStatus not yet implemented in whatsapp-web.js adapter');
+  postVideoStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
+    return this.statuses.postVideoStatus(media, options);
   }
 
-  async deleteStatus(_statusId: string): Promise<void> {
-    this.ensureReady();
-    throw new Error('deleteStatus not yet implemented in whatsapp-web.js adapter');
+  postVoiceStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
+    return this.statuses.postVoiceStatus(media, options);
+  }
+
+  deleteStatus(statusId: string): Promise<void> {
+    return this.statuses.deleteStatus(statusId);
   }
 
   // ========== Catalog (Phase 3) ==========
+  // whatsapp-web.js has no Catalog API at all (no Client.getCatalog/getProducts/getProduct symbol in
+  // index.d.ts). These used to be phantom stubs — a warn log plus null/empty results — so the API
+  // reported "no catalog" / "no products" for a capability that never ran. Honest 501s instead,
+  // matching sendProduct/sendCatalog below.
 
-  async getCatalog(): Promise<Catalog | null> {
-    this.ensureReady();
-    // whatsapp-web.js doesn't have native Catalog API support
-    this.logger.warn('getCatalog not implemented in whatsapp-web.js adapter');
-    return null;
+  getCatalog(): Promise<Catalog | null> {
+    return this.catalog.getCatalog();
   }
 
-  async getProducts(_options?: ProductQueryOptions): Promise<PaginatedProducts> {
-    this.ensureReady();
-    this.logger.warn('getProducts not implemented in whatsapp-web.js adapter');
-    return {
-      products: [],
-      pagination: { page: 1, limit: 20, total: 0, totalPages: 0 },
-    };
+  getProducts(_options?: ProductQueryOptions): Promise<PaginatedProducts> {
+    return this.catalog.getProducts(_options);
   }
 
-  async getProduct(_productId: string): Promise<Product | null> {
-    this.ensureReady();
-    this.logger.warn('getProduct not implemented in whatsapp-web.js adapter');
-    return null;
+  getProduct(_productId: string): Promise<Product | null> {
+    return this.catalog.getProduct(_productId);
   }
 
-  async sendProduct(_chatId: string, _productId: string, _body?: string): Promise<MessageResult> {
-    this.ensureReady();
-    throw new Error('sendProduct not yet implemented in whatsapp-web.js adapter');
+  sendProduct(_chatId: string, _productId: string, _body?: string): Promise<MessageResult> {
+    return this.catalog.sendProduct(_chatId, _productId, _body);
   }
 
-  async sendCatalog(_chatId: string, _body?: string): Promise<MessageResult> {
-    this.ensureReady();
-    throw new Error('sendCatalog not yet implemented in whatsapp-web.js adapter');
+  sendCatalog(_chatId: string, _body?: string): Promise<MessageResult> {
+    return this.catalog.sendCatalog(_chatId, _body);
   }
 
-  /* eslint-enable @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
+  getChats(): Promise<ChatSummary[]> {
+    return this.chats.getChats();
+  }
+
+  // messageIds is dropped on purpose: whatsapp-web.js exposes only a chat-level sendSeen, which
+  // already marks every message in the chat.
+  sendSeen(chatId: string): Promise<boolean> {
+    return this.chats.sendSeen(chatId);
+  }
+
+  muteChat(chatId: string, muteUntil: number | null): Promise<void> {
+    return this.chats.muteChat(chatId, muteUntil);
+  }
+
+  pinChat(chatId: string, pin: boolean): Promise<boolean> {
+    return this.chats.pinChat(chatId, pin);
+  }
+
+  archiveChat(chatId: string, archive: boolean): Promise<boolean> {
+    return this.chats.archiveChat(chatId, archive);
+  }
+
+  clearChatMessages(chatId: string): Promise<boolean> {
+    return this.chats.clearChatMessages(chatId);
+  }
+
+  markUnread(chatId: string): Promise<boolean> {
+    return this.chats.markUnread(chatId);
+  }
+
+  deleteChat(chatId: string): Promise<boolean> {
+    return this.chats.deleteChat(chatId);
+  }
+
+  sendChatState(chatId: string, state: ChatState): Promise<void> {
+    return this.chats.sendChatState(chatId, state);
+  }
+
+  setOnlinePresence(available: boolean): Promise<void> {
+    return this.chats.setOnlinePresence(available);
+  }
 
   private extractMessageResult(msg: unknown): MessageResult {
     let id = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -1093,7 +987,28 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   private ensureReady(): void {
     if (this.status !== EngineStatus.READY || !this.client) {
-      throw new Error('WhatsApp client is not ready');
+      // Typed so the global filter returns 409 Conflict ("session not connected")
+      // instead of a 500 when an engine op is attempted while the session is
+      // disconnected / reconnecting / still initializing (#100).
+      throw new EngineNotReadyError();
+    }
+    // Post-READY navigation window: window.WWebJS is gone until the re-inject completes, so every
+    // delegate evaluate would die as a raw TypeError 500 (and five raw send failures latch the send
+    // breaker for its 15-minute cooldown). Answer the same retryable 409 the pre-READY states get,
+    // naming the reload so the operator can tell this state from a plain disconnect (#1081).
+    if (this.lifecycle.isInNavigationReinjectWindow()) {
+      throw new EngineNotReadyError(
+        'WhatsApp Web is reloading its page and the session is re-injecting. Retry in a few seconds.',
+      );
+    }
+  }
+
+  private ensureNotChannelRecipient(chatId: string): void {
+    // whatsapp-web.js crashes building a channel media message (`msg.avParams is not a function`,
+    // upstream wwebjs#201823 — WA Web removed Msg.avParams). Text→channel works; media does not.
+    // Fail fast with a typed 501 instead of surfacing the raw TypeError as a 500 (#673).
+    if (isChannelJid(chatId)) {
+      throw new ChannelMediaNotSupportedError();
     }
   }
 }

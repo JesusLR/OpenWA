@@ -4,44 +4,19 @@
   box-sizing: border-box;
 }
 
-.page-header {
+.api-keys-page .page-header {
   margin-bottom: 2rem;
-}
-
-.header-content {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
 }
 
 /* H1 inherited from global */
 
-.btn-primary {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.75rem 1.25rem;
-  background: var(--primary);
-  color: white;
-  border: none;
-  border-radius: var(--radius);
-  font-size: 0.9375rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.btn-primary:hover {
-  background: var(--primary-hover);
-}
-
-.api-keys-content {
+.api-keys-page .api-keys-content {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
 }
 
-.keys-table-container {
+.api-keys-page .keys-table-container {
   background: var(--bg-white);
   border-radius: 12px;
   box-shadow: var(--shadow-sm);
@@ -50,14 +25,14 @@
   overflow-x: auto;
 }
 
-.keys-table {
+.api-keys-page .keys-table {
   width: 100%;
   font-size: 0.875rem;
   border-collapse: collapse;
 }
 
 /* Table header and row styling */
-.keys-table thead tr.table-row.header th {
+.api-keys-page .keys-table thead tr.table-row.header th {
   background: var(--bg-light);
   font-size: 0.7rem;
   font-weight: 700;
@@ -69,41 +44,41 @@
   text-align: left;
 }
 
-.keys-table tbody tr.table-row td {
+.api-keys-page .keys-table tbody tr.table-row td {
   padding: 1.125rem 1.5rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
 
-.keys-table tbody tr.table-row:last-child td {
+.api-keys-page .keys-table tbody tr.table-row:last-child td {
   border-bottom: none;
 }
 
-.keys-table tbody tr.table-row:hover {
+.api-keys-page .keys-table tbody tr.table-row:hover {
   background: rgba(37, 211, 102, 0.05);
 }
 
-.keys-table tbody tr.table-row:nth-child(even) {
-  background: rgba(0, 0, 0, 0.02);
+.api-keys-page .keys-table tbody tr.table-row:nth-child(even) {
+  background: rgba(148, 163, 184, 0.08);
 }
 
-.keys-table tbody tr.table-row:nth-child(even):hover {
+.api-keys-page .keys-table tbody tr.table-row:nth-child(even):hover {
   background: rgba(37, 211, 102, 0.05);
 }
 
-.name-cell {
+.api-keys-page .name-cell {
   font-weight: 500;
   color: var(--text-primary);
   white-space: nowrap;
 }
 
-.key-cell {
+.api-keys-page .key-cell {
   display: flex;
   align-items: center;
   gap: 0.5rem;
 }
 
-.key-cell code {
+.api-keys-page .key-cell code {
   font-size: 0.8125rem;
   color: var(--text-secondary);
   background: var(--bg-light);
@@ -113,7 +88,7 @@
   white-space: nowrap;
 }
 
-.icon-btn-sm {
+.api-keys-page .icon-btn-sm {
   padding: 0.25rem;
   background: transparent;
   border: none;
@@ -123,45 +98,147 @@
   flex-shrink: 0;
 }
 
-.icon-btn-sm:hover {
+.api-keys-page .icon-btn-sm:hover {
   color: var(--text-primary);
 }
 
-.permissions-cell {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-
-.permission-badge {
+.api-keys-page .permission-badge {
   font-size: 0.6875rem;
   padding: 0.25rem 0.5rem;
-  background: #e0f2fe;
-  color: #0369a1;
+  background: rgba(59, 130, 246, 0.12);
+  color: var(--info);
   border-radius: 4px;
   font-weight: 500;
   white-space: nowrap;
 }
 
-.permission-badge:first-child:last-child {
+.api-keys-page .permission-badge:first-child:last-child {
   background: rgba(37, 211, 102, 0.1);
-  color: var(--primary);
+  color: var(--primary-text);
 }
 
-.rate-limit {
-  font-family: monospace;
+.api-keys-page .sessions-cell {
   font-size: 0.8125rem;
   color: var(--text-secondary);
+  max-width: 16rem;
+  display: inline-block;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.actions-cell {
+.api-keys-page .sessions-cell.all {
+  color: var(--text-muted);
+}
+
+.api-keys-page .session-scope-picker {
+  margin: 0.75rem 0 0.5rem;
+}
+
+.api-keys-page .session-scope-toggle {
+  display: inline;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: none;
+  color: var(--primary-text);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.4;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.api-keys-page .session-scope-toggle:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.api-keys-page .session-scope-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.api-keys-page .session-scope-hint,
+.api-keys-page .session-scope-empty,
+.api-keys-page .session-scope-widened {
+  margin: 0 0 0.75rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  line-height: 1.45;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+/* An empty selection grants every session, so it reads as a state rather than a hint. */
+.api-keys-page .session-scope-widened {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.api-keys-page .session-scope-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+
+.api-keys-page .session-scope-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  margin: 0;
+  padding: 0.625rem 0.75rem;
+  background: var(--bg-light);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.api-keys-page .session-scope-option:has(input:checked) {
+  border-color: rgba(37, 211, 102, 0.45);
+  background: rgba(37, 211, 102, 0.08);
+}
+
+.api-keys-page .session-scope-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+}
+
+.api-keys-page .session-scope-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.api-keys-page .session-scope-phone {
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.api-keys-page .session-scope-edit-name {
+  margin: 0 0 1rem;
+  color: var(--text-secondary);
+}
+
+.api-keys-page .actions-cell {
   display: flex;
   gap: 0.25rem;
   justify-content: flex-end;
 }
 
-.icon-btn {
+.api-keys-page .icon-btn {
   padding: 0.5rem;
   background: transparent;
   border: 1px solid var(--border);
@@ -172,18 +249,18 @@
   flex-shrink: 0;
 }
 
-.icon-btn:hover {
+.api-keys-page .icon-btn:hover {
   background: var(--bg-light);
   color: var(--text-primary);
 }
 
-.icon-btn.danger:hover {
-  background: #fee2e2;
-  border-color: #fecaca;
-  color: #dc2626;
+.api-keys-page .icon-btn.danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.3);
+  color: var(--error-text);
 }
 
-.permissions-reference {
+.api-keys-page .permissions-reference {
   background: var(--bg-white);
   border-radius: 12px;
   padding: 1.5rem;
@@ -191,18 +268,18 @@
   border: 1px solid var(--border);
 }
 
-.permissions-reference h3 {
+.api-keys-page .permissions-reference h3 {
   /* Inherits from H3 */
   margin-bottom: 1rem;
 }
 
-.permissions-list {
+.api-keys-page .permissions-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 0.75rem;
 }
 
-.perm-item {
+.api-keys-page .perm-item {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
@@ -211,22 +288,22 @@
   border-radius: var(--radius);
 }
 
-.perm-item code {
+.api-keys-page .perm-item code {
   font-size: 0.8125rem;
-  color: var(--primary);
+  color: var(--primary-text);
   background: rgba(37, 211, 102, 0.1);
   padding: 0.25rem 0.5rem;
   border-radius: 4px;
   width: fit-content;
 }
 
-.perm-item span {
+.api-keys-page .perm-item span {
   font-size: 0.75rem;
   color: var(--text-secondary);
 }
 
 /* Empty Table State */
-.empty-table-state {
+.api-keys-page .empty-table-state {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -236,41 +313,41 @@
   color: var(--text-muted);
 }
 
-.empty-table-state svg {
+.api-keys-page .empty-table-state svg {
   margin-bottom: 1rem;
   opacity: 0.4;
   color: var(--text-muted);
 }
 
-.empty-table-state h3 {
+.api-keys-page .empty-table-state h3 {
   font-size: 1.125rem;
   font-weight: 600;
   color: var(--text-secondary);
   margin: 0 0 0.5rem;
 }
 
-.empty-table-state p {
+.api-keys-page .empty-table-state p {
   margin: 0;
   font-size: 0.875rem;
   max-width: 300px;
 }
 
 /* Confirmation Modal Styles */
-.confirm-modal {
+.api-keys-page .confirm-modal {
   max-width: 400px;
 }
 
-.confirm-icon-wrapper {
+.api-keys-page .confirm-icon-wrapper {
   display: flex;
   justify-content: center;
   margin-bottom: 1rem;
 }
 
-.confirm-warning-icon {
-  color: #f59e0b;
+.api-keys-page .confirm-warning-icon {
+  color: var(--warning-text);
 }
 
-.confirm-message {
+.api-keys-page .confirm-message {
   text-align: center;
   color: var(--text-secondary);
   font-size: 0.9375rem;
@@ -278,37 +355,124 @@
   margin: 0;
 }
 
-.confirm-message strong {
+.api-keys-page .confirm-message strong {
   color: var(--text-primary);
 }
 
-.btn-danger {
-  padding: 0.75rem 1.25rem;
-  background: #dc2626;
-  color: white;
-  border: none;
+/* Key limit fields (IP allow-list, chats, expiry) in the create and edit modals. */
+.api-keys-page .modal-body > textarea {
+  width: 100%;
+  padding: 0.625rem 1rem;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  font-size: 0.9375rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.2s;
+  font-size: 0.875rem;
+  font-family: 'JetBrains Mono Variable', 'JetBrains Mono', monospace;
+  background: var(--bg-light);
+  box-sizing: border-box;
+  resize: vertical;
 }
 
-.btn-danger:hover {
-  background: #b91c1c;
+.api-keys-page .modal-body > select,
+.api-keys-page .modal-body > textarea {
+  margin-bottom: 0.25rem;
+}
+
+.api-keys-page .key-field-hint {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.875rem;
+}
+
+.api-keys-page .key-field-hint.error {
+  color: var(--error-text);
+  margin-bottom: 0.25rem;
+}
+
+.api-keys-page .key-expiry-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.25rem;
+}
+
+.api-keys-page .key-expiry-row input {
+  flex: 1 1 auto;
+}
+
+.api-keys-page .key-expiry-row button {
+  flex: none;
+  white-space: nowrap;
+}
+
+.api-keys-page .key-signed-in-warning {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin: 0 0 1rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+}
+
+.api-keys-page .key-signed-in-warning svg {
+  flex: none;
+  margin-top: 0.125rem;
+  color: var(--warning, #f59e0b);
+}
+
+.api-keys-page .restrictions-cell {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  font-size: 0.8125rem;
+}
+
+.api-keys-page .restrictions-cell.none {
+  color: var(--text-muted);
+}
+
+.api-keys-page .restriction-badge {
+  font-size: 0.6875rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  background: var(--bg-light);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.api-keys-page .restriction-badge.expired {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: transparent;
+  color: var(--error-text);
 }
 
 /* Mobile Responsive */
+/* Status badges — must apply on DESKTOP too (they were stranded inside the mobile media query,
+   leaving every Active/Revoked badge unstyled on wide screens). */
+.api-keys-page .status-badge {
+  font-size: 0.6875rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 9999px;
+  font-weight: 600;
+}
+
+.api-keys-page .status-badge.active {
+  background: rgba(37, 211, 102, 0.1);
+  color: var(--primary-text);
+}
+
+.api-keys-page .status-badge.inactive {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--error-text);
+}
+
 @media (max-width: 768px) {
   .api-keys-page {
     padding: 1rem;
-  }
-
-  /* Header adjustments for mobile */
-  .api-keys-page .header-content {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 1rem;
   }
 
   .api-keys-page .btn-primary {
@@ -316,7 +480,7 @@
     justify-content: center;
   }
 
-  .keys-table-container {
+  .api-keys-page .keys-table-container {
     overflow-x: visible;
     border: none;
     background: transparent;
@@ -324,21 +488,21 @@
   }
 
   /* Switch to card layout on mobile */
-  .keys-table {
+  .api-keys-page .keys-table {
     display: block;
   }
 
-  .keys-table thead {
+  .api-keys-page .keys-table thead {
     display: none;
   }
 
-  .keys-table tbody {
+  .api-keys-page .keys-table tbody {
     display: flex;
     flex-direction: column;
     gap: 1rem;
   }
 
-  .keys-table tbody tr.table-row {
+  .api-keys-page .keys-table tbody tr.table-row {
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
@@ -349,24 +513,24 @@
     box-shadow: var(--shadow-sm);
   }
 
-  .keys-table tbody tr.table-row:hover,
-  .keys-table tbody tr.table-row:nth-child(even),
-  .keys-table tbody tr.table-row:nth-child(even):hover {
+  .api-keys-page .keys-table tbody tr.table-row:hover,
+  .api-keys-page .keys-table tbody tr.table-row:nth-child(even),
+  .api-keys-page .keys-table tbody tr.table-row:nth-child(even):hover {
     background: var(--bg-white);
   }
 
-  .keys-table tbody tr.table-row td {
+  .api-keys-page .keys-table tbody tr.table-row td {
     padding: 0;
     border-bottom: none;
     display: block;
   }
 
   /* Name cell - prominent at top */
-  .keys-table tbody tr.table-row td:first-child {
+  .api-keys-page .keys-table tbody tr.table-row td:first-child {
     order: 1;
   }
 
-  .keys-table tbody tr.table-row td:first-child .name-cell {
+  .api-keys-page .keys-table tbody tr.table-row td:first-child .name-cell {
     font-size: 1.125rem;
     font-weight: 600;
     display: block;
@@ -374,77 +538,63 @@
   }
 
   /* Key cell */
-  .keys-table tbody tr.table-row td:nth-child(2) {
+  .api-keys-page .keys-table tbody tr.table-row td:nth-child(2) {
     order: 2;
   }
 
-  .keys-table tbody tr.table-row td:nth-child(2) .key-cell {
+  .api-keys-page .keys-table tbody tr.table-row td:nth-child(2) .key-cell {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     flex-wrap: wrap;
   }
 
-  .keys-table tbody tr.table-row td:nth-child(2) .key-cell code {
+  .api-keys-page .keys-table tbody tr.table-row td:nth-child(2) .key-cell code {
     font-size: 0.75rem;
     word-break: break-all;
     white-space: normal;
   }
 
-  /* Role & Status - wrapper for badges */
-  .keys-table tbody tr.table-row td:nth-child(3),
-  .keys-table tbody tr.table-row td:nth-child(4) {
+  /* Role, sessions & status sit together as chips */
+  .api-keys-page .keys-table tbody tr.table-row td:has(.permission-badge),
+  .api-keys-page .keys-table tbody tr.table-row td:has(.sessions-cell),
+  .api-keys-page .keys-table tbody tr.table-row td:has(.restrictions-cell),
+  .api-keys-page .keys-table tbody tr.table-row td:has(.status-badge) {
     display: inline-block;
     order: 3;
-  }
-
-  .keys-table tbody tr.table-row td:nth-child(3) {
     margin-right: 0.5rem;
   }
 
-  /* Status badges styling */
-  .status-badge {
-    font-size: 0.6875rem;
-    padding: 0.25rem 0.5rem;
-    border-radius: 9999px;
-    font-weight: 600;
-  }
-
-  .status-badge.active {
-    background: rgba(37, 211, 102, 0.1);
-    color: var(--primary);
-  }
-
-  .status-badge.inactive {
-    background: #fee2e2;
-    color: #dc2626;
+  .api-keys-page .sessions-cell {
+    max-width: 100%;
+    white-space: normal;
   }
 
   /* Actions cell - bottom with separator */
-  .keys-table tbody tr.table-row td:last-child {
+  .api-keys-page .keys-table tbody tr.table-row td:last-child {
     order: 5;
     margin-top: 0.5rem;
     padding-top: 0.75rem;
     border-top: 1px solid var(--border);
   }
 
-  .keys-table tbody tr.table-row td:last-child .actions-cell {
+  .api-keys-page .keys-table tbody tr.table-row td:last-child .actions-cell {
     justify-content: flex-start;
     gap: 0.5rem;
   }
 
   /* Permissions reference mobile */
-  .permissions-reference {
+  .api-keys-page .permissions-reference {
     padding: 1rem;
   }
 
-  .permissions-reference h3 {
+  .api-keys-page .permissions-reference h3 {
     font-size: 0.9375rem;
   }
 }
 
 @media (max-width: 480px) {
-  .permissions-list {
+  .api-keys-page .permissions-list {
     grid-template-columns: 1fr;
   }
 

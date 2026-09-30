@@ -9,90 +9,117 @@ The dashboard is a web-based management interface for OpenWA that lets users man
 ```mermaid
 flowchart LR
     subgraph Frontend
-        REACT[React 18]
-        VITE[Vite 5]
+        REACT[React 19]
+        VITE[Vite 8]
         TS[TypeScript]
-        TW[Tailwind CSS]
-        SHADCN[shadcn/ui]
-        LUCIDE[Lucide Icons]
+        CSS[Hand-written per-page CSS]
+        LUCIDE[lucide-react Icons]
     end
 
     subgraph State
         TANSTACK[TanStack Query]
-        ZUSTAND[Zustand]
+        CTX[React Context]
     end
 
     subgraph Backend
         API[OpenWA API]
-        WS[WebSocket]
+        WS[socket.io WebSocket]
     end
 
     Frontend --> State
     State --> Backend
 ```
 
+The styling foundation is **plain CSS** — there is no Tailwind, no shadcn/ui, and no CSS-in-JS.
+Every page — and most shared components — ships its own stylesheet colocated beside the source
+(`Sessions.tsx` + `Sessions.css`, `Layout.tsx` + `Layout.css`, ...), imported directly by the
+component (see §17.4 for the handful that carry no stylesheet of their own). Icons come from
+`lucide-react`; charts from `recharts`; i18n from `react-i18next`.
+Client state is **TanStack Query** for most server data (see `src/hooks/queries.ts`; §17.5 names the
+pages that keep their own copy) plus two small React
+Context providers (`RoleProvider`, `ToastProvider`); theme mode is a provider-less `useTheme` hook
+backed by `localStorage` — there is no Zustand store.
+
 ### Design Principles
 
 1. **Minimalist** - Clean, uncluttered interface
 2. **Responsive** - Works on desktop and mobile
 3. **Real-time** - Live updates via WebSocket
-4. **Accessible** - WCAG 2.1 AA compliant
+4. **Accessible** - built to WCAG 2.1 AA as the target. Shipped: full keyboard reachability of
+   the chat/channel/status lists (role, focus, Enter/Space activation), focus-visible styling, the
+   form labels in the settings and config surfaces associated with their controls via `htmlFor`/`id`,
+   toggle switches and button groups that expose an accessible name and their selected state, and a
+   muted-text token that meets AA on both themes. `dashboard/src/a11y-controls.test.ts` fails the
+   build when a toggle switch, a button toggle-group or a plugin config field loses its name; other
+   control shapes are not covered by it.
+   Brand and status colours are split in two: `--primary`, `--error`, `--success` and `--warning` are
+   fill colours for buttons, borders and tints, and `--primary-text`, `--error-text`, `--success-text`
+   and `--warning-text` are darkened twins for anything rendered as text or an icon. As foregrounds
+   the originals measure 1.98:1, 3.76:1, 2.28:1 and 2.15:1 on white. Each twin is set from the
+   darkest surface it actually lands on, which is the 10 to 20 percent tint of its own hue that the
+   badges and callouts paint behind it, not white. Dark restates primary, success and warning as the
+   originals, which are 6:1 or better on the dark surfaces, and lightens error to `#f15e5e` because
+   the original measures 4.06:1 there.
+   Known gap: the exclusive button groups report `aria-pressed` without arrow-key roving focus. Every
+   page has a render test, but only Infrastructure's resolves the caption references
+   against a real DOM; elsewhere they are checked structurally. Treat the claim as directional, not
+   certified.
 5. **Dark mode** - Support for light/dark themes
 
 ## 17.2 Information Architecture
 
+The dashboard is a **flat, single-level route table** (see `src/App.tsx`). Each sidebar entry maps
+to one top-level page — there are no nested detail/`:id` routes; a session or chat is opened in-place
+(modals / split panes) rather than via its own URL.
+
 ```mermaid
 flowchart TB
-    subgraph Dashboard
-        HOME[Dashboard Home]
-        SESSIONS[Sessions]
-        WEBHOOKS[Webhooks]
-        APIKEYS[API Keys]
-        LOGS[Logs]
-        SETTINGS[Settings]
+    subgraph "Always visible"
+        HOME[Dashboard /]
+        SESSIONS[Sessions /sessions]
+        CHATS[Chats /chats]
+        WEBHOOKS[Webhooks /webhooks]
+        TEMPLATES[Templates /templates]
+        TESTER[Message Tester /message-tester]
     end
 
-    HOME --> |Quick Actions| SESSIONS
-    HOME --> |View Stats| LOGS
-
-    subgraph Sessions Pages
-        LIST[Session List]
-        DETAIL[Session Detail]
-        QR[QR Scanner]
-        CHAT[Test Chat]
+    subgraph "Admin-only"
+        APIKEYS[API Keys /api-keys]
+        INFRA[Infrastructure /infrastructure]
+        PLUGINS[Plugins /plugins]
+        LOGS[Logs /logs]
     end
 
-    SESSIONS --> LIST
-    LIST --> DETAIL
-    DETAIL --> QR
-    DETAIL --> CHAT
-
-    subgraph Webhooks Pages
-        WH_LIST[Webhook List]
-        WH_DETAIL[Webhook Detail]
-        WH_LOGS[Webhook Logs]
-    end
-
-    WEBHOOKS --> WH_LIST
-    WH_LIST --> WH_DETAIL
-    WH_DETAIL --> WH_LOGS
+    HOME --> SESSIONS
+    HOME --> CHATS
+    SESSIONS --> CHATS
 ```
 
 ### Navigation Structure
 
+The route table lives in `src/App.tsx`; the sidebar items in `src/components/Layout.tsx`. Routes
+guarded by `role === 'admin'` are only mounted (and only shown in the sidebar) for an admin key —
+a non-admin hitting the path falls through to the `*` redirect.
+
 ```
-/                       → Dashboard Home
-/sessions               → Session List
-/sessions/:id           → Session Detail
-/sessions/:id/chat      → Test Chat Interface
-/webhooks               → Webhook List
-/webhooks/:id           → Webhook Detail
-/api-keys               → API Keys Management
-/logs                   → Activity Logs
-/settings               → Settings
-/settings/profile       → Profile Settings
-/settings/appearance    → Theme Settings
+/                  → Dashboard (overview + charts)
+/sessions          → Sessions (create / start / stop / QR / delete)
+/chats             → Chats (Chats / Channels / Status tabs; chat list + message thread live via
+                     WebSocket; thread pages older history in on scroll-up; read-only channel
+                     feed on whatsapp-web.js)
+/webhooks          → Webhooks (per-session webhook endpoints)
+/templates         → Message Templates
+/message-tester    → Message Tester (ad-hoc send-* + check-number)
+/logs              → Activity / Audit Logs            [admin only]
+/api-keys          → API Keys Management              [admin only]
+/infrastructure    → Infrastructure status & config   [admin only]
+/plugins           → Plugins (install / enable / configure) [admin only]
+*                  → redirect to /
 ```
+
+> There is **no Settings page** and no `/sessions/:id`, `/sessions/:id/chat`, or `/webhooks/:id`
+> route. Theme (light/dark/system) is a one-click toggle in the sidebar footer (`Layout.tsx`),
+> persisted client-side by the `useTheme` hook.
 
 ## 17.3 Wireframes
 
@@ -188,8 +215,17 @@ flowchart TB
 │  │  │         │  Status: 🟢 Connected                          │    │
 │  │  └─────────┘  Platform: Android                             │    │
 │  │                                                              │    │
-│  │  [Restart Session] [Logout] [Delete]                        │    │
+│  │  [Restart Session] [Unlink Device] [Delete]                  │    │
 │  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  Unlink Device attempts an engine-native unlink of this companion   │
+│  device (POST /sessions/:sessionId/logout), then stops the          │
+│  session. A 200 means the unlink + local cleanup completed (not an  │
+│  independent Linked-Devices observation) — reconnecting then        │
+│  requires a fresh QR scan or pairing code. A 502                    │
+│  (SESSION_LOGOUT_INCOMPLETE) stops locally but leaves the           │
+│  operation incomplete; retry after starting. Delete only clears     │
+│  the local data; it does NOT unlink.                                │
 │                                                                      │
 │  ┌─────────────────────┬─────────────────────┐                      │
 │  │  📊 Statistics      │  ⚙️ Configuration    │                      │
@@ -339,717 +375,407 @@ flowchart TB
 
 ## 17.4 Component Library
 
-### Using shadcn/ui
+> **No component framework is installed.** shadcn/ui is _not_ adopted — there is no `npx shadcn`
+> init, no `components/ui/` directory, no `cn()` utility, and no `@/components` import alias. The
+> wireframes above are design intent; the implementation is hand-written.
 
-```bash
-# Initialize shadcn/ui
-npx shadcn-ui@latest init
+### Bespoke components
 
-# Add components
-npx shadcn-ui@latest add button
-npx shadcn-ui@latest add card
-npx shadcn-ui@latest add dialog
-npx shadcn-ui@latest add dropdown-menu
-npx shadcn-ui@latest add input
-npx shadcn-ui@latest add table
-npx shadcn-ui@latest add tabs
-npx shadcn-ui@latest add toast
-npx shadcn-ui@latest add avatar
-npx shadcn-ui@latest add badge
-npx shadcn-ui@latest add skeleton
-```
+The UI is built from a small set of project-specific components under `dashboard/src/components/`,
+most with a colocated CSS file. Six top-level components ship none: `ErrorBoundary` styles inline
+via `style={{...}}`, `GithubIcon` carries no styling beyond `fill="currentColor"`, `Modal` reuses the
+global `.modal-*` rules from `index.css`, `GroupPicker` and `SessionScopePicker` are styled by the
+one page that uses each (`pages/MessageTester.css`, `pages/ApiKeys.css`), and `RoleProvider` renders
+no DOM. Nothing under `chats/` ships its own stylesheet either: those components take their classes
+from `pages/Chats.css`, and `MediaLightbox` adds the `yet-another-react-lightbox` vendor CSS. There
+is no design-system package to pull from.
 
-### Custom Components
+| Component                    | File                                | Responsibility                                                                                                               |
+| ---------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `Layout`                     | `components/Layout.tsx`             | App shell: collapsible sidebar nav, mobile drawer, language menu, light/dark/system theme toggle, logout, live version badge |
+| `ToastProvider` / `useToast` | `components/Toast.tsx`              | Context-based toast notifications (success/error/warning/info) with de-dup keys                                              |
+| `PageHeader`                 | `components/PageHeader.tsx`         | Shared page title / subtitle / badge / actions header                                                                        |
+| `Modal`                      | `components/Modal.tsx`              | Accessible dialog (`role="dialog"`, Escape/overlay close, focus trap + restore); uses the global `.modal-*` styles           |
+| `CustomSelect`               | `components/CustomSelect.tsx`       | Keyboard-navigable select replacement (type-ahead, arrow keys) used by Sessions / Logs / Login                               |
+| `DashboardCharts`            | `components/DashboardCharts.tsx`    | `recharts`-based message-volume / activity charts on the Dashboard                                                           |
+| `FilterBuilder`              | `components/FilterBuilder.tsx`      | Visual condition builder for webhook event filters                                                                           |
+| `GlobalSearch`               | `components/GlobalSearch.tsx`       | Debounced message-search box in the Chats header, with all-sessions / current-session scope                                  |
+| `PluginInstances`            | `components/PluginInstances.tsx`    | Per-plugin instance list: create / edit / delete and secret regeneration                                                     |
+| `ErrorBoundary`              | `components/ErrorBoundary.tsx`      | Top-level React error boundary wrapping the whole app                                                                        |
+| `GithubIcon`                 | `components/GithubIcon.tsx`         | Inline brand SVG                                                                                                             |
+| `GroupPicker`                | `components/GroupPicker.tsx`        | Searchable multi-select of a session's groups, used by the Message Tester's multi-group send                                 |
+| `SessionScopePicker`         | `components/SessionScopePicker.tsx` | Per-key session scope checklist on the API Keys page                                                                         |
+| `RoleProvider`               | `components/RoleProvider.tsx`       | Context holding the logged-in key's role, read with `useRole` (`canWrite` gates write actions)                               |
+
+Chat-specific pieces live one level down in `components/chats/`: `MessageBody` (WhatsApp text
+formatting + link detection), `ChatThread` (bubble list, including inbound Baileys prompt buttons
+that call `POST /sessions/:id/messages/click-button`), and `MediaLightbox` (the media viewer, built
+on `yet-another-react-lightbox`). The rest of the room is split the same way: `ChatSidebar`,
+`ChatComposer`, `ChatAvatar`, `KindIcon`, `StatusComposeModal` and `StatusMedia`. Prompt choices
+arrive on live `message.received` as top-level `buttons` and are also stored in message
+`metadata.buttons` so a reload can re-render them. Clicking still requires the prompt to be in the
+engine store; an evicted prompt 404s. A read-only key sees the choices disabled and gets no reply,
+react or delete actions, the same as the disabled composer.
+
+The message thread is paged. `useChatMessages` is a `useInfiniteQuery` whose cursor is the number
+of DB rows fetched so far, not the length of the rendered list — the thread also carries engine
+history and drops the duplicates between the two, so its length is not an offset the gateway would
+agree with. Reaching the top requests the next page; the reading position is held across the
+prepend rather than jumping. Both rules are pure functions with tests: `utils/messagePages.ts` for
+the cursor, `shouldFetchOlderMessages` in `utils/scrollDecision.ts` for when to ask.
+
+Pages live under `dashboard/src/pages/`, each as a `*.tsx` + `*.css` pair (e.g. `Sessions.tsx` +
+`Sessions.css`). Pages are lazy-loaded in `App.tsx` via `React.lazy` + `Suspense`.
+
+A representative bespoke component — the shared page header — shows the actual conventions
+(plain props, a colocated stylesheet, BEM-ish class names, no utility classes):
 
 ```typescript
-// components/ui/status-badge.tsx
+// components/PageHeader.tsx
+import type { ReactNode } from 'react';
+import './PageHeader.css';
 
-import { Badge } from '@/components/ui/badge';
-import { cn } from '@/lib/utils';
-
-type SessionStatus = 'CONNECTED' | 'DISCONNECTED' | 'INITIALIZING' | 'SCAN_QR';
-
-interface StatusBadgeProps {
-  status: SessionStatus;
-  className?: string;
+interface PageHeaderProps {
+  title: string;
+  subtitle?: string;
+  badge?: ReactNode;
+  actions?: ReactNode;
 }
 
-const statusConfig: Record<SessionStatus, { label: string; variant: string; dot: string }> = {
-  CONNECTED: {
-    label: 'Connected',
-    variant: 'success',
-    dot: 'bg-green-500',
-  },
-  DISCONNECTED: {
-    label: 'Disconnected',
-    variant: 'destructive',
-    dot: 'bg-red-500',
-  },
-  INITIALIZING: {
-    label: 'Initializing',
-    variant: 'warning',
-    dot: 'bg-yellow-500',
-  },
-  SCAN_QR: {
-    label: 'Scan QR',
-    variant: 'secondary',
-    dot: 'bg-blue-500 animate-pulse',
-  },
-};
-
-export function StatusBadge({ status, className }: StatusBadgeProps) {
-  const config = statusConfig[status];
-
+export function PageHeader({ title, subtitle, badge, actions }: PageHeaderProps) {
   return (
-    <Badge variant={config.variant as any} className={cn('gap-1.5', className)}>
-      <span className={cn('h-2 w-2 rounded-full', config.dot)} />
-      {config.label}
-    </Badge>
+    <header className="page-header">
+      <div className="page-header__title-group">
+        <h1>{title}</h1>
+        {badge && <span className="page-header__badge">{badge}</span>}
+      </div>
+      {actions && <div className="page-header__actions">{actions}</div>}
+      {subtitle && <p className="page-header__subtitle">{subtitle}</p>}
+    </header>
   );
 }
 ```
 
-```typescript
-// components/ui/session-card.tsx
-
-import { Card, CardContent, CardFooter, CardHeader } from '@/components/ui/card';
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
-import { Button } from '@/components/ui/button';
-import { StatusBadge } from '@/components/ui/status-badge';
-import { MessageSquare, QrCode, Settings, Trash2 } from 'lucide-react';
-import { Session } from '@/types';
-import { formatDistanceToNow } from 'date-fns';
-
-interface SessionCardProps {
-  session: Session;
-  onQr: () => void;
-  onChat: () => void;
-  onSettings: () => void;
-  onDelete: () => void;
-}
-
-export function SessionCard({
-  session,
-  onQr,
-  onChat,
-  onSettings,
-  onDelete,
-}: SessionCardProps) {
-  return (
-    <Card>
-      <CardHeader className="flex flex-row items-center gap-4">
-        <Avatar className="h-12 w-12">
-          <AvatarImage src={session.profilePicture} />
-          <AvatarFallback>
-            {session.name.slice(0, 2).toUpperCase()}
-          </AvatarFallback>
-        </Avatar>
-        <div className="flex-1">
-          <div className="flex items-center justify-between">
-            <h3 className="font-semibold">{session.name}</h3>
-            <StatusBadge status={session.status} />
-          </div>
-          <p className="text-sm text-muted-foreground">
-            {session.phoneNumber || 'Not connected'}
-          </p>
-        </div>
-      </CardHeader>
-
-      <CardContent>
-        <div className="flex justify-between text-sm text-muted-foreground">
-          <span>{session.stats?.messagesSent || 0} messages</span>
-          <span>
-            {session.lastSeen
-              ? `Active ${formatDistanceToNow(new Date(session.lastSeen))} ago`
-              : 'Never active'}
-          </span>
-        </div>
-      </CardContent>
-
-      <CardFooter className="gap-2">
-        {session.status === 'CONNECTED' ? (
-          <>
-            <Button variant="outline" size="sm" onClick={onChat}>
-              <MessageSquare className="mr-2 h-4 w-4" />
-              Chat
-            </Button>
-          </>
-        ) : (
-          <Button variant="outline" size="sm" onClick={onQr}>
-            <QrCode className="mr-2 h-4 w-4" />
-            Scan QR
-          </Button>
-        )}
-        <Button variant="ghost" size="sm" onClick={onSettings}>
-          <Settings className="h-4 w-4" />
-        </Button>
-        <Button variant="ghost" size="sm" onClick={onDelete}>
-          <Trash2 className="h-4 w-4 text-destructive" />
-        </Button>
-      </CardFooter>
-    </Card>
-  );
-}
-```
-
-```typescript
-// components/ui/qr-code-display.tsx
-
-import { useEffect, useState } from 'react';
-import { Card, CardContent } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Skeleton } from '@/components/ui/skeleton';
-import { RefreshCw } from 'lucide-react';
-import QRCode from 'qrcode';
-
-interface QrCodeDisplayProps {
-  qrData: string | null;
-  expiresAt: string | null;
-  onRefresh: () => void;
-  isLoading: boolean;
-}
-
-export function QrCodeDisplay({
-  qrData,
-  expiresAt,
-  onRefresh,
-  isLoading,
-}: QrCodeDisplayProps) {
-  const [qrImage, setQrImage] = useState<string | null>(null);
-  const [countdown, setCountdown] = useState<number>(0);
-
-  useEffect(() => {
-    if (qrData) {
-      QRCode.toDataURL(qrData, {
-        width: 256,
-        margin: 2,
-        color: {
-          dark: '#000000',
-          light: '#ffffff',
-        },
-      }).then(setQrImage);
-    }
-  }, [qrData]);
-
-  useEffect(() => {
-    if (expiresAt) {
-      const interval = setInterval(() => {
-        const remaining = Math.max(
-          0,
-          Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000)
-        );
-        setCountdown(remaining);
-
-        if (remaining === 0) {
-          clearInterval(interval);
-        }
-      }, 1000);
-
-      return () => clearInterval(interval);
-    }
-  }, [expiresAt]);
-
-  return (
-    <Card className="w-fit mx-auto">
-      <CardContent className="pt-6 text-center">
-        {isLoading ? (
-          <Skeleton className="h-64 w-64 mx-auto" />
-        ) : qrImage ? (
-          <>
-            <img
-              src={qrImage}
-              alt="QR Code"
-              className="mx-auto rounded-lg"
-              width={256}
-              height={256}
-            />
-            <p className="mt-4 text-sm text-muted-foreground">
-              Expires in: {Math.floor(countdown / 60)}:
-              {(countdown % 60).toString().padStart(2, '0')}
-            </p>
-          </>
-        ) : (
-          <div className="h-64 w-64 flex items-center justify-center bg-muted rounded-lg">
-            <p className="text-muted-foreground">QR Code expired</p>
-          </div>
-        )}
-
-        <Button
-          variant="outline"
-          className="mt-4"
-          onClick={onRefresh}
-          disabled={isLoading}
-        >
-          <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
-          Refresh QR
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-```
+Icons are imported individually from `lucide-react`; there is no `Avatar`/`Card`/`Badge` primitive
+library — those visuals are composed directly with `div`s and the page's own CSS.
 
 ## 17.5 State Management
 
-### Zustand Store
+There is **no Zustand store** (and no global client-state library). Most server data is owned by
+**TanStack Query** (`@tanstack/react-query`); the only other shared state lives in the two React
+Context providers in the app — `RoleProvider` (the authenticated key's role, read through the
+`useRole` hook) and `ToastProvider` (transient notifications). Theme mode is deliberately _not_ a
+context: `useTheme` is a plain hook that persists to `localStorage` and writes one attribute on
+`<html>` (see §17.7).
+
+Three pages keep a server list in local state instead of the query cache:
+
+- **Sessions** (`Sessions.tsx`) holds the session list itself and sequences each read against its
+  own row writes and socket pushes, so an older answer never overwrites a newer row. After each read
+  it applies, it invalidates the `['sessions']` key prefix so the Dashboard and per-session views
+  refetch.
+- **Chats** (`Chats.tsx`) reads the ready sessions directly on mount, and again when a search hit
+  names a session that list lacks, and keeps the chat list in local state that socket pushes, sends
+  and marking a chat read update.
+- **Plugins** (`Plugins.tsx`) keeps the catalog in local state. It prefetches it silently on mount
+  so installed cards can show an update chip, fetches it again when the Catalog tab opens with an
+  empty list, and reloads it after any install, update or uninstall.
+
+### API client — raw payloads, no `{ data }` envelope
+
+The client lives in `src/services/api.ts`. A single `request<T>()` helper attaches the `X-API-Key`
+header from `sessionStorage`, then returns **the parsed JSON body as-is** — the backend sends the
+raw handler payload, so `request<Session[]>('/sessions')` resolves to a bare `Session[]`, not
+`{ data: Session[] }`. (A `204 No Content` resolves to `undefined`; a `401`, or a `403` because the
+key's `allowedIps` refuse this client, clears the stored key and redirects to login; any other `403`
+leaves the key in place.) Endpoints are grouped into typed namespaces — `sessionApi`, `webhookApi`,
+`templateApi`, `apiKeyApi`, `auditApi`, `messageApi`, `infraApi`, `pluginsApi`, `statsApi`, ...
 
 ```typescript
-// stores/session-store.ts
+// src/services/api.ts (abridged)
+export const API_BASE_URL = `${(import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '')}/api`;
 
-import { create } from 'zustand';
-import { Session } from '@/types';
-
-interface SessionState {
-  sessions: Session[];
-  selectedSession: Session | null;
-  isLoading: boolean;
-  error: string | null;
-
-  // Actions
-  setSessions: (sessions: Session[]) => void;
-  addSession: (session: Session) => void;
-  updateSession: (id: string, updates: Partial<Session>) => void;
-  removeSession: (id: string) => void;
-  selectSession: (session: Session | null) => void;
-  setLoading: (loading: boolean) => void;
-  setError: (error: string | null) => void;
+async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  const apiKey = sessionStorage.getItem('openwa_api_key');
+  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+      ...options.headers,
+    },
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.message || `HTTP ${response.status}`);
+  }
+  if (response.status === 204) return undefined as T;
+  return response.json(); // ← the raw payload, no unwrapping
 }
 
-export const useSessionStore = create<SessionState>((set) => ({
-  sessions: [],
-  selectedSession: null,
-  isLoading: false,
-  error: null,
-
-  setSessions: (sessions) => set({ sessions }),
-
-  addSession: (session) =>
-    set((state) => ({
-      sessions: [...state.sessions, session],
-    })),
-
-  updateSession: (id, updates) =>
-    set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === id ? { ...s, ...updates } : s
-      ),
-      selectedSession:
-        state.selectedSession?.id === id
-          ? { ...state.selectedSession, ...updates }
-          : state.selectedSession,
-    })),
-
-  removeSession: (id) =>
-    set((state) => ({
-      sessions: state.sessions.filter((s) => s.id !== id),
-      selectedSession:
-        state.selectedSession?.id === id ? null : state.selectedSession,
-    })),
-
-  selectSession: (session) => set({ selectedSession: session }),
-
-  setLoading: (isLoading) => set({ isLoading }),
-
-  setError: (error) => set({ error }),
-}));
+export const sessionApi = {
+  list: () => request<Session[]>('/sessions'), // bare array
+  get: (id: string) => request<Session>(`/sessions/${id}`),
+  create: (name: string) => request<Session>('/sessions', { method: 'POST', body: JSON.stringify({ name }) }),
+  delete: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
+  // QR returns a raw { qrCode, status } object — not { qr, expiresAt }, and there is no expiry timer.
+  getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
+};
 ```
 
-### TanStack Query Hooks
+### TanStack Query hooks
+
+Hooks wrap those namespaces in `src/hooks/queries.ts` — each returns the raw payload directly (no
+`.data.data`). Cache invalidation, not a store, keeps the UI in sync after a mutation.
 
 ```typescript
-// hooks/use-sessions.ts
-
+// src/hooks/queries.ts (abridged)
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/lib/api';
-import { Session, CreateSessionInput } from '@/types';
-import { useSessionStore } from '@/stores/session-store';
+import { sessionApi, webhookApi } from '../services/api';
 
-export function useSessions() {
-  const { setSessions, setError } = useSessionStore();
+export const queryKeys = {
+  sessions: ['sessions'] as const,
+  webhooks: ['webhooks'] as const,
+  // ...
+};
 
+export function useSessionsQuery() {
   return useQuery({
-    queryKey: ['sessions'],
-    queryFn: async () => {
-      const response = await api.get<{ data: Session[] }>('/api/sessions');
-      return response.data.data;
-    },
-    onSuccess: (data) => {
-      setSessions(data);
-    },
-    onError: (error: Error) => {
-      setError(error.message);
-    },
+    queryKey: queryKeys.sessions,
+    queryFn: sessionApi.list, // resolves to Session[] directly
+    staleTime: 30_000,
   });
 }
 
-export function useSession(id: string) {
-  return useQuery({
-    queryKey: ['sessions', id],
-    queryFn: async () => {
-      const response = await api.get<{ data: Session }>(`/api/sessions/${id}`);
-      return response.data.data;
-    },
-    enabled: !!id,
-  });
-}
-
-export function useCreateSession() {
+export function useStopSessionMutation() {
   const queryClient = useQueryClient();
-  const { addSession } = useSessionStore();
-
   return useMutation({
-    mutationFn: async (input: CreateSessionInput) => {
-      const response = await api.post<{ data: Session }>('/api/sessions', input);
-      return response.data.data;
-    },
-    onSuccess: (data) => {
-      addSession(data);
-      queryClient.invalidateQueries({ queryKey: ['sessions'] });
-    },
-  });
-}
-
-export function useDeleteSession() {
-  const queryClient = useQueryClient();
-  const { removeSession } = useSessionStore();
-
-  return useMutation({
-    mutationFn: async (id: string) => {
-      await api.delete(`/api/sessions/${id}`);
-      return id;
-    },
-    onSuccess: (id) => {
-      removeSession(id);
-      queryClient.invalidateQueries({ queryKey: ['sessions'] });
-    },
-  });
-}
-
-export function useSessionQr(id: string) {
-  return useQuery({
-    queryKey: ['sessions', id, 'qr'],
-    queryFn: async () => {
-      const response = await api.get<{ data: { qr: string; expiresAt: string } }>(
-        `/api/sessions/${id}/qr`
-      );
-      return response.data.data;
-    },
-    enabled: !!id,
-    refetchInterval: 30000, // Refresh every 30 seconds
+    mutationFn: (id: string) => sessionApi.stop(id),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.sessions }),
   });
 }
 ```
+
+> **There is no `useSessionQr` polling hook.** QR codes are not fetched on a 30 s
+> `refetchInterval`. The Sessions page fetches the current QR imperatively via `sessionApi.getQR()`
+> and then receives fresh codes pushed over the WebSocket (`session.qr` events, see §17.6).
 
 ## 17.6 WebSocket Integration
 
+Real-time updates use **socket.io** (`socket.io-client`), not a raw browser `WebSocket`. The hook is
+`src/hooks/useWebSocket.ts`. Key facts:
+
+- **Namespace `/events`** (not `/ws`). The client connects to `<origin>/events`, where the origin is
+  that of `VITE_WS_URL` when set, else that of `VITE_API_URL` (so a split-origin build reaches the
+  API), else `window.location.origin`. A path or trailing slash on either variable is dropped, and a
+  value with no scheme (`host:port`) is dialled on the page's protocol.
+- **API key via the socket.io `auth` payload (and an `X-API-Key` header for proxies), deliberately
+  _not_ in the query string** — a key in the handshake URL would leak into access logs / `Referer`.
+- **Reconnection is socket.io's built-in mechanism** — `reconnectionAttempts: 5`,
+  `reconnectionDelay: 1000` — not a hand-rolled `setTimeout(connect, 3000)`. When all attempts are
+  exhausted the manager fires `reconnect_failed`; the hook surfaces that as `connectionFailed` so the
+  UI can offer a manual `reconnect()`.
+- **Server → client envelope.** Every push arrives as a single `message` event whose payload is
+  `{ type: 'event', timestamp, payload: { event, sessionId, data } }`. The hook registers one
+  handler, switches on `payload.event`, and fans out to typed callbacks.
+- **Subscriptions** are sent with `socket.emit('message', { type: 'subscribe' | 'unsubscribe', ... })`.
+
 ```typescript
-// lib/websocket.ts
+// src/hooks/useWebSocket.ts (abridged)
+import { useEffect, useRef, useCallback, useState } from 'react';
+import { io, Socket } from 'socket.io-client';
+import { API_ORIGIN } from '../services/api';
+import { resolveSocketUrl } from '../utils/urlSecurity';
 
-import { useEffect, useRef, useCallback } from 'react';
-import { useSessionStore } from '@/stores/session-store';
+// The origin of VITE_WS_URL, else of VITE_API_URL, else the page origin.
+const SOCKET_URL = resolveSocketUrl(import.meta.env.VITE_WS_URL, API_ORIGIN, window.location.origin);
 
-type EventType =
-  | 'session.status'
-  | 'session.qr'
-  | 'message.received'
-  | 'message.ack'
-  | 'session.authenticated'
-  | 'session.disconnected';
-
-interface WebSocketMessage {
-  event: EventType;
-  sessionId: string;
-  data: any;
+interface ServerEventEnvelope {
+  type: string; // 'event'
+  timestamp: string;
+  payload?: { event: string; sessionId: string; data: Record<string, unknown> };
 }
 
-export function useWebSocket(apiKey: string) {
-  const ws = useRef<WebSocket | null>(null);
-  const { updateSession } = useSessionStore();
+export function useWebSocket(events: WebSocketEvents = {}) {
+  const socketRef = useRef<Socket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionFailed, setConnectionFailed] = useState(false);
 
   const connect = useCallback(() => {
-    const wsUrl = `${import.meta.env.VITE_WS_URL || 'ws://localhost:2785'}/ws?apiKey=${apiKey}`;
-    ws.current = new WebSocket(wsUrl);
+    if (socketRef.current?.connected) return;
+    const apiKey = sessionStorage.getItem('openwa_api_key');
+    if (!apiKey) return;
 
-    ws.current.onopen = () => {
-      console.log('WebSocket connected');
-    };
+    socketRef.current = io(`${SOCKET_URL}/events`, {
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      auth: { apiKey }, // key in the handshake auth, NOT the URL
+      extraHeaders: { 'X-API-Key': apiKey }, // header copy for proxies
+    });
 
-    ws.current.onmessage = (event) => {
-      const message: WebSocketMessage = JSON.parse(event.data);
-
-      switch (message.event) {
-        case 'session.status':
-          updateSession(message.sessionId, {
-            status: message.data.status,
-          });
-          break;
-
-        case 'session.authenticated':
-          updateSession(message.sessionId, {
-            status: 'CONNECTED',
-            phoneNumber: message.data.phoneNumber,
-            profileName: message.data.profileName,
-          });
-          break;
-
-        case 'session.disconnected':
-          updateSession(message.sessionId, {
-            status: 'DISCONNECTED',
-          });
-          break;
-
-        case 'session.qr':
-          // Handle QR update via query invalidation
-          break;
-
-        default:
-          console.log('Unknown event:', message.event);
-      }
-    };
-
-    ws.current.onclose = () => {
-      console.log('WebSocket disconnected, reconnecting...');
-      setTimeout(connect, 3000);
-    };
-
-    ws.current.onerror = (error) => {
-      console.error('WebSocket error:', error);
-    };
-  }, [apiKey, updateSession]);
+    socketRef.current.on('connect', () => {
+      setIsConnected(true);
+      setConnectionFailed(false);
+    });
+    socketRef.current.on('disconnect', () => setIsConnected(false));
+    socketRef.current.io.on('reconnect_failed', () => setConnectionFailed(true));
+  }, []);
 
   useEffect(() => {
     connect();
-
-    return () => {
-      ws.current?.close();
+    const socket = socketRef.current;
+    const handle = (msg: ServerEventEnvelope) => {
+      if (!msg || msg.type !== 'event' || !msg.payload) return;
+      const { event, sessionId, data } = msg.payload;
+      switch (event) {
+        case 'session.status':
+          events.onSessionStatus?.({ sessionId, status: String(data.status), timestamp: msg.timestamp });
+          break;
+        case 'session.qr':
+          events.onQRCode?.({ sessionId, qrCode: String(data.qrCode), timestamp: msg.timestamp });
+          break;
+        case 'message.received':
+        case 'message.sent':
+          events.onMessage?.({ sessionId, message: data, timestamp: msg.timestamp });
+          break;
+        // ...message.ack, message.reaction, message.revoked
+      }
     };
-  }, [connect]);
+    socket?.on('message', handle);
+    return () => {
+      socket?.off('message', handle);
+    };
+  }, [connect, events]);
 
-  const send = useCallback((event: string, data: any) => {
-    if (ws.current?.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify({ event, data }));
-    }
-  }, []);
-
-  return { send };
+  return { isConnected, connectionFailed, reconnect, subscribe, unsubscribe };
 }
 ```
 
 ## 17.7 Theme Configuration
 
+Theming is **not** shadcn HSL design tokens. It is a plain `useTheme` hook (`src/hooks/useTheme.ts`)
+that toggles one attribute on `<html>` and lets the CSS do the rest. The value is persisted to
+`localStorage` under `openwa_theme`:
+
+- **Mode** — `light | dark | system`. `system` removes `data-theme` so a `prefers-color-scheme`
+  media query in the global CSS takes over; otherwise `data-theme="light|dark"` is set explicitly.
+
+The sidebar footer button cycles light → dark → system, its label naming the mode a click
+selects; there is no
+picker popover and no `ThemeProvider` context wrapper — it's a hook consumed directly where needed.
+An earlier accent-palette picker (seven palettes via `data-palette`) was removed for
+maintainability; the legacy `openwa_palette` storage key and the attribute are cleaned up on load.
+
 ```typescript
-// lib/theme.ts
+// src/hooks/useTheme.ts (abridged)
+export type Theme = 'light' | 'dark' | 'system';
 
-export const themes = {
-  light: {
-    background: '0 0% 100%',
-    foreground: '222.2 84% 4.9%',
-    card: '0 0% 100%',
-    'card-foreground': '222.2 84% 4.9%',
-    primary: '222.2 47.4% 11.2%',
-    'primary-foreground': '210 40% 98%',
-    secondary: '210 40% 96.1%',
-    'secondary-foreground': '222.2 47.4% 11.2%',
-    muted: '210 40% 96.1%',
-    'muted-foreground': '215.4 16.3% 46.9%',
-    accent: '210 40% 96.1%',
-    'accent-foreground': '222.2 47.4% 11.2%',
-    destructive: '0 84.2% 60.2%',
-    'destructive-foreground': '210 40% 98%',
-    border: '214.3 31.8% 91.4%',
-    input: '214.3 31.8% 91.4%',
-    ring: '222.2 84% 4.9%',
-  },
-  dark: {
-    background: '222.2 84% 4.9%',
-    foreground: '210 40% 98%',
-    card: '222.2 84% 4.9%',
-    'card-foreground': '210 40% 98%',
-    primary: '210 40% 98%',
-    'primary-foreground': '222.2 47.4% 11.2%',
-    secondary: '217.2 32.6% 17.5%',
-    'secondary-foreground': '210 40% 98%',
-    muted: '217.2 32.6% 17.5%',
-    'muted-foreground': '215 20.2% 65.1%',
-    accent: '217.2 32.6% 17.5%',
-    'accent-foreground': '210 40% 98%',
-    destructive: '0 62.8% 30.6%',
-    'destructive-foreground': '210 40% 98%',
-    border: '217.2 32.6% 17.5%',
-    input: '217.2 32.6% 17.5%',
-    ring: '212.7 26.8% 83.9%',
-  },
-};
-
-// Theme provider component
-// components/theme-provider.tsx
-
-import { createContext, useContext, useEffect, useState } from 'react';
-
-type Theme = 'light' | 'dark' | 'system';
-
-interface ThemeContextType {
-  theme: Theme;
-  setTheme: (theme: Theme) => void;
-}
-
-const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
-
-export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setTheme] = useState<Theme>(() => {
-    const stored = localStorage.getItem('theme') as Theme;
-    return stored || 'system';
-  });
+export function useTheme() {
+  const [theme, setTheme] = useState<Theme>(/* localStorage 'openwa_theme' ?? 'system' */);
 
   useEffect(() => {
     const root = document.documentElement;
-
-    root.classList.remove('light', 'dark');
-
-    if (theme === 'system') {
-      const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches
-        ? 'dark'
-        : 'light';
-      root.classList.add(systemTheme);
-    } else {
-      root.classList.add(theme);
-    }
-
-    localStorage.setItem('theme', theme);
+    if (theme === 'system') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme);
+    localStorage.setItem('openwa_theme', theme);
   }, [theme]);
 
-  return (
-    <ThemeContext.Provider value={{ theme, setTheme }}>
-      {children}
-    </ThemeContext.Provider>
-  );
-}
-
-export function useTheme() {
-  const context = useContext(ThemeContext);
-  if (!context) {
-    throw new Error('useTheme must be used within a ThemeProvider');
-  }
-  return context;
+  return { theme, setTheme /* toggleTheme, resolvedTheme */ };
 }
 ```
+
+The actual colors live in `src/App.css` as variables keyed off `[data-theme]` —
+e.g. `:root { --bg-light: #f8fafc; } [data-theme='dark'] { --bg-light: #0f172a; }` — so
+switching mode is a single attribute write with no re-render of the tree.
 
 ## 17.8 Build & Deployment
 
 ### Vite Configuration
 
+The dev server listens on **2886** and proxies `/api` to the API on `2785`. The WebSocket proxy is
+on **`/socket.io`** (socket.io's transport path) with `ws: true` — _not_ `/ws`. There is no `@`
+import alias and no custom `manualChunks`/Radix vendor split; code-splitting is handled by the
+per-page `React.lazy` imports in `App.tsx`. The build-time version (`__APP_VERSION__`) is injected
+via `define` from the **root** `package.json` — the file a release bumps — resolved relative to the
+config file rather than `process.cwd()`, because the dashboard is normally built from inside
+`dashboard/`, where a cwd-relative read picks up the release-untouched `dashboard/package.json`
+instead. `APP_VERSION` in the environment still overrides it.
+
 ```typescript
 // vite.config.ts
-
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import path from 'path';
+
+// Root package.json, resolved from this file — NOT process.cwd().
+const { version: pkgVersion } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as {
+  version: string;
+};
 
 export default defineConfig({
   plugins: [react()],
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src'),
-    },
+  appType: 'spa', // SPA fallback for client-side routing
+  define: {
+    __APP_VERSION__: JSON.stringify(process.env.APP_VERSION || pkgVersion),
+    __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
   },
   server: {
     port: 2886,
     proxy: {
-      '/api': {
+      // Trailing slash: a plain '/api' prefix would also proxy the /api-keys SPA route.
+      '/api/': {
         target: 'http://localhost:2785',
         changeOrigin: true,
+        secure: false,
       },
-      '/ws': {
-        target: 'ws://localhost:2785',
+      // socket.io transport — NOT '/ws'
+      '/socket.io': {
+        target: 'http://localhost:2785',
         ws: true,
-      },
-    },
-  },
-  build: {
-    outDir: 'dist',
-    sourcemap: true,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom', 'react-router-dom'],
-          ui: ['@radix-ui/react-dialog', '@radix-ui/react-dropdown-menu'],
-        },
+        changeOrigin: true,
       },
     },
   },
 });
 ```
 
-### Docker Build
+### Production Build & Serving
 
-```dockerfile
-# dashboard/Dockerfile
+The dashboard has **no container of its own**. In production the NestJS API serves the bundled
+SPA from the same process and port (default `2785`) via `@nestjs/serve-static`, so there is no
+nginx image and no separate dashboard service to deploy.
 
-# Build stage
-FROM node:20-alpine AS builder
+How it fits together:
 
-WORKDIR /app
+- `npm run build:all` builds the API (`dist/`) **and** the dashboard (`dashboard/dist/`). The root
+  `Dockerfile` does this in its builder stage and copies `dashboard/dist` into the runtime image.
+- `ServeStaticModule` is registered conditionally in `src/app.module.ts`: it only activates when
+  `dashboard/dist/index.html` exists, serves it with SPA fallback, and `exclude`s `/api` and
+  `/socket.io` so those keep returning real API/WebSocket responses. Opt out with
+  `SERVE_DASHBOARD=false`.
+- Run it directly with `npm run prod` (build + serve) or `node dist/main` against a prebuilt image.
 
-COPY package*.json ./
-RUN npm ci
+In development the build is absent, so serve-static stays inert and the Vite dev server (port
+`2886`, see above) handles the UI with HMR while proxying `/api` + `/socket.io` to the API.
 
-COPY . .
-RUN npm run build
+**Split-origin hosting is still supported.** Same-origin serving is the default, not a lock-in: to
+host the dashboard separately (a CDN, an object store, or its own container), build it with the API
+origin baked in and deploy `dashboard/dist` wherever you like:
 
-# Production stage
-FROM nginx:alpine
-
-COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]
+```bash
+VITE_API_URL=https://api.example.com npm run build   # in dashboard/
 ```
 
-```nginx
-# dashboard/nginx.conf
+`dashboard/src/services/api.ts` reads `VITE_API_URL` and calls that origin instead of same-origin
+`/api`. The realtime socket follows the same origin unless `VITE_WS_URL` overrides it. Set
+`SERVE_DASHBOARD=false` on the API so it stops serving its own copy. Remember to add the dashboard's
+origin to `CORS_ORIGINS` on the API.
 
-server {
-    listen 80;
-    server_name _;
-    root /usr/share/nginx/html;
-    index index.html;
+For TLS or public exposure of the default single-port setup, terminate at your own reverse proxy
+(nginx, Caddy, a cloud load balancer, or a k8s Ingress) in front of the API; see
+`docs/12-troubleshooting-faq.md` for an nginx example.
 
-    # Gzip compression
-    gzip on;
-    gzip_types text/plain text/css application/json application/javascript;
-
-    # SPA routing
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    # API proxy (if needed)
-    location /api {
-        proxy_pass http://openwa:2785;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-    }
-
-    # WebSocket proxy
-    location /ws {
-        proxy_pass http://openwa:2785;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    # Cache static assets
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }
-}
-```
 ---
 
 <div align="center">

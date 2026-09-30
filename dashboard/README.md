@@ -21,7 +21,7 @@ Modern web dashboard for managing OpenWA WhatsApp API Gateway sessions, webhooks
 | ---------------- | ----------------------- |
 | React 19         | UI Framework            |
 | TypeScript       | Type Safety             |
-| Vite 7           | Build Tool              |
+| Vite 8           | Build Tool              |
 | React Router 7   | Client-side Routing     |
 | TanStack Query   | Server State Management |
 | TanStack Table   | Data Tables             |
@@ -32,8 +32,8 @@ Modern web dashboard for managing OpenWA WhatsApp API Gateway sessions, webhooks
 
 ### Prerequisites
 
-- Node.js 20+
-- npm or yarn
+- Node.js 22.22.2+ or 24.15+ (jsdom, used by the unit tests, requires it)
+- npm (the lockfile and the `overrides` security pins are npm-specific)
 
 ### Development
 
@@ -45,7 +45,11 @@ npm install
 npm run dev
 ```
 
-Dashboard will be available at `http://localhost:2886`
+Dashboard will be available at `http://localhost:2886` (Vite dev server with hot reload; it
+proxies `/api` + `/socket.io` to the NestJS API on `:2785`).
+
+In production the build (`npm run build` → `dist/`) is served by the NestJS API itself on the
+same port via `@nestjs/serve-static`, so there is no separate dashboard container.
 
 ### Production Build
 
@@ -78,10 +82,16 @@ dashboard/
 
 ## 🔗 API Connection
 
-The dashboard connects to the OpenWA API backend. Configure the API URL in environment variables:
+By default the dashboard calls the API on the **same origin** it is served from (the
+single-container setup), so no configuration is needed.
+
+For a **split-origin** deployment (dashboard hosted separately from the API), set the API
+**origin** at build time — the `/api` prefix is appended automatically:
 
 ```bash
 VITE_API_URL=http://localhost:2785
+# real-time events (WebSocket) origin; defaults to VITE_API_URL, else the page origin
+VITE_WS_URL=http://localhost:2785
 ```
 
 ## 📄 License
