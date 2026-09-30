@@ -269,13 +269,48 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.pushName;
   }
 
+  private async resolveChatId(chatId: string): Promise<string> {
+    if (!this.client) return chatId;
+
+    // Direct group chat
+    if (chatId.endsWith('@g.us')) {
+      return chatId;
+    }
+
+    try {
+      const cleanDigits = chatId.replace('@c.us', '').replace(/\D/g, '');
+
+      let numberId = await this.client.getNumberId(cleanDigits);
+
+      if (!numberId && cleanDigits.startsWith('521') && cleanDigits.length === 13) {
+        const altDigits = '52' + cleanDigits.substring(3);
+        numberId = await this.client.getNumberId(altDigits);
+      } else if (!numberId && cleanDigits.length === 10) {
+        numberId = await this.client.getNumberId('52' + cleanDigits);
+        if (!numberId) {
+          numberId = await this.client.getNumberId('521' + cleanDigits);
+        }
+      }
+
+      if (numberId && numberId._serialized) {
+        return numberId._serialized;
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to resolve getNumberId for ${chatId}: ${String(error)}`);
+    }
+
+    if (chatId.startsWith('521') && chatId.endsWith('@c.us') && chatId.length === 18) {
+      return '52' + chatId.substring(3);
+    }
+
+    return chatId;
+  }
+
   async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
     this.ensureReady();
-    const msg = await this.client!.sendMessage(chatId, text);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    const targetChatId = await this.resolveChatId(chatId);
+    const msg = await this.client!.sendMessage(targetChatId, text);
+    return this.extractMessageResult(msg);
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -287,39 +322,174 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   async sendAudioMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media);
+    return this.sendMediaMessage(chatId, media, { sendAudioAsVoice: false });
   }
 
   async sendDocumentMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media);
+    // WhatsApp Web revienta dentro del frontend ("Data passed to getter must
+    // include an id property...") cuando el documento no lleva filename o lleva
+    // un filename sin extensión. Normalizamos aquí para no depender del caller.
+    const normalized: MediaInput = {
+      ...media,
+      filename: this.ensureDocumentFilename(media.filename, media.mimetype),
+    };
+    return this.sendMediaMessage(chatId, normalized, { sendMediaAsDocument: true });
   }
 
-  private async sendMediaMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
+  /**
+   * Garantiza un filename con extensión para documentos.
+   * Sin esto WA Web falla con: "Data passed to getter must include an id
+   * property (it's how we memoize) but got undefined".
+   */
+  private ensureDocumentFilename(filename: string | undefined, mimetype: string): string {
+    const clean = (filename || '').trim().replace(/^"|"$/g, '');
+    const ext = this.extensionForMimetype(mimetype);
+    if (!clean) {
+      return `document.${ext}`;
+    }
+    // Quita rutas que a veces manda el cliente (C:\fakepath\doc.pdf)
+    const base = clean.split(/[\\/]/).pop() || clean;
+    if (base.includes('.')) {
+      return base;
+    }
+    return `${base}.${ext}`;
+  }
+
+  private extensionForMimetype(mimetype: string): string {
+    const mime = (mimetype || '').split(';')[0].trim().toLowerCase();
+    const map: Record<string, string> = {
+      'application/pdf': 'pdf',
+      'application/msword': 'doc',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+      'application/vnd.ms-excel': 'xls',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+      'application/vnd.ms-powerpoint': 'ppt',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+      'application/zip': 'zip',
+      'application/x-rar-compressed': 'rar',
+      'application/json': 'json',
+      'text/plain': 'txt',
+      'text/csv': 'csv',
+      'text/html': 'html',
+      'image/jpeg': 'jpg',
+      'image/png': 'png',
+      'image/gif': 'gif',
+      'image/webp': 'webp',
+      'video/mp4': 'mp4',
+      'audio/mpeg': 'mp3',
+      'audio/ogg': 'ogg',
+    };
+    if (map[mime]) return map[mime];
+    const parts = mime.split('/');
+    if (parts.length === 2 && parts[1]) {
+      // image/jpeg -> jpeg (válido), application/octet-stream -> bin
+      if (parts[1] === 'octet-stream') return 'bin';
+      return parts[1].split('+')[0];
+    }
+    return 'bin';
+  }
+
+  private async sendMediaMessage(
+    chatId: string,
+    media: MediaInput,
+    options: Record<string, any> = {},
+  ): Promise<MessageResult> {
     this.ensureReady();
+    const targetChatId = await this.resolveChatId(chatId);
+    const isDocument = Boolean(options.sendMediaAsDocument);
 
     let messageMedia: MessageMedia;
 
     if (typeof media.data === 'string') {
       if (media.data.startsWith('http://') || media.data.startsWith('https://')) {
-        // URL
-        messageMedia = await MessageMedia.fromUrl(media.data);
+        // URL: no perder el filename normalizado (fromUrl lo deduciría de la URL
+        // y podría quedar sin extensión -> revienta WA Web con el error del getter).
+        messageMedia = await MessageMedia.fromUrl(media.data, {
+          filename: isDocument
+            ? this.ensureDocumentFilename(media.filename, media.mimetype)
+            : media.filename,
+          unsafeMime: true,
+        });
+        // fromUrl deduce el mimetype del Content-Type; si quedó genérico y el
+        // caller dio uno explícito, respetar el del caller.
+        if (
+          media.mimetype &&
+          media.mimetype !== 'application/octet-stream' &&
+          (!messageMedia.mimetype || messageMedia.mimetype === 'application/octet-stream')
+        ) {
+          messageMedia.mimetype = media.mimetype;
+        }
       } else {
-        // Base64
-        messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
+        // Base64 (puro o data URI)
+        let cleanData = media.data.trim();
+        let mimetype = media.mimetype;
+        const dataUriMatch = cleanData.match(/^data:([^;]+);base64,([\s\S]*)$/);
+        if (dataUriMatch) {
+          mimetype = dataUriMatch[1] || mimetype;
+          cleanData = dataUriMatch[2].replace(/\s/g, '');
+        }
+        if (!cleanData) {
+          throw new Error('Media data is empty');
+        }
+        messageMedia = new MessageMedia(
+          mimetype,
+          cleanData,
+          isDocument ? this.ensureDocumentFilename(media.filename, mimetype) : media.filename,
+        );
       }
     } else {
       // Buffer
-      messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
+      if (media.data.length === 0) {
+        throw new Error('Media data is empty');
+      }
+      messageMedia = new MessageMedia(
+        media.mimetype,
+        media.data.toString('base64'),
+        isDocument ? this.ensureDocumentFilename(media.filename, media.mimetype) : media.filename,
+      );
     }
 
-    const msg = await this.client!.sendMessage(chatId, messageMedia, {
-      caption: media.caption,
-    });
+    // Cinturón y tirantes: el documento SIEMPRE debe llevar filename con extensión.
+    if (isDocument) {
+      messageMedia.filename = this.ensureDocumentFilename(
+        messageMedia.filename || media.filename,
+        messageMedia.mimetype || media.mimetype,
+      );
+    }
+    if (!messageMedia.mimetype) {
+      messageMedia.mimetype = media.mimetype;
+    }
 
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    let msg: unknown;
+    try {
+      msg = await this.client!.sendMessage(targetChatId, messageMedia, {
+        caption: media.caption,
+        ...options,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (detail.includes('getter must include an id')) {
+        throw new Error(
+          `WhatsApp Web rechazó el ${isDocument ? 'documento' : 'medio'} para ${targetChatId} ` +
+            `(getter id error). Verifica que el chat exista y esté sincronizado, y que el archivo ` +
+            `lleve filename con extensión y mimetype válido ` +
+            `(filename="${messageMedia.filename}", mimetype="${messageMedia.mimetype}"). ` +
+            `Original: ${detail}`,
+        );
+      }
+      throw error;
+    }
+
+    // sendMessage devuelve undefined cuando el chat no existe (Client.js retorna
+    // null si getChat falla). Antes esto se enmascaraba con un id inventado.
+    if (!msg) {
+      throw new Error(
+        `No se pudo enviar el ${isDocument ? 'documento' : 'medio'}: chat ${targetChatId} no encontrado. ` +
+          `Verifica el chatId y que la sesión esté sincronizada.`,
+      );
+    }
+
+    return this.extractMessageResult(msg);
   }
 
   async getContacts(): Promise<Contact[]> {
@@ -391,10 +561,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       address: location.address || '',
     });
     const msg = await this.client!.sendMessage(chatId, loc);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
@@ -411,10 +578,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, vcard, {
       parseVCards: true,
     });
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -434,10 +598,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, messageMedia, {
       sendMediaAsSticker: true,
     });
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult> {
@@ -452,10 +613,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     const msg = await quotedMsg.reply(text);
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    return this.extractMessageResult(msg);
   }
 
   async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
@@ -469,10 +627,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     await msgToForward.forward(toChatId);
-    // forward() returns void, so we generate a result based on original message
     return {
       id: `fwd_${messageId}`,
-      timestamp: Date.now(),
+      timestamp: Math.floor(Date.now() / 1000),
     };
   }
 
@@ -914,6 +1071,25 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   /* eslint-enable @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
+
+  private extractMessageResult(msg: unknown): MessageResult {
+    let id = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    let timestamp = Math.floor(Date.now() / 1000);
+
+    if (msg && typeof msg === 'object') {
+      const msgObj = msg as { id?: string | { _serialized?: string; id?: string }; timestamp?: number };
+      if (typeof msgObj.id === 'string') {
+        id = msgObj.id;
+      } else if (msgObj.id && typeof msgObj.id === 'object') {
+        id = msgObj.id._serialized || msgObj.id.id || JSON.stringify(msgObj.id);
+      }
+      if (typeof msgObj.timestamp === 'number') {
+        timestamp = msgObj.timestamp;
+      }
+    }
+
+    return { id, timestamp };
+  }
 
   private ensureReady(): void {
     if (this.status !== EngineStatus.READY || !this.client) {
