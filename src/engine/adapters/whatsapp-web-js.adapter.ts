@@ -385,10 +385,14 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     let cleanData = typeof media.data === 'string' ? media.data : '';
 
     if (typeof media.data === 'string') {
-      const dataUriMatch = media.data.match(/^data:([^;]+);base64,(.*)$/);
-      if (dataUriMatch) {
-        mimetype = dataUriMatch[1] || mimetype;
-        cleanData = dataUriMatch[2];
+      if (!media.data.startsWith('http://') && !media.data.startsWith('https://')) {
+        const dataUriMatch = media.data.match(/^data:([^;]+);base64,(.*)$/s);
+        if (dataUriMatch) {
+          mimetype = dataUriMatch[1] || mimetype;
+          cleanData = dataUriMatch[2];
+        }
+        // Remove newlines, carriage returns, and spaces from base64 string
+        cleanData = cleanData.replace(/[\r\n\s]/g, '');
       }
     }
 
@@ -415,10 +419,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       messageMedia.filename = filename;
     }
 
-    const msg = await this.client!.sendMessage(targetChatId, messageMedia, {
+    const sendOptions = {
       caption: media.caption,
+      filename,
       ...options,
-    });
+    };
+
+    const msg = await this.client!.sendMessage(targetChatId, messageMedia, sendOptions);
 
     return this.extractMessageResult(msg);
   }
