@@ -329,6 +329,50 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.sendMediaMessage(chatId, media, { sendMediaAsDocument: true });
   }
 
+  private getExtensionFromMimeType(mimetype?: string): string {
+    if (!mimetype) return '';
+    const mimeMap: Record<string, string> = {
+      'application/pdf': '.pdf',
+      'application/msword': '.doc',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+      'application/vnd.ms-excel': '.xls',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+      'application/vnd.ms-powerpoint': '.ppt',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+      'text/plain': '.txt',
+      'text/csv': '.csv',
+      'text/html': '.html',
+      'application/json': '.json',
+      'application/zip': '.zip',
+      'application/x-rar-compressed': '.rar',
+      'image/jpeg': '.jpg',
+      'image/jpg': '.jpg',
+      'image/png': '.png',
+      'image/gif': '.gif',
+      'image/webp': '.webp',
+      'audio/mpeg': '.mp3',
+      'audio/ogg': '.ogg',
+      'audio/wav': '.wav',
+      'video/mp4': '.mp4',
+    };
+    const baseMime = mimetype.split(';')[0].trim().toLowerCase();
+    return mimeMap[baseMime] || '';
+  }
+
+  private normalizeFilename(filename?: string, mimetype?: string, defaultBase = 'document'): string {
+    let name = filename ? filename.trim() : defaultBase;
+    if (!name) name = defaultBase;
+
+    const hasExtension = /\.[a-zA-Z0-9]+$/.test(name);
+    if (!hasExtension && mimetype) {
+      const ext = this.getExtensionFromMimeType(mimetype);
+      if (ext) {
+        name += ext;
+      }
+    }
+    return name;
+  }
+
   private async sendMediaMessage(
     chatId: string,
     media: MediaInput,
@@ -337,25 +381,38 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.ensureReady();
     const targetChatId = await this.resolveChatId(chatId);
 
-    let messageMedia: MessageMedia;
+    let mimetype = media.mimetype || 'application/octet-stream';
+    let cleanData = typeof media.data === 'string' ? media.data : '';
 
     if (typeof media.data === 'string') {
-      if (media.data.startsWith('http://') || media.data.startsWith('https://')) {
-        // URL
-        messageMedia = await MessageMedia.fromUrl(media.data);
-      } else {
-        // Base64
-        let cleanData = media.data;
-        const dataUriMatch = media.data.match(/^data:([^;]+);base64,(.*)$/);
-        if (dataUriMatch) {
-          media.mimetype = dataUriMatch[1] || media.mimetype;
-          cleanData = dataUriMatch[2];
-        }
-        messageMedia = new MessageMedia(media.mimetype, cleanData, media.filename);
+      const dataUriMatch = media.data.match(/^data:([^;]+);base64,(.*)$/);
+      if (dataUriMatch) {
+        mimetype = dataUriMatch[1] || mimetype;
+        cleanData = dataUriMatch[2];
       }
+    }
+
+    const defaultBase = options.sendMediaAsDocument ? 'document' : 'file';
+    const filename = this.normalizeFilename(media.filename, mimetype, defaultBase);
+
+    let messageMedia: MessageMedia;
+
+    if (typeof media.data === 'string' && (media.data.startsWith('http://') || media.data.startsWith('https://'))) {
+      // URL
+      messageMedia = await MessageMedia.fromUrl(media.data, { filename });
+      if (!messageMedia.filename) {
+        messageMedia.filename = filename;
+      }
+    } else if (typeof media.data === 'string') {
+      // Base64
+      messageMedia = new MessageMedia(mimetype, cleanData, filename);
     } else {
       // Buffer
-      messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
+      messageMedia = new MessageMedia(mimetype, media.data.toString('base64'), filename);
+    }
+
+    if (filename && !messageMedia.filename) {
+      messageMedia.filename = filename;
     }
 
     const msg = await this.client!.sendMessage(targetChatId, messageMedia, {
