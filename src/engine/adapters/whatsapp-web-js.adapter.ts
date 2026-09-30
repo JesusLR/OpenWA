@@ -269,48 +269,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.pushName;
   }
 
-  private async resolveChatId(chatId: string): Promise<string> {
-    if (!this.client) return chatId;
-
-    // Direct group chat
-    if (chatId.endsWith('@g.us')) {
-      return chatId;
-    }
-
-    try {
-      const cleanDigits = chatId.replace('@c.us', '').replace(/\D/g, '');
-
-      let numberId = await this.client.getNumberId(cleanDigits);
-
-      if (!numberId && cleanDigits.startsWith('521') && cleanDigits.length === 13) {
-        const altDigits = '52' + cleanDigits.substring(3);
-        numberId = await this.client.getNumberId(altDigits);
-      } else if (!numberId && cleanDigits.length === 10) {
-        numberId = await this.client.getNumberId('52' + cleanDigits);
-        if (!numberId) {
-          numberId = await this.client.getNumberId('521' + cleanDigits);
-        }
-      }
-
-      if (numberId && numberId._serialized) {
-        return numberId._serialized;
-      }
-    } catch (error) {
-      this.logger.warn(`Failed to resolve getNumberId for ${chatId}: ${String(error)}`);
-    }
-
-    if (chatId.startsWith('521') && chatId.endsWith('@c.us') && chatId.length === 18) {
-      return '52' + chatId.substring(3);
-    }
-
-    return chatId;
-  }
-
   async sendTextMessage(chatId: string, text: string): Promise<MessageResult> {
     this.ensureReady();
-    const targetChatId = await this.resolveChatId(chatId);
-    const msg = await this.client!.sendMessage(targetChatId, text);
-    return this.extractMessageResult(msg);
+    const msg = await this.client!.sendMessage(chatId, text);
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
+    };
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -322,112 +287,39 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   async sendAudioMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media, { sendAudioAsVoice: false });
+    return this.sendMediaMessage(chatId, media);
   }
 
   async sendDocumentMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media, { sendMediaAsDocument: true });
+    return this.sendMediaMessage(chatId, media);
   }
 
-  private getExtensionFromMimeType(mimetype?: string): string {
-    if (!mimetype) return '';
-    const mimeMap: Record<string, string> = {
-      'application/pdf': '.pdf',
-      'application/msword': '.doc',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
-      'application/vnd.ms-excel': '.xls',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
-      'application/vnd.ms-powerpoint': '.ppt',
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
-      'text/plain': '.txt',
-      'text/csv': '.csv',
-      'text/html': '.html',
-      'application/json': '.json',
-      'application/zip': '.zip',
-      'application/x-rar-compressed': '.rar',
-      'image/jpeg': '.jpg',
-      'image/jpg': '.jpg',
-      'image/png': '.png',
-      'image/gif': '.gif',
-      'image/webp': '.webp',
-      'audio/mpeg': '.mp3',
-      'audio/ogg': '.ogg',
-      'audio/wav': '.wav',
-      'video/mp4': '.mp4',
-    };
-    const baseMime = mimetype.split(';')[0].trim().toLowerCase();
-    return mimeMap[baseMime] || '';
-  }
-
-  private normalizeFilename(filename?: string, mimetype?: string, defaultBase = 'document'): string {
-    let name = filename ? filename.trim() : defaultBase;
-    if (!name) name = defaultBase;
-
-    const hasExtension = /\.[a-zA-Z0-9]+$/.test(name);
-    if (!hasExtension && mimetype) {
-      const ext = this.getExtensionFromMimeType(mimetype);
-      if (ext) {
-        name += ext;
-      }
-    }
-    return name;
-  }
-
-  private async sendMediaMessage(
-    chatId: string,
-    media: MediaInput,
-    options: Record<string, any> = {},
-  ): Promise<MessageResult> {
+  private async sendMediaMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.ensureReady();
-    const targetChatId = await this.resolveChatId(chatId);
-
-    let mimetype = media.mimetype || 'application/octet-stream';
-    let cleanData = typeof media.data === 'string' ? media.data : '';
-
-    if (typeof media.data === 'string') {
-      if (!media.data.startsWith('http://') && !media.data.startsWith('https://')) {
-        const dataUriMatch = media.data.match(/^data:([^;]+);base64,(.*)$/s);
-        if (dataUriMatch) {
-          mimetype = dataUriMatch[1] || mimetype;
-          cleanData = dataUriMatch[2];
-        }
-        // Remove newlines, carriage returns, and spaces from base64 string
-        cleanData = cleanData.replace(/[\r\n\s]/g, '');
-      }
-    }
-
-    const defaultBase = options.sendMediaAsDocument ? 'document' : 'file';
-    const filename = this.normalizeFilename(media.filename, mimetype, defaultBase);
 
     let messageMedia: MessageMedia;
 
-    if (typeof media.data === 'string' && (media.data.startsWith('http://') || media.data.startsWith('https://'))) {
-      // URL
-      messageMedia = await MessageMedia.fromUrl(media.data, { filename });
-      if (!messageMedia.filename) {
-        messageMedia.filename = filename;
+    if (typeof media.data === 'string') {
+      if (media.data.startsWith('http://') || media.data.startsWith('https://')) {
+        // URL
+        messageMedia = await MessageMedia.fromUrl(media.data);
+      } else {
+        // Base64
+        messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
       }
-    } else if (typeof media.data === 'string') {
-      // Base64
-      messageMedia = new MessageMedia(mimetype, cleanData, filename);
     } else {
       // Buffer
-      messageMedia = new MessageMedia(mimetype, media.data.toString('base64'), filename);
+      messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
     }
 
-    if (filename && !messageMedia.filename) {
-      messageMedia.filename = filename;
-    }
-
-    const sendOptions = {
+    const msg = await this.client!.sendMessage(chatId, messageMedia, {
       caption: media.caption,
-      filename,
-      ...options,
+    });
+
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
     };
-
-    const msg = await this.client!.sendMessage(targetChatId, messageMedia, sendOptions);
-
-    return this.extractMessageResult(msg);
   }
 
   async getContacts(): Promise<Contact[]> {
@@ -499,7 +391,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       address: location.address || '',
     });
     const msg = await this.client!.sendMessage(chatId, loc);
-    return this.extractMessageResult(msg);
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
+    };
   }
 
   async sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
@@ -516,7 +411,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, vcard, {
       parseVCards: true,
     });
-    return this.extractMessageResult(msg);
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
+    };
   }
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
@@ -536,7 +434,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const msg = await this.client!.sendMessage(chatId, messageMedia, {
       sendMediaAsSticker: true,
     });
-    return this.extractMessageResult(msg);
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
+    };
   }
 
   async replyToMessage(chatId: string, quotedMsgId: string, text: string): Promise<MessageResult> {
@@ -551,7 +452,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     const msg = await quotedMsg.reply(text);
-    return this.extractMessageResult(msg);
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
+    };
   }
 
   async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
@@ -565,9 +469,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     }
 
     await msgToForward.forward(toChatId);
+    // forward() returns void, so we generate a result based on original message
     return {
       id: `fwd_${messageId}`,
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: Date.now(),
     };
   }
 
@@ -1009,25 +914,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   /* eslint-enable @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
-
-  private extractMessageResult(msg: unknown): MessageResult {
-    let id = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    let timestamp = Math.floor(Date.now() / 1000);
-
-    if (msg && typeof msg === 'object') {
-      const msgObj = msg as { id?: string | { _serialized?: string; id?: string }; timestamp?: number };
-      if (typeof msgObj.id === 'string') {
-        id = msgObj.id;
-      } else if (msgObj.id && typeof msgObj.id === 'object') {
-        id = msgObj.id._serialized || msgObj.id.id || JSON.stringify(msgObj.id);
-      }
-      if (typeof msgObj.timestamp === 'number') {
-        timestamp = msgObj.timestamp;
-      }
-    }
-
-    return { id, timestamp };
-  }
 
   private ensureReady(): void {
     if (this.status !== EngineStatus.READY || !this.client) {
