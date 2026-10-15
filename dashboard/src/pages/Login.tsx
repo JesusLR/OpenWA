@@ -1,9 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Eye, EyeOff, Languages } from 'lucide-react';
+import { Eye, EyeOff } from 'lucide-react';
 import { GithubIcon } from '../components/GithubIcon';
-import { CustomSelect } from '../components/CustomSelect';
-import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
 import { API_BASE_URL } from '../services/api';
 import './Login.css';
 
@@ -12,16 +10,11 @@ interface LoginProps {
 }
 
 export function Login({ onLogin }: LoginProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
-  const currentLang = resolveSupportedLanguage(i18n.resolvedLanguage || i18n.language);
-
-  const changeLanguage = (language: SupportedLanguage) => {
-    void i18n.changeLanguage(language);
-  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -72,7 +65,7 @@ export function Login({ onLogin }: LoginProps) {
       <div className="login-card">
         <div className="login-logo login-hero">
           <img src="/logo_pds.png" alt="OpenWA" className="logo-icon" />
-          <p className="logo-tagline">{t('common.appSubtitle')}</p>
+          <p className="logo-tagline">Servicio de mensajeria OpenWA.</p>
           <span className="version-info">
             {t('login.version', {
               version: __APP_VERSION__,
@@ -81,16 +74,6 @@ export function Login({ onLogin }: LoginProps) {
               date: new Date(__BUILD_TIME__).toISOString().slice(0, 10).replace(/-/g, ''),
             })}
           </span>
-        </div>
-
-        <div className="login-language">
-          <Languages size={18} />
-          <CustomSelect
-            value={currentLang}
-            onChange={value => changeLanguage(value as SupportedLanguage)}
-            options={languageOptions.map(opt => ({ value: opt.value, label: opt.label }))}
-            ariaLabel={t('common.language')}
-          />
         </div>
 
         <form onSubmit={handleSubmit} className="login-form">
@@ -104,6 +87,10 @@ export function Login({ onLogin }: LoginProps) {
                 onChange={e => setApiKey(e.target.value)}
                 placeholder={t('login.apiKeyPlaceholder')}
                 className={error ? 'error' : ''}
+                autoComplete="off"
+                spellCheck={false}
+                aria-invalid={Boolean(error)}
+                aria-describedby={error ? 'login-error' : undefined}
               />
               <button
                 type="button"
@@ -114,10 +101,16 @@ export function Login({ onLogin }: LoginProps) {
                 {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
               </button>
             </div>
+            {error && (
+              <span id="login-error" className="error-message" role="alert">
+                {error}
+              </span>
+            )}
+          </div>
 
-            <button type="submit" className="connect-btn" disabled={isLoading}>
-              {isLoading ? t('login.connecting') : t('login.connect')}
-            </button>
+          <button type="submit" className="connect-btn" disabled={isLoading}>
+            {isLoading ? t('login.connecting') : t('login.connect')}
+          </button>
         </form>
 
         <p className="login-help">
@@ -126,7 +119,7 @@ export function Login({ onLogin }: LoginProps) {
             {t('login.viewDocs')}
           </a>
         </p>
-      </div >
+      </div>
 
       <footer className="login-footer">
         <span>{t('login.footer')}</span>
@@ -140,6 +133,6 @@ export function Login({ onLogin }: LoginProps) {
           <GithubIcon size={18} />
         </a>
       </footer>
-    </div >
+    </div>
   );
 }

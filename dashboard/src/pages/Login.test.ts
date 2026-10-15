@@ -102,5 +102,5 @@ test('the login form aligns to the document direction, which is set on <html>', 
   // i18n sets `dir` on the document element only, so a `[dir]` compound after another selector part
   // would need a second element carrying `dir` inside the page and never matches.
   assert.deepEqual(css.match(/[^\s,{}][^,{}]*\s\[dir[^\]]*\][^{]*/g) ?? [], []);
-  assert.match(css, /\.login-container \.login-form \{\s*text-align: start;\s*\}/);
+  assert.match(css, /\.login-container \.login-form \{[^}]*\btext-align:\s*start;/);
 });

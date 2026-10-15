@@ -100,7 +100,7 @@ export class RedisIoAdapter extends IoAdapter {
   }
 
   /** Close the pub/sub connections so a shutdown does not leak them. Called by Nest on app close. */
-  async close(server: Server): Promise<void> {
+  async close(server: Parameters<IoAdapter['close']>[0]): Promise<void> {
     // Socket.IO's adapters unsubscribe from their Redis channels as the server closes. Tearing the
     // clients down FIRST left those unsubscribes to be issued on dead clients, and each rejection
     // surfaced as an unhandled rejection — a handful of ERROR lines on every graceful shutdown, for

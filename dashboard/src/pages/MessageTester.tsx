@@ -123,34 +123,6 @@ const MEDIA_UPLOAD_MAX_BYTES = 18 * 1024 * 1024;
 // Batch statuses that stop the progress polling (mirrors the backend BatchStatus enum).
 const TERMINAL_BATCH_STATUSES: readonly BatchStatus[] = ['completed', 'cancelled', 'failed'];
 
-const mediaAcceptByType: Record<typeof messageTypes[number], string> = {
-  text: '',
-  image: 'image/*',
-  video: 'video/*',
-  audio: 'audio/*',
-  document: '*/*',
-};
-
-const readFileAsDataUrl = (file: File) =>
-  new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        resolve(reader.result);
-        return;
-      }
-
-      reject(new Error('Unable to read the selected file'));
-    };
-
-    reader.onerror = () => {
-      reject(reader.error || new Error('Unable to read the selected file'));
-    };
-
-    reader.readAsDataURL(file);
-  });
-
 export function MessageTester() {
   const { t } = useTranslation();
   useDocumentTitle(t('messageTester.title'));
@@ -498,21 +470,6 @@ export function MessageTester() {
   const cancelGroupSend = () => {
     setGroupSendCancelling(true);
     groupSendAbort.current?.abort();
-  };
-
-  useEffect(() => {
-    setSelectedFile(null);
-    if (mediaFileInputRef.current) {
-      mediaFileInputRef.current.value = '';
-    }
-  }, [messageType]);
-
-  const handleMediaFileChange = (event: ChangeEvent<HTMLInputElement>) => {
-    setSelectedFile(event.target.files?.[0] ?? null);
-  };
-
-  const openMediaFilePicker = () => {
-    mediaFileInputRef.current?.click();
   };
 
   const handleSend = async () => {
