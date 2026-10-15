@@ -36,6 +36,7 @@
     "hoursAgo_other": "Há {{count}} horas",
     "hoursAgo_many": "Há {{count}} horas",
     "optional": "opcional",
+    "fieldTooLong": "Limite de {{max}} caracteres (agora {{count}}).",
     "language": "Idioma",
     "back": "Voltar",
     "next": "Próximo",
@@ -97,6 +98,7 @@
     "loadingMessages": "Carregando mensagens...",
     "loadingOlderMessages": "Carregando mensagens anteriores...",
     "loadOlderMessagesError": "Não foi possível carregar mensagens anteriores. Role para cima para tentar novamente.",
+    "loadOlderMessagesRetryHint": "Role para cima para tentar novamente.",
     "noMessagesInChat": "Ainda não há mensagens. Envie a primeira para começar!",
     "downloadDocument": "Baixar documento",
     "actions": {
@@ -125,7 +127,6 @@
       "unknownType": "Tipo desconhecido"
     },
     "you": "Você",
-    "youPrefix": "Você: ",
     "yesterday": "Ontem",
     "attachTitle": "Enviar arquivo / imagem",
     "emojiTitle": "Escolher emoji",
@@ -353,7 +354,7 @@
       "configured": "{{host}} ({{type}})",
       "noProxy": "Nenhum proxy configurado",
       "hasCredentials": "As credenciais estão armazenadas, mas não são exibidas. Digite uma URL completa para alterá-las.",
-      "hint": "As alterações se aplicam no próximo início da sessão, não a uma conexão em andamento. O proxy precisa ser real e acessível: um valor inacessível bloqueia a entrega do QR code e o início retorna 504.",
+      "hint": "As alterações se aplicam no próximo início da sessão, não a uma conexão em andamento. O proxy precisa ser real e acessível: um valor inacessível bloqueia a entrega do QR code. No whatsapp-web.js o início retorna 504; no Baileys o início é concluído e a sessão continua tentando reconectar.",
       "createHint": "Necessário apenas quando sua rede não consegue acessar o WhatsApp diretamente. Precisa ser um proxy real e acessível.",
       "invalidUrl": "Digite uma URL de proxy http, https, socks4 ou socks5 válida.",
       "saveSuccessTitle": "Proxy salvo",
@@ -493,11 +494,9 @@
       "valueLabel": "Valor do filtro"
     },
     "columns": {
-      "url": "URL",
       "events": "Eventos",
       "session": "Sessão",
-      "status": "Status",
-      "actions": "Ações"
+      "status": "Status"
     },
     "empty": {
       "title": "Nenhum webhook configurado",
@@ -537,6 +536,7 @@
       "session.reconnect_loop": "Quando uma sessão continua sem conseguir se reconectar",
       "session.restriction": "Quando o WhatsApp restringe a conta ou remove uma restrição",
       "presence.update": "Quando um chat inscrito fica online, digita ou fica offline",
+      "event.response": "Quando um convidado responde a um evento do WhatsApp (vai, não vai, talvez)",
       "group.join": "Quando participantes entram em um grupo ou são adicionados",
       "group.leave": "Quando participantes saem de um grupo ou são removidos",
       "group.update": "Quando o nome, a descrição ou as configurações de um grupo mudam",
@@ -627,7 +627,6 @@
       "revoke": "Revogar"
     },
     "actions": {
-      "copy": "Copiar",
       "revoke": "Revogar",
       "delete": "Excluir",
       "edit": "Editar acesso"
@@ -660,8 +659,9 @@
     },
     "chats": {
       "label": "Acesso a chats (opcional)",
-      "hint": "Um chat por linha: um ID de grupo terminado em @g.us, um ID de contato terminado em @c.us ou @lid, ou um número de telefone. Deixe em branco para todos os chats. Uma chave restrita a chats só pode usar as rotas abertas a esse tipo de chave; o WebSocket de eventos e o MCP a recusam.",
-      "invalid": "Não é um ID de chat nem um número de telefone: {{value}}"
+      "hint": "Um chat por linha: um ID de grupo terminado em @g.us, um ID de contato terminado em @c.us ou @lid, ou um número de telefone. Deixe em branco para todos os chats. Uma chave restrita a chats só pode usar as rotas abertas a esse tipo de chave; o acesso dela pelo WebSocket de eventos e pelo MCP fica limitado a esses chats.",
+      "invalid": "Não é um ID de chat nem um número de telefone: {{value}}",
+      "tooMany": "Chats demais ({{count}}): uma chave pode listar no máximo {{max}}."
     },
     "expiry": {
       "label": "Expira em (opcional)",
@@ -892,7 +892,7 @@
       "sslRejectUnauthorized": "Verificar certificado SSL",
       "sslRejectUnauthorizedDesc": "Rejeitar certificados autoassinados ou inválidos. Desative para Postgres gerenciado com certificados autoassinados (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Migrações do banco de dados",
-      "migrationsStatus": "O esquema é sincronizado automaticamente com TypeORM",
+      "migrationsStatus": "Migrações pendentes são aplicadas automaticamente na inicialização",
       "migrationsHint": "As migrações são gerenciadas automaticamente. Use a CLI para migrações manuais."
     },
     "engine": {
@@ -915,7 +915,7 @@
     "redis": {
       "title": "Redis",
       "enable": "Habilitar Redis",
-      "enableDesc": "Necessário para cache, armazenamento de sessões e filas BullMQ",
+      "enableDesc": "Usado para cache, filas BullMQ, contadores de limite de taxa e distribuição de WebSocket entre vários nós",
       "useBuiltIn": "Usar contêiner Redis integrado",
       "builtInDesc": "OpenWA gerenciará um contêiner Redis para você",
       "queueTitle": "Habilitar sistema de filas BullMQ",
@@ -927,7 +927,7 @@
       "failed": "Falhou",
       "viewBullMq": "Ver painel BullMQ",
       "disabledTitle": "Redis está desabilitado",
-      "disabledDesc": "Habilite o Redis para cache, armazenamento de sessões e filas de mensagens BullMQ.",
+      "disabledDesc": "Habilite o Redis para cache, filas de mensagens BullMQ, contadores de limite de taxa e distribuição de WebSocket entre vários nós.",
       "passwordOptional": "(opcional)",
       "bullMqUrlCopied": "URL do painel do Bull MQ copiada",
       "bullMqUrlHint": "Abra com uma chave de API ADMIN — uma aba do navegador não consegue autenticar."
@@ -1061,7 +1061,7 @@
       "healthFail": "Verificação de saúde falhou",
       "healthError": "Erro na verificação de saúde",
       "savedTitle": "Configuração salva",
-      "savedDesc": "É necessário reiniciar o servidor para aplicar as alterações.",
+      "savedDesc": "As alterações entram em vigor sem reiniciar o servidor.",
       "saveFailed": "Erro ao salvar",
       "installed": "Plugin instalado",
       "installFailed": "Erro na instalação",

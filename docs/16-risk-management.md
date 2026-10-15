@@ -8,8 +8,8 @@ quadrantChart
     x-axis Low Impact --> High Impact
     y-axis Low Probability --> High Probability
 
-    quadrant-1 Monitor
-    quadrant-2 Critical
+    quadrant-1 Critical
+    quadrant-2 Monitor
     quadrant-3 Low Priority
     quadrant-4 Mitigate
 
@@ -19,6 +19,8 @@ quadrantChart
     Maintainer Burnout: [0.5, 0.4]
     Dependency Issues: [0.4, 0.6]
     Legal Issues: [0.8, 0.2]
+    Rate Limiting: [0.45, 0.7]
+    Data Loss: [0.7, 0.2]
 ```
 
 ## 16.2 Risk Register
@@ -58,7 +60,7 @@ flowchart TB
     M4 --> A4[< 24h patch capability]
 ```
 
-Switching `ENGINE_TYPE` (M3) helps only when one engine library breaks. A gate WhatsApp enforces inside the linking handshake, such as the passkey step ([#560](https://github.com/rmyndharis/OpenWA/issues/560), upstream [WhiskeySockets/Baileys#2672](https://github.com/WhiskeySockets/Baileys/issues/2672)), stops new links on both engines; the fix has to come from the engine libraries, and operators rely on their fallback channel until then (see [Plan A](#plan-a-whatsapp-protocol-change)).
+Switching `ENGINE_TYPE` (M3) helps only when one engine library breaks, and every session must then be linked again, because each engine keeps its own auth state. A gate WhatsApp enforces inside the linking handshake, such as the passkey step ([#560](https://github.com/rmyndharis/OpenWA/issues/560), upstream [WhiskeySockets/Baileys#2672](https://github.com/WhiskeySockets/Baileys/issues/2672)), stops new links on both engines; the fix has to come from the engine libraries, and operators rely on their fallback channel until then (see [Plan A](#plan-a-whatsapp-protocol-change)).
 
 **Action Items:**
 
@@ -316,7 +318,7 @@ Dependencies (`whatsapp-web.js`, Puppeteer, NestJS, etc.) may have vulnerabiliti
 
 **Mitigation Strategies:**
 
-> **Current state:** the real dependency check is a dedicated `audit` job in `ci.yml` running `npm run check:audit` over the root tree and `npm audit --audit-level=high` over `dashboard/` (on push and PR); it is deliberately split out of the `Lint` job so a newly published advisory cannot abort the other quality gates. `check:audit` keeps the `high` threshold but applies it per advisory, so one with no patched version can be excused by id in `scripts/check-audit.mjs` (with its reason and removal condition recorded, and a stale entry failing the job) instead of lowering the bar for everything. `release.yml` repeats both and additionally runs a Trivy image scan (`CRITICAL,HIGH`, `ignore-unfixed`) against an explicit `.trivyignore` before the release tags are promoted. Dependabot PRs cover npm for `/` and `/dashboard` (weekly), GitHub Actions (monthly), the Dockerfile base image and the `docker-compose.yml` images (weekly; PostgreSQL and Redis majors ignored, and a postgres, redis or pgsty/silo bump fails `compose-parity.spec.ts` until `src/modules/docker/docker.service.ts` carries the same image reference), with version-pinned ignores (seven in the root tree, two in `/dashboard`) whose reasons and lift conditions are recorded in `.github/dependabot.yml`. Between releases, `.github/workflows/security-scan.yml` (Scheduled Security Scan) runs every Wednesday at 03:00 UTC and on demand: it repeats the `audit` job and the release Trivy scan against the published `latest` image on amd64 and arm64, so an advisory those gates would block fails a run within a week of being published; the amd64 Chrome for Testing binary stays outside what Trivy can see (see `.trivyignore`). Its `base-image-drift` job fails when the Dockerfile's two `node:22-slim` FROM digests disagree, or when the pin differs from what the tag serves today and either the tag has served that image for 7 or more days, or for 3 or more days with the pin last changed 28 or more days ago; it backstops a Dependabot digest refresh that is late or left unmerged. There is **no** Snyk integration. The workflow below is a recommended enhancement to add Snyk; its scheduled `npm audit` is already covered by `security-scan.yml`.
+> **Current state:** the real dependency check is a dedicated `audit` job in `ci.yml` running `npm run check:audit` over the root tree and `npm audit --audit-level=high` over `dashboard/` and `sdk/javascript/` (on push and PR); it is deliberately split out of the `Lint` job so a newly published advisory cannot abort the other quality gates. `check:audit` keeps the `high` threshold but applies it per advisory, so one with no patched version can be excused by id in `scripts/check-audit.mjs` (with its reason and removal condition recorded, and a stale entry failing the job) instead of lowering the bar for everything. `js-sdk-release.yml` audits `sdk/javascript/` before it publishes the SDK. `release.yml` repeats the root and dashboard audits, the two trees the image ships, and additionally runs a Trivy image scan (`CRITICAL,HIGH`, `ignore-unfixed`) against an explicit `.trivyignore` before the release tags are promoted. Dependabot PRs cover npm for `/`, `/dashboard` and `/sdk/javascript`, and pip, maven, composer and gomod for the other four SDKs (weekly), GitHub Actions (monthly), the Dockerfile base image and the `docker-compose.yml` images (weekly; PostgreSQL and Redis majors ignored, and a postgres, redis or pgsty/silo bump fails `compose-parity.spec.ts` until `src/modules/docker/docker.service.ts` carries the same image reference), with version-pinned ignores (seven in the root tree, two in `/dashboard`) whose reasons and lift conditions are recorded in `.github/dependabot.yml`. Between releases, `.github/workflows/security-scan.yml` (Scheduled Security Scan) runs every Wednesday at 03:00 UTC and on demand: it repeats the `audit` job and the release Trivy scan against the published `latest` image on amd64 and arm64, so an advisory those gates would block fails a run within a week of being published; the amd64 Chrome for Testing binary stays outside what Trivy can see (see `.trivyignore`). Its `base-image-drift` job fails when the Dockerfile's two `node:22-slim` FROM digests disagree, or when the pin differs from what the tag serves today and either the tag has served that image for 7 or more days, or for 3 or more days with the pin last changed 28 or more days ago; it backstops a Dependabot digest refresh that is late or left unmerged. There is **no** Snyk integration. The workflow below is a recommended enhancement to add Snyk; its scheduled `npm audit` is already covered by `security-scan.yml`.
 
 ```yaml
 # .github/workflows/security.yml
@@ -345,16 +347,16 @@ jobs:
 
 **Dependency Management Policy:**
 
-| Action                                                                                    | Frequency                    |
-| ----------------------------------------------------------------------------------------- | ---------------------------- |
-| npm audit (`high`, per-advisory allowlist via `check:audit`; dedicated `audit` job in CI) | Every push / PR              |
-| Trivy image scan (`CRITICAL,HIGH`, `.trivyignore`)                                        | Every release                |
-| Scheduled Security Scan (audit, Trivy on `latest` amd64 and arm64, base-image drift)      | Weekly (Wednesday 03:00 UTC) |
-| Snyk scan                                                                                 | Not configured (planned)     |
-| Dependabot PRs (npm: `/` and `/dashboard`; docker; docker-compose)                        | Weekly                       |
-| Dependabot PRs (github-actions)                                                           | Monthly                      |
-| Major updates                                                                             | Reviewed manually            |
-| Security patches                                                                          | Immediate                    |
+| Action                                                                                             | Frequency                    |
+| -------------------------------------------------------------------------------------------------- | ---------------------------- |
+| npm audit (`high`, per-advisory allowlist via `check:audit`; dedicated `audit` job in CI)          | Every push / PR              |
+| Trivy image scan (`CRITICAL,HIGH`, `.trivyignore`)                                                 | Every release                |
+| Scheduled Security Scan (audit, Trivy on `latest` amd64 and arm64, base-image drift)               | Weekly (Wednesday 03:00 UTC) |
+| Snyk scan                                                                                          | Not configured (planned)     |
+| Dependabot PRs (npm: `/`, `/dashboard`, `/sdk/javascript`; the other SDKs; docker; docker-compose) | Weekly                       |
+| Dependabot PRs (github-actions)                                                                    | Monthly                      |
+| Major updates                                                                                      | Reviewed manually            |
+| Security patches                                                                                   | Immediate                    |
 
 ---
 
@@ -452,7 +454,8 @@ flowchart TB
 
     E --> |One engine| C1[Notify users]
     C1 --> C2[Set ENGINE_TYPE to the unaffected engine]
-    C2 --> M1
+    C2 --> C3[Link every session again on the new engine - auth state is per engine]
+    C3 --> M1
     E --> |Both engines or server-side gate| B1[Notify users and link the tracking issue]
     B1 --> B2[Keep linked sessions running - no logout or restart churn]
     B2 --> B3[Operators move critical traffic to their fallback channel]
@@ -461,6 +464,8 @@ flowchart TB
 ```
 
 During a both-engines event keep linked sessions running rather than logging them out or deleting them: linking again may hit the same gate.
+
+After a one-engine switch every session starts without credentials, because each engine keeps its own auth state. An account behind the passkey gate cannot link again, so keep it on the fallback channel.
 
 ### Plan B: Critical Security Vulnerability
 

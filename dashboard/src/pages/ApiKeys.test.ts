@@ -4,8 +4,11 @@
 import '../test-helpers/register-hooks.ts';
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { createElement } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ALLOWED_CHATS_MAX } from '../utils/sessionScope.ts';
 
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
@@ -24,6 +27,8 @@ const billingBot = {
 };
 let keyList: Record<string, unknown>[] = [billingBot];
 let createBody: Record<string, unknown> | undefined;
+// When set, POST /auth/api-keys answers only once this settles.
+let createGate: Promise<void> | undefined;
 let updateBodies: Record<string, unknown>[] = [];
 let updateStatus = 200;
 
@@ -34,7 +39,8 @@ function installFetchStub(): void {
     if (path === '/api/sessions') return Promise.resolve(jsonResponse([]));
     if (init?.method === 'POST' && path === '/api/auth/api-keys') {
       createBody = JSON.parse(String(init.body));
-      return Promise.resolve(jsonResponse({ ...billingBot, id: 'key-new', apiKey: 'owa_k1_new' }, 201));
+      const created = jsonResponse({ ...billingBot, id: 'key-new', apiKey: 'owa_k1_new' }, 201);
+      return createGate ? createGate.then(() => created) : Promise.resolve(created);
     }
     if (init?.method === 'PUT' && path.startsWith('/api/auth/api-keys/')) {
       updateBodies.push(JSON.parse(String(init.body)));
@@ -76,6 +82,7 @@ afterEach(() => {
   listStatus = 200;
   keyList = [billingBot];
   createBody = undefined;
+  createGate = undefined;
   updateBodies = [];
   updateStatus = 200;
   window.sessionStorage.removeItem('openwa_api_key');
@@ -177,10 +184,54 @@ test('a create sends the IP allow-list, chats and expiry only when filled in', a
   });
 });
 
-// A production gateway refuses a name over 100 characters with a bare "Bad Request".
-test('the key name cannot exceed the 100 characters the gateway takes', async () => {
-  await openCreate();
-  assert.equal(rtl.screen.getByLabelText<HTMLInputElement>('Name').maxLength, 100);
+// The key exists once the request lands; a modal closed meanwhile would leave its one-time secret
+// unseen and pop it up on the next Create API Key click.
+test('the create modal stays open until the request settles and then shows the secret', async () => {
+  const { screen, fireEvent } = rtl;
+  let release = (): void => {};
+  createGate = new Promise(resolve => {
+    release = resolve;
+  });
+  const create = await openCreate();
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'crm-bot' } });
+  fireEvent.click(create);
+  const cancel = await screen.findByRole<HTMLButtonElement>('button', { name: 'Cancel' });
+  await rtl.waitFor(() => assert.equal(cancel.disabled, true, 'Cancel is live while the key is being created'));
+  assert.equal(screen.queryByRole('button', { name: 'Close' }) === null, true, 'the close button is live mid-request');
+  fireEvent.keyDown(document, { key: 'Escape' });
+  fireEvent.mouseDown(document.querySelector('.modal-overlay') as HTMLElement);
+  screen.getByRole('dialog');
+  release();
+  await screen.findByText('owa_k1_new');
+});
+
+// The gateway counts an emoji, with or without its presentation selector, as one character.
+test('a name of two emoji keeps Create disabled', async () => {
+  const { screen, fireEvent } = rtl;
+  const create = await openCreate();
+  for (const name of ['\u{1F511}\u{1F511}', '\u2714\uFE0F\u2714\uFE0F']) {
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: name } });
+    assert.equal(create.disabled, true, `Create is enabled for ${name}`);
+    screen.getByText('Use at least 3 characters.');
+  }
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: '\u{1F511}\u{1F511}\u{1F511}' } });
+  assert.equal(create.disabled, false);
+});
+
+// A production gateway refuses a name over 100 characters with a bare "Bad Request". It counts code
+// points, while a maxlength attribute counts UTF-16 units and would cut an emoji name at 50.
+test('a key name over the 100 characters the gateway takes keeps Create disabled', async () => {
+  const { screen, fireEvent } = rtl;
+  const create = await openCreate();
+  const name = screen.getByLabelText<HTMLInputElement>('Name');
+  assert.equal(name.hasAttribute('maxlength'), false);
+  fireEvent.change(name, { target: { value: '\u{1F511}'.repeat(100) } });
+  assert.equal(create.disabled, false, 'Create is disabled for a 100-character name');
+  const regions = screen.queryAllByRole('status');
+  fireEvent.change(name, { target: { value: '\u{1F511}'.repeat(101) } });
+  assert.equal(create.disabled, true, 'Create is enabled for a 101-character name');
+  // A live region mounted together with its text is often not announced, so the hint fills one already there.
+  assert.ok(regions.includes(screen.getByText('Limited to 100 characters (101 now).')));
 });
 
 test('an IP or chat line the gateway would refuse keeps Create disabled and names the line', async () => {
@@ -208,7 +259,7 @@ test('switching the new key to admin hides and drops the chat list', async () =>
   fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'root-key' } });
   fireEvent.change(screen.getByLabelText('Chat access (optional)'), { target: { value: '120363000@g.us' } });
   fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'admin' } });
-  assert.equal(screen.queryByLabelText('Chat access (optional)'), null);
+  assert.equal(screen.queryByLabelText('Chat access (optional)') === null, true);
   fireEvent.click(create);
   await waitFor(() => assert.ok(createBody));
   assert.deepEqual(createBody, { name: 'root-key', role: 'admin' });
@@ -244,7 +295,7 @@ test('an active admin key can be edited; a revoked key cannot', async () => {
   assert.equal(rtl.screen.getAllByTitle('Edit access').length, 1);
   rtl.fireEvent.click(rtl.screen.getByTitle('Edit access'));
   // Admin keys stay unscoped in the dashboard: no session or chat fields.
-  assert.equal(rtl.screen.queryByLabelText('Chat access (optional)'), null);
+  assert.equal(rtl.screen.queryByLabelText('Chat access (optional)') === null, true);
   rtl.screen.getByLabelText('Allowed IP addresses (optional)');
 });
 
@@ -265,7 +316,7 @@ test('saving an untouched key sends nothing, even with an expiry and lists set',
     expiresAt: '2027-03-04T05:06:59.000Z',
   });
   rtl.fireEvent.click(save);
-  await rtl.waitFor(() => assert.equal(rtl.screen.queryByRole('button', { name: 'Save' }), null));
+  await rtl.waitFor(() => assert.equal(rtl.screen.queryByRole('button', { name: 'Save' }) === null, true));
   assert.deepEqual(updateBodies, []);
 });
 
@@ -321,6 +372,55 @@ test('an untouched list with an entry the form would refuse does not block Save'
   screen.getByText('Not an IPv4 address or CIDR range: fd00::1');
 });
 
+// The gateway answers a list of more than 2000 chats with 400 and, in production, words it as a bare
+// "Bad Request". The form counts entries itself, so it has to hold the same bound the gateway publishes
+// and spare a stored list that the update does not send.
+const chatList = (count: number, offset = 0): string =>
+  Array.from({ length: count }, (_, i) => `1203630${String(offset + i).padStart(9, '0')}@g.us`).join('\n');
+
+test('the form holds the chat limit the gateway publishes', () => {
+  const contract = JSON.parse(
+    readFileSync(fileURLToPath(new URL('../../../openapi.json', import.meta.url)), 'utf8'),
+  ) as {
+    components: { schemas: Record<string, { properties: { allowedChats: { maxItems: number } } }> };
+  };
+  for (const dto of ['CreateApiKeyDto', 'UpdateApiKeyDto']) {
+    assert.equal(contract.components.schemas[dto].properties.allowedChats.maxItems, ALLOWED_CHATS_MAX);
+  }
+});
+
+test('a chat list at the limit keeps Create enabled and one past it disables it', async () => {
+  const { screen, fireEvent } = rtl;
+  const create = await openCreate();
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'crm-bot' } });
+  fireEvent.change(screen.getByLabelText('Chat access (optional)'), { target: { value: chatList(ALLOWED_CHATS_MAX) } });
+  assert.equal(create.disabled, false);
+  fireEvent.change(screen.getByLabelText('Chat access (optional)'), {
+    target: { value: chatList(ALLOWED_CHATS_MAX + 1) },
+  });
+  assert.equal(create.disabled, true);
+});
+
+test('a stored list past the limit does not block an unrelated edit, and a new one does', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  const stored = chatList(ALLOWED_CHATS_MAX + 1).split('\n');
+  const save = await openEdit({ ...billingBot, allowedChats: stored, expiresAt: '2027-03-04T05:06:59.000Z' });
+  // Left as stored it is not sent, so its length is not checked.
+  assert.equal(save.disabled, false);
+  fireEvent.click(screen.getByRole('button', { name: 'Remove expiry' }));
+  fireEvent.click(save);
+  await waitFor(() => assert.equal(updateBodies.length, 1));
+  assert.deepEqual(updateBodies[0], { expiresAt: null });
+
+  // Replaced, it is sent whole, so it is counted again.
+  rtl.cleanup();
+  const edited = await openEdit({ ...billingBot, allowedChats: stored });
+  fireEvent.change(screen.getByLabelText('Chat access (optional)'), {
+    target: { value: chatList(ALLOWED_CHATS_MAX + 1, 100_000) },
+  });
+  assert.equal(edited.disabled, true);
+});
+
 test('a refused update keeps the editor open and shows the reason', async () => {
   const { screen, fireEvent, waitFor } = rtl;
   updateStatus = 409;
@@ -339,7 +439,7 @@ test('editing the key the dashboard is signed in with warns before saving', asyn
   rtl.cleanup();
   window.sessionStorage.setItem('openwa_api_key', 'owa_k1zzXXXXYYYYZZZZ');
   await openEdit(billingBot);
-  assert.equal(rtl.screen.queryByText(/This dashboard is signed in with this key/), null);
+  assert.equal(rtl.screen.queryByText(/This dashboard is signed in with this key/) === null, true);
 });
 
 // A datetime-local with a blank segment reports value '' (as an empty field does) and sets badInput.
@@ -434,7 +534,7 @@ test('Remove expiry appears for a partial expiry typed into an empty field', asy
   assert.deepEqual(updateBodies, []);
   fireEvent.click(screen.getByRole('button', { name: 'Remove expiry' }));
   fireEvent.click(save);
-  await waitFor(() => assert.equal(screen.queryByRole('button', { name: 'Save' }), null));
+  await waitFor(() => assert.equal(screen.queryByRole('button', { name: 'Save' }) === null, true));
   assert.deepEqual(updateBodies, []);
 });
 
@@ -505,4 +605,37 @@ test('an expiry Save cannot convert ends in an error toast, not a silent no-op',
   fireEvent.click(save);
   await screen.findByText('Invalid time value');
   assert.deepEqual(updateBodies, []);
+});
+
+// The name of a key is free text and is interpolated into the delete confirmation. A name carrying a
+// styled tag became a real element with a string `style`, which React throws on, so the page went down.
+test('deleting a key whose name carries markup shows the name as text', async () => {
+  const { screen, fireEvent } = rtl;
+  const name = '<strong style="font-size:50px">boom</strong>';
+  keyList = [{ ...billingBot, name }];
+  renderApiKeys();
+  await screen.findByText('owa_k1ab****');
+
+  fireEvent.click(screen.getByTitle('Delete'));
+
+  const dialog = await screen.findByRole('dialog');
+  assert.ok(dialog.textContent?.includes(name), 'the name was not shown as typed');
+  assert.equal(dialog.querySelector('strong[style]'), null, 'the name became an element');
+});
+
+// The gateway refuses a list of more than 2000 chats with a 400, which a production gateway answers with a
+// bare "Bad Request"; the form says so before it is sent.
+test('a chat list past the gateway limit blocks Create and says how many it holds', async () => {
+  const { screen, fireEvent } = rtl;
+  const create = await openCreate();
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'crm-bot' } });
+  const numbers = Array.from({ length: 2001 }, (_, i) => String(628000000000 + i)).join('\n');
+  fireEvent.change(screen.getByLabelText('Chat access (optional)'), { target: { value: numbers } });
+
+  const alert = await screen.findByText(/Too many chats \(2001\): a key may list at most 2000/);
+  assert.ok(alert);
+  assert.equal(create.disabled, true, 'Create is live with a list the gateway refuses');
+
+  fireEvent.change(screen.getByLabelText('Chat access (optional)'), { target: { value: '6281234' } });
+  await rtl.waitFor(() => assert.equal(create.disabled, false));
 });

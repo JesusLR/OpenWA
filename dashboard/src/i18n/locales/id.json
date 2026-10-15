@@ -36,6 +36,7 @@
     "hoursAgo": "{{count}} jam lalu",
     "hoursAgo_other": "{{count}} jam lalu",
     "optional": "opsional",
+    "fieldTooLong": "Dibatasi {{max}} karakter (saat ini {{count}}).",
     "language": "Bahasa",
     "back": "Kembali",
     "next": "Selanjutnya",
@@ -94,6 +95,7 @@
     "loadingMessages": "Memuat pesan...",
     "loadingOlderMessages": "Memuat pesan lama...",
     "loadOlderMessagesError": "Gagal memuat pesan lama. Gulir ke atas untuk mencoba lagi.",
+    "loadOlderMessagesRetryHint": "Gulir ke atas untuk mencoba lagi.",
     "noMessagesInChat": "Belum ada pesan. Kirim pesan pertama untuk memulai!",
     "downloadDocument": "Unduh dokumen",
     "actions": {
@@ -122,7 +124,6 @@
       "unknownType": "Tipe tidak diketahui"
     },
     "you": "Anda",
-    "youPrefix": "Anda: ",
     "yesterday": "Kemarin",
     "attachTitle": "Kirim berkas / gambar",
     "emojiTitle": "Pilih emoji",
@@ -353,7 +354,7 @@
       "configured": "{{host}} ({{type}})",
       "noProxy": "Tidak ada proxy dikonfigurasi",
       "hasCredentials": "Kredensial tersimpan tetapi tidak ditampilkan. Masukkan URL lengkap untuk mengubahnya.",
-      "hint": "Perubahan berlaku saat sesi dimulai berikutnya, bukan pada koneksi yang sedang berjalan. Proxy harus nyata dan dapat dijangkau: nilai yang tidak dapat dijangkau akan memblokir pengiriman QR, dan permintaan mulai sesi mengembalikan 504.",
+      "hint": "Perubahan berlaku saat sesi dimulai berikutnya, bukan pada koneksi yang sedang berjalan. Proxy harus nyata dan dapat dijangkau: nilai yang tidak dapat dijangkau akan memblokir pengiriman QR. Di whatsapp-web.js permintaan mulai sesi mengembalikan 504, sedangkan di Baileys sesi berhasil dimulai dan terus mencoba ulang.",
       "createHint": "Hanya diperlukan jika jaringan Anda tidak dapat menjangkau WhatsApp secara langsung. Harus berupa proxy yang nyata dan dapat dijangkau.",
       "invalidUrl": "Masukkan URL proxy yang valid: http, https, socks4, atau socks5.",
       "saveSuccessTitle": "Proxy Disimpan",
@@ -487,11 +488,9 @@
       "valueLabel": "Nilai filter"
     },
     "columns": {
-      "url": "URL",
       "events": "Kejadian",
       "session": "Sesi",
-      "status": "Status",
-      "actions": "Aksi"
+      "status": "Status"
     },
     "empty": {
       "title": "Belum ada webhook dikonfigurasi",
@@ -531,6 +530,7 @@
       "session.reconnect_loop": "Saat sesi terus gagal terhubung kembali",
       "session.restriction": "Saat WhatsApp membatasi akun atau mencabut pembatasan",
       "presence.update": "Saat obrolan yang dilanggani online, mengetik atau offline",
+      "event.response": "Saat tamu menjawab undangan acara WhatsApp (hadir, tidak hadir, mungkin)",
       "group.join": "Saat peserta bergabung atau ditambahkan ke grup",
       "group.leave": "Saat peserta keluar atau dikeluarkan dari grup",
       "group.update": "Saat nama, deskripsi atau pengaturan grup berubah",
@@ -671,7 +671,6 @@
       "revoke": "Cabut"
     },
     "actions": {
-      "copy": "Salin",
       "revoke": "Cabut",
       "delete": "Hapus",
       "edit": "Edit akses"
@@ -704,8 +703,9 @@
     },
     "chats": {
       "label": "Akses obrolan (opsional)",
-      "hint": "Satu obrolan per baris: ID grup yang diakhiri @g.us, ID kontak yang diakhiri @c.us atau @lid, atau nomor telepon. Kosongkan untuk semua obrolan. Kunci yang dibatasi obrolan hanya dapat menggunakan rute yang terbuka untuk kunci dengan cakupan obrolan; WebSocket kejadian dan MCP menolaknya.",
-      "invalid": "Bukan ID obrolan atau nomor telepon: {{value}}"
+      "hint": "Satu obrolan per baris: ID grup yang diakhiri @g.us, ID kontak yang diakhiri @c.us atau @lid, atau nomor telepon. Kosongkan untuk semua obrolan. Kunci yang dibatasi obrolan hanya dapat menggunakan rute yang terbuka untuk kunci dengan cakupan obrolan; akses lewat WebSocket kejadian dan MCP tetap terbatas pada obrolan tersebut.",
+      "invalid": "Bukan ID obrolan atau nomor telepon: {{value}}",
+      "tooMany": "Terlalu banyak obrolan ({{count}}): satu kunci paling banyak memuat {{max}}."
     },
     "expiry": {
       "label": "Kedaluwarsa pada (opsional)",
@@ -886,7 +886,7 @@
       "sslRejectUnauthorized": "Verifikasi Sertifikat SSL",
       "sslRejectUnauthorizedDesc": "Tolak sertifikat self-signed atau tidak valid. Nonaktifkan untuk Postgres terkelola dengan sertifikat self-signed (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Migrasi Database",
-      "migrationsStatus": "Skema disinkronkan otomatis dengan TypeORM",
+      "migrationsStatus": "Migrasi yang tertunda diterapkan otomatis saat startup",
       "migrationsHint": "Migrasi dikelola otomatis. Gunakan CLI untuk migrasi manual."
     },
     "engine": {
@@ -909,7 +909,7 @@
     "redis": {
       "title": "Redis",
       "enable": "Aktifkan Redis",
-      "enableDesc": "Diperlukan untuk caching, penyimpanan sesi, dan antrian BullMQ",
+      "enableDesc": "Digunakan untuk caching, antrian BullMQ, penghitung rate limit, dan distribusi WebSocket multi-node",
       "useBuiltIn": "Gunakan Container Redis Bawaan",
       "builtInDesc": "OpenWA akan mengelola container Redis untuk Anda",
       "queueTitle": "Aktifkan Sistem Antrian BullMQ",
@@ -921,7 +921,7 @@
       "failed": "Gagal",
       "viewBullMq": "Lihat Dasbor Bull MQ",
       "disabledTitle": "Redis Dinonaktifkan",
-      "disabledDesc": "Aktifkan Redis untuk caching, penyimpanan sesi, dan antrian pesan BullMQ.",
+      "disabledDesc": "Aktifkan Redis untuk caching, antrian pesan BullMQ, penghitung rate limit, dan distribusi WebSocket multi-node.",
       "passwordOptional": "(opsional)",
       "bullMqUrlCopied": "URL dasbor Bull MQ disalin",
       "bullMqUrlHint": "Buka dengan kunci API ADMIN — tab browser tidak dapat mengautentikasi."
@@ -1055,7 +1055,7 @@
       "healthFail": "Cek Kesehatan Gagal",
       "healthError": "Kesalahan Cek Kesehatan",
       "savedTitle": "Konfigurasi Disimpan",
-      "savedDesc": "Restart server diperlukan untuk menerapkan perubahan.",
+      "savedDesc": "Perubahan berlaku tanpa restart server.",
       "saveFailed": "Gagal Menyimpan",
       "installed": "Plugin terpasang",
       "installFailed": "Gagal menginstal",

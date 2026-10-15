@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.Gson;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -43,6 +44,14 @@ class HttpTest {
     }
 
     @Test
+    void buildUrlRefusesPathWithoutLeadingSlash() {
+        // Appended to the base, these would change the host the request and its API key go to.
+        for (String path : new String[] {".evil.example/x", "@evil.example/x", "api/sessions", ""}) {
+            assertThrows(IllegalArgumentException.class, () -> Http.buildUrl("https://api.example.com", path, null, gson), path);
+        }
+    }
+
+    @Test
     void buildUrlStripsTrailingSlashAndPreservesPrefix() {
         assertEquals("http://h:2785/api/sessions", Http.buildUrl("http://h:2785/", "/api/sessions", null, gson));
         assertEquals("http://h/v1/api/sessions", Http.buildUrl("http://h/v1", "/api/sessions", null, gson));
@@ -55,6 +64,14 @@ class HttpTest {
         assertTrue(url.contains("chatId=x%40c.us") || url.contains("chatId=x@c.us"));
         assertTrue(url.contains("limit=50"));
         assertFalse(url.contains("cursor"));
+    }
+
+    @Test
+    void buildUrlAppendsQueryToPathThatAlreadyHasOne() {
+        // A second "?" would fold the query into the last value of the path's own query string.
+        assertEquals(
+            "http://h/m?a=1&limit=50",
+            Http.buildUrl("http://h", "/m?a=1", new Query(null, 50, null), gson));
     }
 
     @Test
@@ -79,4 +96,15 @@ class HttpTest {
     }
 
     private record Query(String chatId, Integer limit, String cursor) {}
+
+    @Test
+    void requestToStringShowsNeitherTheApiKeyNorTheBody() {
+        // A logging transport prints the request it is handed.
+        HttpRequestData req = new HttpRequestData(HttpMethod.POST, "https://h/api/x",
+            Map.of("X-API-Key", "owa_k1_secret"), "{\"text\":\"private words\"}", Duration.ofSeconds(5));
+        String text = req.toString();
+        assertFalse(text.contains("owa_k1_secret"), text);
+        assertFalse(text.contains("private words"), text);
+        assertTrue(text.contains("POST https://h/api/x") || text.contains("https://h/api/x"), text);
+    }
 }

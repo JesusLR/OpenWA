@@ -38,6 +38,7 @@
     "hoursAgo_other": "Il y a {{count}} heures",
     "hoursAgo_many": "Il y a {{count}} heures",
     "optional": "optionnel",
+    "fieldTooLong": "Limité à {{max}} caractères ({{count}} actuellement).",
     "language": "Langue",
     "back": "Retour",
     "next": "Suivant",
@@ -97,6 +98,7 @@
     "loadingMessages": "Chargement des messages...",
     "loadingOlderMessages": "Chargement des messages plus anciens...",
     "loadOlderMessagesError": "Impossible de charger les messages plus anciens. Faites défiler vers le haut pour réessayer.",
+    "loadOlderMessagesRetryHint": "Faites défiler vers le haut pour réessayer.",
     "noMessagesInChat": "Aucun message pour le moment. Envoyez le premier message pour commencer !",
     "downloadDocument": "Télécharger le document",
     "actions": {
@@ -125,7 +127,6 @@
       "unknownType": "Type inconnu"
     },
     "you": "Vous",
-    "youPrefix": "Vous : ",
     "yesterday": "Hier",
     "attachTitle": "Envoyer un fichier / une image",
     "emojiTitle": "Choisir un emoji",
@@ -353,7 +354,7 @@
       "configured": "{{host}} ({{type}})",
       "noProxy": "Aucun proxy configuré",
       "hasCredentials": "Les identifiants sont enregistrés mais ne sont pas affichés. Saisissez une URL complète pour les modifier.",
-      "hint": "Les modifications s'appliquent au prochain démarrage de la session, pas à une connexion en cours. Le proxy doit être réel et joignable : une valeur injoignable bloque l'envoi du QR code et le démarrage renvoie 504.",
+      "hint": "Les modifications s'appliquent au prochain démarrage de la session, pas à une connexion en cours. Le proxy doit être réel et joignable : une valeur injoignable bloque l'envoi du QR code. Avec whatsapp-web.js, le démarrage renvoie 504 ; avec Baileys, le démarrage réussit et la session continue de réessayer.",
       "createHint": "Nécessaire uniquement si votre réseau ne peut pas joindre WhatsApp directement. Doit être un proxy réel et joignable.",
       "invalidUrl": "Saisissez une URL de proxy http, https, socks4 ou socks5 valide.",
       "saveSuccessTitle": "Proxy enregistré",
@@ -493,11 +494,9 @@
       "valueLabel": "Valeur de filtre"
     },
     "columns": {
-      "url": "URL",
       "events": "Événements",
       "session": "Session",
-      "status": "Statut",
-      "actions": "Actions"
+      "status": "Statut"
     },
     "empty": {
       "title": "Aucun webhook configuré",
@@ -537,6 +536,7 @@
       "session.reconnect_loop": "Lorsqu'une session échoue à se reconnecter à plusieurs reprises",
       "session.restriction": "Lorsque WhatsApp restreint le compte ou lève une restriction",
       "presence.update": "Lorsqu'un chat suivi passe en ligne, écrit ou se déconnecte",
+      "event.response": "Lorsqu'un invité répond à un événement WhatsApp (participe, ne participe pas, peut-être)",
       "group.join": "Lorsque des participants rejoignent un groupe ou y sont ajoutés",
       "group.leave": "Lorsque des participants quittent un groupe ou en sont retirés",
       "group.update": "Lorsque le nom, la description ou les paramètres d'un groupe changent",
@@ -677,7 +677,6 @@
       "revoke": "Révoquer"
     },
     "actions": {
-      "copy": "Copier",
       "revoke": "Révoquer",
       "delete": "Supprimer",
       "edit": "Modifier l'accès"
@@ -710,8 +709,9 @@
     },
     "chats": {
       "label": "Accès aux discussions (facultatif)",
-      "hint": "Une discussion par ligne : un ID de groupe se terminant par @g.us, un ID de contact se terminant par @c.us ou @lid, ou un numéro de téléphone. Laissez vide pour toutes les discussions. Une clé limitée à des discussions ne peut utiliser que les routes ouvertes à ce type de clé ; le WebSocket des événements et MCP la refusent.",
-      "invalid": "Ni un ID de discussion ni un numéro de téléphone : {{value}}"
+      "hint": "Une discussion par ligne : un ID de groupe se terminant par @g.us, un ID de contact se terminant par @c.us ou @lid, ou un numéro de téléphone. Laissez vide pour toutes les discussions. Une clé limitée à des discussions ne peut utiliser que les routes ouvertes à ce type de clé ; son accès par le WebSocket des événements et MCP reste limité à ces discussions.",
+      "invalid": "Ni un ID de discussion ni un numéro de téléphone : {{value}}",
+      "tooMany": "Trop de discussions ({{count}}) : une clé peut en lister au plus {{max}}."
     },
     "expiry": {
       "label": "Expire le (facultatif)",
@@ -892,7 +892,7 @@
       "sslRejectUnauthorized": "Vérifier le certificat SSL",
       "sslRejectUnauthorizedDesc": "Rejeter les certificats auto-signés ou non valides. Désactivez cette option pour les bases Postgres gérées avec des certificats auto-signés (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Migrations de base de données",
-      "migrationsStatus": "Le schéma est auto-synchronisé avec TypeORM",
+      "migrationsStatus": "Les migrations en attente sont appliquées automatiquement au démarrage",
       "migrationsHint": "Les migrations sont gérées automatiquement. Utilisez la CLI pour les migrations manuelles."
     },
     "engine": {
@@ -915,7 +915,7 @@
     "redis": {
       "title": "Redis",
       "enable": "Activer Redis",
-      "enableDesc": "Requis pour le cache, le stockage des sessions et les files d'attente BullMQ",
+      "enableDesc": "Utilisé pour le cache, les files d'attente BullMQ, les compteurs de limitation de débit et la diffusion WebSocket multi-nœuds",
       "useBuiltIn": "Utiliser le conteneur Redis intégré",
       "builtInDesc": "OpenWA gérera un conteneur Redis pour vous",
       "queueTitle": "Activer le système de file d'attente BullMQ",
@@ -927,7 +927,7 @@
       "failed": "Échoué",
       "viewBullMq": "Voir le tableau de bord Bull MQ",
       "disabledTitle": "Redis est désactivé",
-      "disabledDesc": "Activez Redis pour le cache, le stockage des sessions et les files d'attente de messages BullMQ.",
+      "disabledDesc": "Activez Redis pour le cache, les files d'attente de messages BullMQ, les compteurs de limitation de débit et la diffusion WebSocket multi-nœuds.",
       "passwordOptional": "(optionnel)",
       "bullMqUrlCopied": "URL du tableau de bord Bull MQ copiée",
       "bullMqUrlHint": "Ouvrez-le avec une clé d'API ADMIN — un onglet de navigateur ne peut pas s'authentifier."
@@ -1061,7 +1061,7 @@
       "healthFail": "Bilan de santé échoué",
       "healthError": "Erreur lors du bilan de santé",
       "savedTitle": "Configuration enregistrée",
-      "savedDesc": "Redémarrage du serveur requis pour appliquer les modifications.",
+      "savedDesc": "Les modifications prennent effet sans redémarrage du serveur.",
       "saveFailed": "Échec de l'enregistrement",
       "installed": "Plugin installé",
       "installFailed": "Échec de l'installation",

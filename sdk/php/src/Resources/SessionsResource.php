@@ -143,7 +143,15 @@ class SessionsResource
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/logout");
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Force-kill a stuck session (SIGKILL + teardown). Throws with HTTP 502 and
+     * getErrorCode() 'SESSION_FORCE_KILL_INCOMPLETE' when the session was stopped
+     * locally but the force-destroy threw or timed out, so the engine process may
+     * still be running; the status is settled to disconnected and a retry answers 400
+     * because no engine is left to kill. Restart the node to reap a leaked process.
+     *
+     * @return array<string,mixed>
+     */
     public function forceKill(string $id): array
     {
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/force-kill");
@@ -156,6 +164,9 @@ class SessionsResource
     }
 
     /**
+     * Request an 8-character pairing code for phone-based login. On whatsapp-web.js, never request one for a
+     * number that already has a linked session: WhatsApp can revoke that device. Link it by QR instead.
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */

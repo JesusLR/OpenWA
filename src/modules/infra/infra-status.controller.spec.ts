@@ -22,6 +22,7 @@ jest.mock('fs', () => {
 
 import { InfraStatusController } from './infra-status.controller';
 import { recordPinnedEnvKeys } from '../../config/env-precedence';
+import { producerConnectWaitMs } from '../queue/redis-connection';
 
 describe('InfraStatusController.getStatus DB health (active SELECT 1 probe, not just isInitialized)', () => {
   const build = (query: jest.Mock) => {
@@ -53,9 +54,14 @@ describe('InfraStatusController.getStatus DB health (active SELECT 1 probe, not 
 });
 
 describe('InfraStatusController.getStatus queue job counts', () => {
-  function buildStatusController(opts: { queueEnabled: boolean; queue?: { getJobCounts: jest.Mock } }) {
+  function buildStatusController(opts: {
+    queueEnabled: boolean;
+    queue?: { getJobCounts: jest.Mock; waitUntilReady?: jest.Mock };
+  }) {
     const configService = {
-      get: (key: string, def?: unknown) => (key === 'queue.enabled' ? opts.queueEnabled : def),
+      // engine.type=baileys skips the wa-web-version registry fetch (no network in unit tests).
+      get: (key: string, def?: unknown) =>
+        key === 'queue.enabled' ? opts.queueEnabled : key === 'engine.type' ? 'baileys' : def,
     };
     const dataSource = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) } as unknown;
     const engineFactory = { create: jest.fn() };
@@ -70,7 +76,7 @@ describe('InfraStatusController.getStatus queue job counts', () => {
       dockerService as never,
       cacheService as never,
       storageService as never,
-      opts.queue as never,
+      (opts.queue && { waitUntilReady: jest.fn().mockResolvedValue(undefined), ...opts.queue }) as never,
     );
   }
 
@@ -82,6 +88,24 @@ describe('InfraStatusController.getStatus queue job counts', () => {
 
     expect(getJobCounts).toHaveBeenCalledWith('wait', 'active', 'delayed', 'completed', 'failed');
     expect(status.queue).toEqual({ enabled: true, webhooks: { pending: 6, completed: 10, failed: 1 } });
+  });
+
+  // Until the first connect BullMQ holds a queue call for as long as Redis stays unreachable.
+  it('reports zeros once the connect timeout passes when Redis has never connected', async () => {
+    const getJobCounts = jest.fn();
+    const waitUntilReady = jest.fn(() => new Promise<never>(() => {}));
+    const controller = buildStatusController({ queueEnabled: true, queue: { getJobCounts, waitUntilReady } });
+    let status: Awaited<ReturnType<InfraStatusController['getStatus']>> | undefined;
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    try {
+      void controller.getStatus().then(s => (status = s));
+      await jest.advanceTimersByTimeAsync(producerConnectWaitMs());
+    } finally {
+      jest.useRealTimers();
+    }
+
+    expect(getJobCounts).not.toHaveBeenCalled();
+    expect(status?.queue).toEqual({ enabled: true, webhooks: { pending: 0, completed: 0, failed: 0 } });
   });
 
   it('reports zeros (and does not touch the queue) when the queue is disabled', async () => {

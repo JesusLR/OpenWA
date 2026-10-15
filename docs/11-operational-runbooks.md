@@ -31,6 +31,7 @@ Each runbook follows this format:
 - SSH access to server
 - Docker CLI access
 - Database access
+- An OPERATOR (or ADMIN) API key, to start sessions and send the test message
 
 **Steps:**
 
@@ -150,10 +151,13 @@ curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}/qr
 
 # Save the QR as a PNG to open or scan. There is no raw QR string: the `session.qr`
-# webhook/WebSocket event carries the same PNG data URL as this endpoint.
-curl -s -H "X-API-Key: $API_KEY" \
+# webhook/WebSocket event carries the same PNG data URL as this endpoint. When no QR is
+# available (not started, already authenticated, not ready yet) the server's message is
+# printed and qr.png is not written.
+QR=$(curl -s -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}/qr \
-  | jq -r .qrCode | sed 's#^data:image/png;base64,##' | base64 -d > qr.png
+  | jq -er '.qrCode // error(.message)') \
+  && printf '%s' "${QR#data:image/png;base64,}" | base64 -d > qr.png
 ```
 
 **Verification:**
@@ -183,6 +187,7 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 
 - SSH access
 - Docker CLI
+- An OPERATOR (or ADMIN) API key, to start sessions after the restart
 
 **Steps:**
 
@@ -216,6 +221,38 @@ curl -H "X-API-Key: $API_KEY" \
 
 # Consider removing unused sessions
 
+# C. If memory climbs during a media burst (received, or sent on whatsapp-web.js):
+# on PostgreSQL each payload, received or the echo of a media send, waits in memory as base64
+# (about 4/3 of the file size) until its row is stored, in one of INBOUND_MEDIA_CONCURRENCY
+# slots per session, so a session holds at most INBOUND_MEDIA_CONCURRENCY x 4 x
+# ceil(MEDIA_DOWNLOAD_MAX_BYTES / 3) bytes (about 267 MiB at the defaults) even while inserts
+# stall. Lower either setting to shrink that bound (MEDIA_DOWNLOAD_MAX_BYTES also caps outbound
+# media sends), or set MEDIA_DOWNLOAD_ENABLED=false to hold none. Media logged as "No room for
+# inbound media" arrived with the omitted marker because no slot was freed for 2 x
+# MEDIA_DOWNLOAD_TIMEOUT_MS. A slot is held until its message's commit settles: the
+# message:received or message:sent hook chain, with RESOLVE_LID_TO_PHONE=true the sender's phone
+# lookup, the insert, and on whatsapp-web.js a timed-out page download (until
+# PUPPETEER_PROTOCOL_TIMEOUT_MS fails it). To find the holder, look for long-running inserts
+# (SELECT pid, now() - query_start, state, query FROM pg_stat_activity WHERE query ILIKE
+# 'INSERT INTO "messages"%') and for "Sandboxed plugin ... timed out after 5000ms" warnings: a
+# plugin loaded from the plugins directory delays a slot by at most 5 s per hook, so such a stall
+# clears on its own. A hook registered in-process (a plugin registered programmatically) has no
+# time limit: one that never settles keeps its chat's later messages from being stored and holds
+# every slot they or its own message took, for the life of the process. A reconnect does not free
+# them, so once INBOUND_MEDIA_CONCURRENCY slots are stuck the session sheds all media; fix or
+# remove that hook and restart the process. On SQLite a slow message:received or message:sent
+# plugin hook still holds payloads with no limit on how many.
+# Archiving (CHAT_MEDIA_ARCHIVE_ENABLED=true) adds its own cost on either database: each
+# message being archived holds its payload as base64 and decoded until the upload finishes (more
+# under MESSAGE_INLINE_MEDIA=archive, which also reads the file back and rewrites the row), and
+# nothing limits how many archive at once. Lowering CHAT_MEDIA_ARCHIVE_MAX_BYTES (25 MiB by
+# default) bounds that cost per message, since larger media are not archived, but not how many
+# archive at once; slow storage such as S3 makes more overlap. With QUEUE_ENABLED=false, webhook
+# deliveries to receivers that stop answering also hold their inline media (up to
+# 4/3 x WEBHOOK_MEDIA_INLINE_MAX_BYTES each as base64, for up to WEBHOOK_DISPATCH_CONCURRENCY
+# + WEBHOOK_DISPATCH_MAX_QUEUED deliveries); lower those settings or enable the queue.
+# Sizing: 12 - Troubleshooting & FAQ, "How many sessions can I run?"
+
 # 5. Long-term fix:
 # Edit docker-compose.yml
 # Increase memory limit or reduce max sessions
@@ -247,7 +284,7 @@ as a delivery failure rather than retaining payloads without limit.
 
 **Prerequisites:**
 
-- An OPERATOR (or ADMIN) API key, and an ADMIN key for step 2
+- An OPERATOR (or ADMIN) API key, and an ADMIN key for steps 2 and 6
 - Access to webhook endpoint
 
 **Steps:**
@@ -318,8 +355,37 @@ curl -X PUT http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} 
   -H "Content-Type: application/json" \
   -d '{"active": true}'
 
-# 6. Retry failed deliveries
-# No retry-failed API — failed deliveries auto-retry with exponential backoff (doc 06 §6.6)
+# 6. Replay deliveries that exhausted their retries
+#    Automatic retry covers one delivery: up to the webhook's retryCount attempts with exponential
+#    backoff (doc 06 §6.6). A step 2 row with attempts > 0 has spent those attempts; do not wait on
+#    it. The outbox sweep runs only while WEBHOOK_RECONCILE_INTERVAL_MS > 0 (default 60000). It
+#    sends an event again only if it was shed, refused at shutdown, or cut off by a restart or a
+#    database fault before its dispatch settled, and then only until WEBHOOK_RECONCILE_MAX_ATTEMPTS
+#    replays are spent, so such an event can show an attempts > 0 row while the sweep still holds it.
+#    A row can be replayed only while step 2 lists it with "replayable": true, that is, it was
+#    recorded while WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS > 0 (with the queue on, also when the
+#    event was queued) and that window has not passed. With the default 0 no event data is kept
+#    and this call replays nothing; turning the setting on later does not cover rows already
+#    recorded. Those events must be re-sent by their source.
+#    Rows stay inside the ADMIN key's allowedSessions; sessionId, webhookId and ids only narrow
+#    the batch. The webhook must be active and still subscribed to the event (re-enable it if
+#    step 5C left it off). Each row gets one direct POST to the webhook's current URL with its
+#    stored X-OpenWA-Idempotency-Key; a delivered row is removed, along with the copy the sweep
+#    still held for that event, and a failed one stays. A sweep replay already under way can still
+#    POST the event again under the same key, so receivers must deduplicate.
+curl -X POST http://localhost:2785/api/webhooks/delivery-failures/redrive \
+  -H "X-API-Key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"sessionId": "{sessionId}", "webhookId": "{webhookId}", "limit": 50}'
+# Expected: {"redriven": N, "delivered": N, "enqueued": 0, "failed": 0, "skipped": 0, "remaining": 0}
+# failed > 0: the replay did not deliver, most often because the receiver still rejects it (the
+# server log names the cause); fix that before calling again. remaining > 0 alone does not mean
+# another call will succeed. skipped > 0: a webhook:before hook cancelled the replay or the webhook
+# changed during the call. A row listed in step 2 but left out of the batch is excluded: it holds
+# no event data, retention is now 0 or its window has passed, it has attempts 0, its webhook was
+# deleted, disabled or unsubscribed, or its session is outside the key's allowedSessions or the
+# body's sessionId. Body fields, limits and the full exclusion list are in doc 06
+# (POST /api/webhooks/delivery-failures/redrive).
 ```
 
 **Verification:**
@@ -350,6 +416,7 @@ curl -H "X-API-Key: $ADMIN_API_KEY" \
 - Scheduled maintenance window
 - Backup verified
 - User notification sent
+- An OPERATOR (or ADMIN) API key, to stop and start sessions around the backup
 
 **Steps:**
 
@@ -367,7 +434,8 @@ docker stats --no-stream
 #    copied live; stop the sessions first if a restore must not need re-pairing, and start them
 #    again in step 10
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-docker cp openwa-api:/app/data/backups/. ./backups/
+docker cp openwa-api:/app/data/backups/. ./backups/ \
+  && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # the copy off the volume is the backup
 
 # Verify backup (backup.sh writes $BACKUP_DIR/openwa-backup-<timestamp>.tar.gz,
 # BACKUP_DIR defaults to ./backups — it creates no dated subdirectories)
@@ -435,6 +503,7 @@ curl -H "X-API-Key: $API_KEY" \
 - Release notes reviewed
 - Breaking changes identified
 - Rollback plan ready
+- An ADMIN API key for step 3; an OPERATOR key covers the stop, start and send steps
 
 **Steps:**
 
@@ -452,10 +521,11 @@ curl -H "X-API-Key: $API_KEY" \
 export BACKUP_DIR="/backups/openwa"
 mkdir -p "$BACKUP_DIR"
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-docker cp openwa-api:/app/data/backups/. "$BACKUP_DIR"/
+docker cp openwa-api:/app/data/backups/. "$BACKUP_DIR"/ \
+  && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # the copy off the volume is the backup
 
 # 3. Export the Data DB as JSON alongside the archive (admin key)
-curl -H "X-API-Key: $API_KEY" \
+curl -H "X-API-Key: $ADMIN_API_KEY" \
   http://localhost:2785/api/infra/export-data > "$BACKUP_DIR/export-data.json"
 
 # Started with docker-compose.dev.yml (the README Quick Start)? Add `-f docker-compose.dev.yml`
@@ -492,7 +562,9 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health | jq '.version'
 # 11. Verify all sessions
 #     (they reconnect on their own only with AUTO_START_SESSIONS=true; otherwise POST
 #     /api/sessions/{sessionId}/start each one first). A session stopped in step 2 stays down,
-#     even with AUTO_START_SESSIONS=true, until that explicit start
+#     even with AUTO_START_SESSIONS=true, until that explicit start, but only when the old image
+#     was 0.24.0 or later: a stop made on 0.23.7 or earlier is not recorded, so with
+#     AUTO_START_SESSIONS=true that session starts on its own after the upgrade
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions
 
@@ -513,9 +585,12 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 
 > On Kubernetes with the chart in `charts/openwa`, take the step 2 backup with the Helm lines in
 > Runbook: Database Backup and the step 3 export first, then replace steps 4-8 with checking out the
-> new release and running `helm upgrade openwa ./charts/openwa --reuse-values`. The image tag defaults
-> to the chart's `appVersion`, so the checkout moves it, unless `image.tag` was set at install:
-> `--reuse-values` keeps that value, so pass `--set image.tag=<new-version>` in that case.
+> new release and running `helm upgrade openwa ./charts/openwa --reset-then-reuse-values` (Helm 3.14
+> or later). It takes the new chart's defaults and re-applies the values you set. Plain
+> `--reuse-values` renders the new templates with the old release's defaults instead, which keeps a
+> 45 s `terminationGracePeriodSeconds` and a capability list without `KILL`, so a stop never reaches
+> the app. The image tag defaults to the chart's `appVersion`, so the checkout moves it, unless
+> `image.tag` was set at install: that value is kept, so pass `--set image.tag=<new-version>` then.
 > Run steps 9-12 through `kubectl port-forward` to the release's Service. `helm rollback` keeps the
 > volume, so read the notes on restoring `sessions/` below before relying on it.
 
@@ -569,7 +644,11 @@ tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/
 # An external PostgreSQL server: rename the upgraded database and create an empty one under the
 # DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
 # OpenWA setting: fill in your own URL for that database, such as
-# postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD
+# postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD. With DATABASE_SSL=true,
+# run psql under PGSSLMODE=verify-full (require when DATABASE_SSL_REJECT_UNAUTHORIZED=false), as the
+# command restore.sh prints does; libpq's default sslmode=prefer accepts any certificate. verify-full
+# also needs PGSSLROOTCERT set to the server's CA file: libpq otherwise reads ~/.postgresql/root.crt,
+# and sslrootcert=system needs libpq 16+ and a system CA store, which the image lacks
 tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
   psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
 
@@ -620,18 +699,25 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 
 **Trigger:** Daily schedule, before maintenance, before upgrade
 
-**Impact:** None for the databases, which are snapshotted consistently online (`sqlite3 .backup`,
-`pg_dump`). Engine authentication state (`sessions/`, `baileys/`) is copied while the engines write
-it, so a restored session can need re-pairing; for a copy that is consistent by construction, stop
-the sessions first (`POST /api/sessions/:id/stop`), or stop the container and archive the volume.
-A stopped session stays down across restarts, even with `AUTO_START_SESSIONS=true`, so start each
-one again with `POST /api/sessions/:id/start` once the backup is copied. The stop is recorded in the
-backed-up database, so a restore of that archive keeps the session stopped too.
+**Impact:** The databases are snapshotted consistently online (`sqlite3 .backup`, `pg_dump`). Each
+SQLite file (`main.sqlite` on every deployment, plus the data database with `DATABASE_TYPE=sqlite`)
+is copied under a read lock, and an app write that meets it waits for the copy to end, failing if the
+copy outlasts the 30 s busy timeout. The SQLite driver waits synchronously, so while a write waits the
+whole gateway stalls with it (API, WebSocket, engine events, health probes), not only that write; run
+the backup in a quiet window, or stop the container for a large database. Engine authentication
+state (`sessions/`, `baileys/`) is copied while the engines write it, so a restored session can need
+re-pairing; for a copy that is consistent by construction, stop the sessions first
+(`POST /api/sessions/:id/stop`), or stop the container and archive the volume. A stopped session
+stays down across restarts, even with `AUTO_START_SESSIONS=true`, so start each one again with
+`POST /api/sessions/:id/start` once the backup is copied. From 0.24.0 the stop is recorded in the
+backed-up database, so a restore of that archive keeps the session stopped too; an archive taken on
+0.23.7 or earlier records no stop.
 
 **Prerequisites:**
 
 - Sufficient disk space
 - Backup storage accessible
+- An OPERATOR (or ADMIN) API key, to stop and start sessions for a consistent engine-state copy
 
 **Steps:**
 
@@ -658,15 +744,16 @@ User-managed files outside that list (for example the project-level `.env`) must
 #                                  (.api-key from BOOTSTRAP_KEY_FILE when that is set)
 #
 # The database paths resolve exactly like the app: MAIN_DATABASE_NAME / DATABASE_NAME from the
-# environment, then ./.env, then <data dir>/.env.generated, otherwise the fixed ./data defaults; they
-# are NOT derived from OPENWA_DATA_DIR. A missing source database fails the run (no silent empty
-# backup), the finished archive is checked to contain every configured database, and with the sqlite3
-# CLI present the databases are snapshotted online via .backup (otherwise plain-copied with a
-# CONSISTENCY-WARNING marker inside the archive). sessions/ and baileys/ are plain copies: when a
-# whatsapp-web.js profile is open or Baileys state is present, the archive carries an
-# ENGINE-STATE-NOTE naming them, which restore.sh prints and never refuses.
+# environment, then ./.env, then <data dir>/.env.generated, otherwise the app's ./data defaults,
+# read under OPENWA_DATA_DIR like every other ./data path. A missing source database fails the run
+# (no silent empty backup), the finished archive is checked to contain every configured database,
+# and with the sqlite3 CLI present the databases are snapshotted online via .backup (otherwise
+# plain-copied with a CONSISTENCY-WARNING marker inside the archive). sessions/ and baileys/ are
+# plain copies: when a whatsapp-web.js profile is open or Baileys state is present, the archive
+# carries an ENGINE-STATE-NOTE naming them, which restore.sh prints and never refuses.
 
-# Run from the repo root (database defaults are ./data/...; state dirs follow OPENWA_DATA_DIR):
+# Run from the repo root (OPENWA_DATA_DIR defaults to ./data; the ./data defaults and a ./data/...
+# path from ./.env or .env.generated are read under it):
 ./scripts/backup.sh
 
 # Customize via environment. Keep the password out of DATABASE_URL: the URL is passed to pg_dump as
@@ -676,6 +763,13 @@ OPENWA_DATA_DIR=/srv/openwa/data \
   BACKUP_DIR=/backups/openwa \
   DATABASE_TYPE=postgres DATABASE_URL=postgres://user@host:5432/openwa PGPASSWORD='<password>' \
   ./scripts/backup.sh
+
+# With DATABASE_SSL=true, pg_dump makes the app's TLS check: sslmode=verify-full against the CA roots
+# Node trusts (add a private CA through NODE_EXTRA_CA_CERTS, as for the app), or sslmode=require when
+# DATABASE_SSL_REJECT_UNAUTHORIZED=false. On a host without node it uses sslrootcert=system, which needs
+# libpq 16+ and a system CA store. PGSSLMODE and PGSSLROOTCERT, when set, take precedence.
+# verify-full also matches the host pg_dump connects to, DATABASE_URL's included, against the
+# certificate, so name the host the certificate carries.
 ```
 
 > The data directory is a Docker **named volume** (`openwa-data`) in the production
@@ -689,9 +783,11 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 >
 > ```bash
 > docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-> docker cp openwa-api:/app/data/backups/. ./backups/
+> docker cp openwa-api:/app/data/backups/. ./backups/ \
+>   && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # do not let archives pile up on the volume
 > # Helm: kubectl exec <pod> -- env BACKUP_DIR=/app/data/backups ./scripts/backup.sh
-> #       kubectl cp <pod>:/app/data/backups ./backups
+> #       kubectl cp <pod>:/app/data/backups ./backups \
+> #         && kubectl exec <pod> -- sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'
 > ```
 >
 > The script stages a full copy of the data in `TMPDIR` before archiving it. The compose file mounts
@@ -705,18 +801,84 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 > first, then `./.env`, then `<data dir>/.env.generated`. Settings made through Dashboard >
 > Infrastructure therefore apply without being restated on the command line. A restore reads that
 > third layer from the archive's `.env.generated` when the archive carries one, because that copy
-> replaces the target's and is the one the restored app reads. Two caveats when
-> operating directly on the host mount: a path recorded inside the container (`/app/data/...`) is not
-> host-visible, so override it in the environment; and a value written with quotes or a trailing `#`
-> comment, or a `KEY: value` line, is reported and skipped rather than guessed at, so pass those
-> explicitly too. Blanks around `=` and CRLF line endings are read as the app reads them.
+> replaces the target's and is the one the restored app reads. A relative `./data/...` path in
+> `./.env` or `.env.generated`, such as the `PLUGINS_DIR=./data/plugins` that `.env.example` sets or
+> the `STORAGE_LOCAL_PATH=./data/media` the app writes on first run, names a path in the app's data
+> directory and is read under `OPENWA_DATA_DIR`, as are the `./data` database and state defaults; a
+> path from the environment is read against the current directory. When operating directly on the
+> host mount, a path recorded inside the container (`/app/data/...`) is not host-visible, so override
+> it in the environment.
+>
+> A leftover `STORAGE_LOCAL_PATH=./uploads` (which v0.2.0 to v0.7.3 wrote to `.env.generated`), in
+> `./.env` or `.env.generated`, is read as `<OPENWA_DATA_DIR>/media` whenever `OPENWA_DATA_DIR` is
+> not the current directory's own `./data`, since the current directory's `./uploads` is then not
+> the app's. A `./data` symlink counts as that directory even before its target exists. On bare metal
+> with `./data` linking to a data directory kept elsewhere, create the link before restoring, or pass
+> an absolute `STORAGE_LOCAL_PATH="$PWD/uploads"` in the environment; otherwise the media goes to the
+> data directory's `media/` while the app keeps serving `./uploads`. A container that mounts a host
+> `./uploads` at `/app/uploads` as its media directory, which no shipped compose file or chart does,
+> needs the same absolute `STORAGE_LOCAL_PATH` in the environment; the scripts warn when they skip a
+> non-empty `./uploads` while the data directory's `media/` is missing or empty, as it is in a volume
+> such a container has booted on. The scripts cannot tell bare metal from a checkout whose `./data` is
+> bind-mounted into the container, as in `docker-compose.dev.yml`, or from a root run inside a
+> container with a writable root filesystem, and keep `./uploads` there; pass
+> `STORAGE_LOCAL_PATH=./data/media` in the environment when restoring into an empty data directory in
+> those layouts.
+>
+> On every install, inside a container or not, the scripts stop with an error naming the key, before
+> anything is archived or restored, when the last line setting it in `./.env` or `.env.generated`,
+> which is the one the app keeps, has one of these forms:
+>
+> - a quoted value followed by a `#` comment or not closed on its line
+> - a quoted value containing its own quote character, or ending in a backslash the app can read
+>   past to a later quote of that kind followed only by blanks or a comment
+> - a double-quoted value with a backslash
+> - a `KEY: value` or `KEY:value` line (Docker Compose reads both from `./.env` into the container)
+> - a NUL or a byte that is not UTF-8
+> - a byte-order mark or a Unicode blank (such as a no-break space) before the key, around its `=`,
+>   at either end of an unquoted value or after a closing quote
+> - a bare `NAME:` line right before the key's line, which the app reads as `NAME`'s value
+> - a bare `KEY` line followed, past any blank lines, by one starting with `=`, or an empty `KEY=`
+>   followed by a quoted value, which the app reads as the key's value
+> - a quoted value opened on an earlier line, the key's own or another key's, that the app can read
+>   on to the key's line, which then belongs to that value
+>
+> A bare CR, U+2028 or U+2029 on any line naming the key, a comment included, stops the run too,
+> since the app can start a setting right after one. Like the app, the scripts break lines at a bare
+> CR, and at a U+2028 or U+2029 outside an unquoted value. The app reads each of these lines
+> (`KEY:value` only through Docker Compose, from `./.env`), so neither the script default nor a
+> guess is safe to use. `DATABASE_NAME` is not read by a PostgreSQL backup through `DATABASE_URL` or
+> by the restore of a PostgreSQL archive, and an unreadable `ENGINE_TYPE` only skips the warning
+> about missing Baileys state.
+>
+> Move the comment to its own line and keep the quotes (an unquoted value ends at a `#` and loses
+> its outer blanks), wrap the value in a quote character it does not contain, single-quote a value
+> whose backslashes are literal and not at its end (inside double quotes the app turns `\n` and `\r`
+> into line breaks; if that is intended, pass the key in the environment), write `KEY=value` on one
+> line for `KEY: value`, `KEY:value` and a value on a later line, close a quote left open on an
+> earlier line, give a bare `NAME:` line a value or remove it, save the file as UTF-8 with ASCII
+> blanks and LF or CRLF line endings, or pass the key in the environment. A restore reads the
+> archive's `.env.generated`, which cannot be edited in place, so a key it holds in such a form has
+> to be passed in the environment, and so does a `DATABASE_*` value saved from
+> Dashboard > Infrastructure in one of these forms, since the next save writes it the same way. The
+> scripts need `tr`, `tail`, `sed` and `grep` to read either file and stop when one is missing.
+> Blanks around `=`, CRLF line endings, a value in one pair of quotes and a `#` comment after an
+> unquoted value are read as the app reads them, and so is a quoted value that spans several lines
+> (a PEM key, say) and closes before the key's line, even when it holds quotes of another kind.
+>
+> Under Docker Compose the container gets `./.env` through Compose, which reads some values
+> differently from the app's own reader: it keeps backticks and a `#` with no blank before it as part
+> of the value, and expands `$NAME` outside single quotes. Run inside the container, the scripts see
+> the value Compose passed in; run on the host, they read `./.env` as the app reads a `.env` file, so
+> a value of that kind can resolve differently there. Single-quote such a value in `./.env`, or pass
+> the key in the environment on the host.
 
 **Verification:**
 
 ```bash
 # The archive MUST contain main.sqlite, the configured data store, and the auth directory for the
-# selected engine (sessions/ for whatsapp-web.js or baileys/ for Baileys).
-tar -tzf ./backups/openwa-backup-*.tar.gz
+# selected engine (sessions/ for whatsapp-web.js or baileys/ for Baileys). Lists the newest archive.
+tar -tzf "$(ls -t ./backups/openwa-backup-*.tar.gz | head -n 1)"
 ```
 
 > Backup archives contain API keys, provider credentials, WhatsApp auth state, and plugin secrets.
@@ -735,6 +897,7 @@ tar -tzf ./backups/openwa-backup-*.tar.gz
 - Valid backup file
 - Sufficient disk space
 - SSH access
+- An OPERATOR (or ADMIN) API key from the restored installation, to start sessions after the restore
 
 **Steps:**
 
@@ -749,9 +912,10 @@ docker compose down
 
 # 2. Restore from an archive produced by scripts/backup.sh
 #    (databases land on MAIN_DATABASE_NAME / DATABASE_NAME, default ./data/... — the same paths
-#    the app reads, as the environment, ./.env or the archive's .env.generated set them; non-DB
-#    state follows OPENWA_DATA_DIR. Pass --strict to refuse an archive
-#    whose CONSISTENCY-WARNING marker reports plain-copied, possibly-torn database snapshots;
+#    the app reads, as the environment, ./.env or the archive's .env.generated set them; the ./data
+#    defaults and a ./data/... path from ./.env or .env.generated are read under OPENWA_DATA_DIR,
+#    as for the backup. Pass --strict to refuse an archive whose CONSISTENCY-WARNING
+#    marker reports plain-copied, possibly-torn database snapshots;
 #    an ENGINE-STATE-NOTE (engine auth state that may have been copied while the app ran) is only printed.
 #    Restoring over an existing install's live databases requires --force; without it the script
 #    refuses to overwrite them)
@@ -776,7 +940,12 @@ tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET
 #    An external PostgreSQL server: rename the current database and create an empty one under the
 #    DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
 #    OpenWA setting: fill in your own URL for that database, such as
-#    postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD
+#    postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD. With
+#    DATABASE_SSL=true, run psql under PGSSLMODE=verify-full (require when
+#    DATABASE_SSL_REJECT_UNAUTHORIZED=false), as the command restore.sh prints does; libpq's default
+#    sslmode=prefer accepts any certificate. verify-full also needs PGSSLROOTCERT set to the server's
+#    CA file: libpq otherwise reads ~/.postgresql/root.crt, and sslrootcert=system needs libpq 16+
+#    and a system CA store, which the image lacks
 tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
   psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
 
@@ -871,8 +1040,8 @@ curl -s -X POST -H "X-API-Key: <an-existing-key>" http://localhost:2785/api/auth
 > `main.sqlite` carries the hashed API keys and audit log; `.api-key`, when retained by the original
 > installation, carries the plaintext bootstrap admin key. After restore, verify that both expected files
 > were present in the archive and that the client is using the original plaintext key. Re-running backup
-> after the source state or key has already been lost cannot recover it; use an older valid archive or the
-> documented credential-recovery procedure instead.
+> after the source state or key has already been lost cannot recover it; use an older valid archive or
+> [recover the admin key](./04-security-design.md#recovering-a-lost-admin-key) instead.
 
 **Verification:**
 
@@ -880,7 +1049,10 @@ curl -s -X POST -H "X-API-Key: <an-existing-key>" http://localhost:2785/api/auth
 # Health check
 curl http://localhost:2785/api/health
 
-# Verify sessions
+# Verify sessions. They reconnect on their own only with AUTO_START_SESSIONS=true (the production
+# compose leaves it unset, so off), and a session that was stopped when the archive was taken (an
+# archive from 0.24.0 or later) stays down even then. Start each one:
+#   curl -X POST -H "X-API-Key: $API_KEY" http://localhost:2785/api/sessions/{sessionId}/start
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions
 
@@ -968,9 +1140,13 @@ sudo truncate -s 0 "$(docker inspect --format='{{.LogPath}}' openwa-api)"
 find /backups -name "*.tar.gz" -mtime +30 -delete
 
 # D. Archived chat media: let the app expire it instead of deleting files, which leaves rows
-#    pointing at missing files. Set CHAT_MEDIA_ARCHIVE_TTL_DAYS (default 0, keep forever) and
-#    restart; expiry clears the file and the row's media columns. Under the production compose the
-#    media lives in the openwa_openwa-data volume, not in ./data in the checkout.
+#    pointing at missing files. Set CHAT_MEDIA_ARCHIVE_TTL_DAYS (default 0, keep forever) in .env and
+#    recreate the container with `docker compose up -d openwa-api`; a plain `docker compose restart`
+#    keeps the old environment. Sessions reconnect on their own only with AUTO_START_SESSIONS=true;
+#    otherwise POST /api/sessions/{sessionId}/start each one. Expiry clears the file and the row's
+#    media columns. Under the production compose the media lives in the openwa_openwa-data volume,
+#    not in ./data in the checkout. With MESSAGE_INLINE_MEDIA=archive the expired file is the only
+#    copy (no inline fallback), so expiry makes that media unreadable for good.
 
 # 4. Verify
 df -h

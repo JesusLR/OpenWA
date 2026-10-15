@@ -58,7 +58,7 @@ export class MessageListItemDto {
     type: String,
     nullable: true,
     description:
-      'Push name of the message sender as the engine reported it; in a group this is the member who posted, not the group subject. Null when no contact name was known.',
+      "Sender's push name, or their saved contact name when the engine reported no push name; in a group this is the member who posted, not the group subject. Null when neither was known.",
     example: 'Alice',
   })
   chatName?: string | null;
@@ -120,6 +120,11 @@ export class MessageListItemDto {
 }
 
 export class MessageListResponseDto {
+  @ApiPropertyOptional({
+    description:
+      'Rows matching the non-time filters with unknown message time, before time bounds. Present only for time selections; excluded from their messages and total. Stored history is not proof of complete remote history.',
+  })
+  unknownTimestampTotal?: number;
   @ApiProperty({ type: [MessageListItemDto], description: 'Newest first.' })
   messages!: MessageListItemDto[];
 
@@ -249,6 +254,17 @@ export class ChatHistoryProductDto {
   businessOwnerJid?: string;
 }
 
+export class ChatHistoryPollDto {
+  @ApiProperty({ example: 'Where?' })
+  name!: string;
+
+  @ApiProperty({ type: [String], example: ['Park', 'Beach'] })
+  options!: string[];
+
+  @ApiProperty({ example: false })
+  allowMultipleAnswers!: boolean;
+}
+
 /** OpenAPI mirror of the engine `IncomingMessage` served by the live chat-history route. */
 export class ChatHistoryMessageDto {
   @ApiProperty({ example: 'true_628123456789@c.us_3EB0123456789' })
@@ -326,6 +342,9 @@ export class ChatHistoryMessageDto {
 
   @ApiPropertyOptional({ type: ChatHistoryQuotedMessageDto })
   quotedMessage?: ChatHistoryQuotedMessageDto;
+
+  @ApiPropertyOptional({ type: ChatHistoryPollDto, description: 'Poll choices and selection mode, when available.' })
+  poll?: ChatHistoryPollDto;
 
   @ApiPropertyOptional({ type: ChatHistoryLocationDto })
   location?: ChatHistoryLocationDto;

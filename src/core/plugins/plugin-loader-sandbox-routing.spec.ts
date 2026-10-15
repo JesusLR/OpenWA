@@ -20,7 +20,7 @@ class TestableLoader extends PluginLoaderService {
   readonly hosts: FakeHost[] = [];
   capturedOnHookSubscribe?: (event: string, priority?: number) => void;
   capturedOnLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void;
-  capturedOnWorkerExit?: (code: number, intentional: boolean) => void;
+  capturedOnWorkerExit?: (code: number, intentional: boolean, reason?: string) => void;
   capturedOnUnresponsive?: () => void;
   protected createSandboxHost(
     _capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
@@ -29,7 +29,7 @@ class TestableLoader extends PluginLoaderService {
     onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
     _runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
     _onSearchProviderRegister?: () => void,
-    onWorkerExit?: (code: number, intentional: boolean) => void,
+    onWorkerExit?: (code: number, intentional: boolean, reason?: string) => void,
     onUnresponsive?: () => void,
   ): PluginWorkerHost {
     this.capturedOnHookSubscribe = onHookSubscribe;
@@ -124,6 +124,46 @@ describe('PluginLoaderService — sandbox tier routing', () => {
     expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
     // the host must be dropped so a misbehaving plugin can't leak its worker thread
     expect((loader as unknown as { sandboxHosts: Map<string, unknown> }).sandboxHosts.has('p1')).toBe(false);
+  });
+
+  it('runs the worker onDisable and terminate once when shutdown overlaps a disable in flight', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const host = loader.hosts[0];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    host.runLifecycle.mockClear().mockReturnValueOnce(gate);
+
+    const disabling = loader.disablePlugin('p1');
+    const destroying = loader.onModuleDestroy();
+    release();
+    await disabling;
+    await destroying;
+
+    expect(host.runLifecycle).toHaveBeenCalledTimes(1);
+    expect(host.runLifecycle).toHaveBeenCalledWith('onDisable', expect.any(Number));
+    expect(host.terminate).toHaveBeenCalledTimes(1);
+    expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
+  });
+
+  it('tears down the second worker when a re-enabled plugin is disabled again', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+
+    await loader.enablePlugin('p1');
+    await loader.disablePlugin('p1');
+    await loader.enablePlugin('p1');
+    await loader.disablePlugin('p1');
+
+    // Each enable starts its own worker and each disable has to end that one. A disable that joined the
+    // settled teardown of the first cycle would report success and leave the second worker running.
+    expect(loader.hosts).toHaveLength(2);
+    for (const host of loader.hosts) {
+      expect(host.runLifecycle).toHaveBeenCalledWith('onDisable', expect.any(Number));
+      expect(host.terminate).toHaveBeenCalledTimes(1);
+    }
+    expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
   });
 
   it('dedups duplicate hook-subscribe from the worker so a flood cannot grow the host registry', async () => {
@@ -230,6 +270,19 @@ describe('PluginLoaderService — sandbox tier routing', () => {
       healthy: false,
       message: 'plugin is not running (status disabled)',
     });
+  });
+
+  it('shows why a sandboxed worker died when it reported a reason before exiting', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    jest
+      .spyOn((loader as unknown as { logger: { warn: jest.Mock } }).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    loader.capturedOnWorkerExit!(1, false, 'boom: relay answered 500');
+
+    expect(pluginOf(loader).error).toBe('worker exited unexpectedly (code 1): boom: relay answered 500');
   });
 
   it('enables a built-in plugin in-process (no sandbox worker spawned)', async () => {
@@ -501,5 +554,62 @@ describe('PluginLoaderService — sandbox log relay bounds', () => {
     const relayed = logSpy.mock.calls[0][0] as string;
     expect(relayed).toContain('…[truncated]');
     expect(relayed.length).toBe('[p1] '.length + 8192 + '…[truncated]'.length);
+  });
+
+  it('bounds a non-string worker log message like a string one', async () => {
+    // Plugin code can post to parentPort directly, so the message is untrusted and may not be a string.
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const logSpy = jest.spyOn(loggerOf(loader), 'log').mockImplementation(() => undefined);
+
+    loader.capturedOnLog!('log', ['x'.repeat(6000), 'y'.repeat(6000)] as unknown as string);
+
+    const relayed = logSpy.mock.calls[0][0] as string;
+    expect(relayed.length).toBe('[p1] '.length + 8192 + '…[truncated]'.length);
+  });
+
+  it('replaces an oversized worker log meta with a size marker instead of relaying it', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const logSpy = jest.spyOn(loggerOf(loader), 'log').mockImplementation(() => undefined);
+
+    loader.capturedOnLog!('log', 'big', { data: 'x'.repeat(20000) });
+    loader.capturedOnLog!('log', 'small', { n: 1 });
+
+    expect(logSpy).toHaveBeenNthCalledWith(1, '[p1] big', {
+      metaTruncated: true,
+      metaLength: 20011,
+      pluginId: 'p1',
+    });
+    expect(logSpy).toHaveBeenNthCalledWith(2, '[p1] small', { n: 1, pluginId: 'p1' });
+  });
+
+  it('keeps the error text of a worker error log whose meta is oversized or not serializable', async () => {
+    // logger.error's reason travels as meta.error, and the host error call gets no trace argument.
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const errorSpy = jest
+      .spyOn((loader as unknown as { logger: { error: jest.Mock } }).logger, 'error')
+      .mockImplementation(() => undefined);
+
+    loader.capturedOnLog!('error', 'big', { data: 'x'.repeat(20000), error: 'boom' });
+    loader.capturedOnLog!('error', 'bigint', { n: 1n, error: 'boom' });
+    loader.capturedOnLog!('error', 'long', { error: 'e'.repeat(10000) });
+    loader.capturedOnLog!('error', 'nullmeta', null as unknown as Record<string, unknown>);
+
+    expect(errorSpy).toHaveBeenNthCalledWith(1, '[p1] big', 'undefined', {
+      error: 'boom',
+      metaTruncated: true,
+      metaLength: 20026,
+      pluginId: 'p1',
+    });
+    expect(errorSpy).toHaveBeenNthCalledWith(2, '[p1] bigint', 'undefined', { error: 'boom', pluginId: 'p1' });
+    const longMeta = errorSpy.mock.calls[2][2] as { error: string; metaTruncated: boolean };
+    expect(longMeta.metaTruncated).toBe(true);
+    expect(longMeta.error).toBe(`${'e'.repeat(8192)}…[truncated]`);
+    expect(errorSpy).toHaveBeenNthCalledWith(4, '[p1] nullmeta', 'undefined', { pluginId: 'p1' });
   });
 });

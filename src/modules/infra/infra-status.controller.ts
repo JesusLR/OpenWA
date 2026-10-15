@@ -10,6 +10,7 @@ import {
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '../queue/queue-names';
+import { producerReady } from '../queue/redis-connection';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
@@ -163,7 +164,7 @@ export class InfraStatusController {
     if (engineType === 'whatsapp-web.js') {
       // Kick the auto-resolve but DON'T await it — /infra/status is polled frequently and the registry
       // fetch can take up to 5s on a firewalled host. Read whatever's cached now (null until the first
-      // success); a later poll reflects the resolved build. (#488 review)
+      // success); a later poll reflects the resolved build. (#488)
       if (getEffectiveWebVersionInfo().source === 'auto') {
         void resolveCurrentWebVersion().catch(() => undefined);
       }
@@ -198,6 +199,7 @@ export class InfraStatusController {
     let webhooks = { pending: 0, completed: 0, failed: 0 };
     if (queueEnabled && this.webhookQueue) {
       try {
+        await producerReady(this.webhookQueue);
         const counts = await this.webhookQueue.getJobCounts('wait', 'active', 'delayed', 'completed', 'failed');
         webhooks = {
           pending: (counts.wait ?? 0) + (counts.active ?? 0) + (counts.delayed ?? 0),
@@ -290,6 +292,12 @@ export class InfraStatusController {
     status: 200,
     description: 'Process is up. This route does not probe dependencies — read /infra/status for those.',
     type: InfraHealthResponseDto,
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'Shutdown teardown has begun: every route except /api/health and /api/health/* answers 503 then. ' +
+      'Probe /api/health/live for a check that survives teardown.',
   })
   healthCheck(): { status: string; timestamp: string } {
     return {

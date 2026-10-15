@@ -234,11 +234,31 @@ does not go back to `false` until a restart, so it shows the bucket came up, not
 outage after that makes the count and the export fail with `500`, and the import answer `imported: false`
 with the entries counted in `failed`.
 
+Check the import caps before the switch. The import counts every byte it extracts from the archive and
+stops before it would write past `STORAGE_IMPORT_MAX_TOTAL_BYTES` (default `10737418240`, 10 GiB), or
+past `STORAGE_IMPORT_MAX_ENTRIES` files (default `100000`), so when Step 1's `sizeBytes` or `count` is
+larger, set a higher value in the `.env` with the Step 3 changes. Compose passes `.env` values to the
+container only when it creates it, so the Step 4 `docker compose up -d` applies the value and a
+dashboard restart, which reuses the container, does not: on the dashboard route run
+`docker compose up -d` before Step 5, or set the value in `data/.env.generated` instead, which every
+restart reads (under compose it lives in the `openwa-data` volume, so edit it through
+`docker compose exec openwa-api`). The import also stops at any single file above
+`STORAGE_IMPORT_MAX_BYTES` (default `209715200`, 200 MiB). It holds each file in memory, about twice its
+size at peak, so raise that cap only while `OPENWA_MEM_LIMIT` (default `2g`) leaves that much headroom
+beside the running sessions, or the container can be killed mid-import. The export logs a warning for
+each of these three caps the archive is above, measured against the lower of this deployment's value and
+the shipped default, so a warning whose "this deployment" value is already above the archive's figure
+needs no change on this gateway. An aborted import keeps what it wrote, and a re-run under the same caps
+stops at the same file, so raise the matching setting on the destination as above (`.env` plus
+`docker compose up -d`, or `data/.env.generated` plus a restart) before re-running Step 5.
+
 ```bash
 # Step 1: Check current storage file count
 curl -s 'http://localhost:2785/api/infra/storage/files/count' \
   -H 'X-API-Key: YOUR_KEY'
 # Response: { "storageType": "local", "count": 150, "sizeBytes": 15000000 }
+# Compare sizeBytes with STORAGE_IMPORT_MAX_TOTAL_BYTES and count with STORAGE_IMPORT_MAX_ENTRIES
+# (see above) before Step 3.
 
 # Step 2: Export all files as tar.gz
 curl -s 'http://localhost:2785/api/infra/storage/export' \
@@ -246,6 +266,9 @@ curl -s 'http://localhost:2785/api/infra/storage/export' \
 # Response: { "message": "Storage export completed", "download": "data/exports/storage-export-xxx.tar.gz" }
 # The archive is auto-removed after STORAGE_EXPORT_TTL_MS (default 1h), so re-import it before then.
 # It is written under data/ so it survives the restart in Step 4 and stays import-able.
+# Before Step 3, check `docker compose logs openwa-api` for an "Export contains" warning: one about
+#   the per-entry import limit means raising STORAGE_IMPORT_MAX_BYTES with the Step 3 changes,
+#   unless its "this deployment" value is already above the file's size.
 
 # Step 3: Change the storage configuration
 # Dashboard: Infrastructure > Amazon S3 + "Use Built-in MinIO Container"; save, then
@@ -292,7 +315,7 @@ route instead. The volume and its media are kept either way.
 
 ### Redis Migration (Cache)
 
-Redis in OpenWA holds only **ephemeral** state: TTL-based cache entries, BullMQ jobs (see below), and — when `REDIS_ENABLED` — the rate-limit hit counters. Cache data automatically regenerates from the database.
+Redis in OpenWA holds only **ephemeral** state: TTL-based cache entries, BullMQ jobs (see below), and — when `REDIS_ENABLED` — the rate-limit hit counters. No request reads the cache, so there is nothing to migrate.
 
 **No migration API needed** - just change configuration:
 
@@ -304,6 +327,7 @@ REDIS_HOST=your-redis-host.com
 REDIS_PORT=6379
 REDIS_USERNAME=optional
 REDIS_PASSWORD=optional
+REDIS_TLS=false          # true for a managed Redis that requires TLS
 ```
 
 > Setting `REDIS_BUILTIN` in `.env` **pins** it: the env value wins, so the dashboard's built-in
@@ -315,18 +339,16 @@ REDIS_PASSWORD=optional
 > This applies to a bare-metal install that reads the project `.env`. Compose does not forward
 > `REDIS_BUILTIN` (nor `POSTGRES_BUILTIN` or `MINIO_BUILTIN`), so on compose clear "Use Built-in Redis
 > Container" in Dashboard > Infrastructure (or set `REDIS_BUILTIN=false` in `data/.env.generated`), and
-> put only the forwarded `REDIS_ENABLED`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME` and
-> `REDIS_PASSWORD` in the `.env` next to `docker-compose.yml`.
+> put only the forwarded `REDIS_ENABLED`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`,
+> `REDIS_PASSWORD`, `REDIS_TLS`, `REDIS_CONNECT_TIMEOUT_MS` and `REDIS_CACHE_DB` in the `.env` next
+> to `docker-compose.yml`.
 
-| Scenario                  | Support | Notes                                      |
-| ------------------------- | ------- | ------------------------------------------ |
-| Built-in → External Redis | ✅      | Config change only                         |
-| External → Built-in Redis | ✅      | Config change only                         |
-| Enable → Disable Redis    | ✅      | Cache no-ops; reads fall through to the DB |
-| Disable → Enable Redis    | ✅      | Cache rebuilds automatically               |
-
-> [!TIP]
-> **Cache Warm-up**: After switching Redis instances, the cache will automatically rebuild as requests come in. No data migration is necessary.
+| Scenario                  | Support | Notes                              |
+| ------------------------- | ------- | ---------------------------------- |
+| Built-in → External Redis | ✅      | Config change only                 |
+| External → Built-in Redis | ✅      | Config change only                 |
+| Enable → Disable Redis    | ✅      | Cache no-ops (no request reads it) |
+| Disable → Enable Redis    | ✅      | Config change only                 |
 
 ### BullMQ Migration (Queue System)
 
@@ -370,7 +392,7 @@ docker compose up -d
 | ------------ | -------------------- | -------------------------------------------------------- |
 | **Database** | Export/Import JSON   | `/api/infra/export-data`, `/api/infra/import-data`       |
 | **Storage**  | Export/Import tar.gz | `/api/infra/storage/export`, `/api/infra/storage/import` |
-| **Redis**    | Config change only   | N/A (cache auto-rebuilds)                                |
+| **Redis**    | Config change only   | N/A (no request reads the cache)                         |
 | **BullMQ**   | Drain then config    | N/A (wait for empty queues)                              |
 
 ### Migration Script (Legacy)
@@ -781,7 +803,8 @@ them on PostgreSQL, and on SQLite unless `DATABASE_SYNCHRONIZE=true` puts the da
 mode. The Main (auth/audit) connection runs its own `migrations-main/` chain at every boot. The chain is
 idempotent, so a `main.sqlite` that an earlier release built with synchronize is adopted in place (rows
 kept, missing columns added, the ledger written). `MAIN_DATABASE_SYNCHRONIZE=true` only adds a
-synchronize pass after the chain. Run the main chain by hand with `npm run migration:run:main`.
+synchronize pass after the chain. Run the main chain by hand with `npm run migration:run:main` on a
+source checkout, or `docker compose run --rm openwa-api npm run migration:run:main:prod` in the image.
 
 ### Upgrade Steps
 
@@ -805,6 +828,7 @@ set -e
 mkdir -p ./backups
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
 docker cp openwa-api:/app/data/backups/. ./backups/
+docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # the copy off the volume is the backup
 
 # 2. Stop the current version
 docker compose down
@@ -846,12 +870,36 @@ docker compose run --rm openwa-api npm run migration:run:prod
 
 > [!WARNING]
 > Use `migration:run:prod` inside the production image. Plain `npm run migration:run` needs `ts-node` and
-> the TypeScript sources, both stripped by `npm ci --omit=dev` in the released image.
+> the TypeScript sources, both stripped by `npm ci --omit=dev` in the released image. The same holds for
+> the main chain: use `migration:run:main:prod`, not `migration:run:main`.
+
+On PostgreSQL the boot migrations run in one transaction, so an index build on a large table holds back
+writes to that table until the whole chain commits. On the Helm chart a boot that outlasts the startup
+probe (about 295 s by default; `startupProbe.failureThreshold` in the chart's values raises it) is killed,
+which rolls the build back and starts it again from nothing. Run the
+command above first, in a one-off container of the new image on the same database (a Kubernetes `Job` on
+Helm); the pods then find nothing to build. To avoid the write lock as well, build the index beforehand
+with `CREATE INDEX CONCURRENTLY IF NOT EXISTS` under the same name and columns, and the migration skips
+it. A concurrent build that fails leaves an INVALID index under that name, which the migration also
+skips: check `pg_index.indisvalid` and drop the invalid index before building it again.
 
 ### Known Upgrade Hazards
 
 | Release  | Change                                                                                                                                                                                                                                                                                                                         | Action                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0.25.0` | Once teardown begins (SIGTERM, SIGINT, `POST /api/infra/restart`) every request except `/api/health`, `/api/health/*`, the dashboard's HTML pages and CORS preflights answers `503` with `Connection: close`, `GET /api/infra/health` included                                                                                 | Probe `/api/health/live` for liveness that survives teardown, and retry a `503` once the instance is up again                                                                                                                                                                                                                                                                                                                                                                  |
+| `0.25.0` | `stop_grace_period` (Docker) and `terminationGracePeriodSeconds` (Kubernetes) go from 45 to 75 s, and a stop that runs 67 s past the shutdown delay exits with status 1 instead of 137                                                                                                                                         | Raise a pinned 45 s value to at least 75 s, plus the excess of `SHUTDOWN_DELAY_MS` over 3 s and of `WEBHOOK_SHUTDOWN_DRAIN_MS` over 5 s; on Helm upgrade with `--reset-then-reuse-values` (3.14 or later) or `-f values.yaml`, since plain `--reuse-values` keeps the 0.24.0 defaults; a container that drops all capabilities and starts as root must add `KILL` to the capabilities 0.24.0 shipped, or a stop never reaches the app; update exit-code alerts                 |
+| `0.25.0` | `400` instead of `201` or `200` for a phone number WhatsApp reports as unregistered (Baileys; `503` when the lookup gets no answer) and for `vote-poll` with no matching option text (whatsapp-web.js)                                                                                                                         | Handle `400` (`POLL_OPTION_NOT_FOUND` carries `validOptions`) and `503` on these routes; an empty `options` list still clears a vote                                                                                                                                                                                                                                                                                                                                           |
+| `0.25.0` | `400` for an `allowedChats` list over 2000 entries and for `GET /api/search` with `q` over 1000 characters or 32 words; on Baileys also for a sticker it converts to WebP with over 500 frames, and for an `image/svg+xml` sticker, profile picture or group picture                                                           | Shorten the list or the query; on Baileys keep an animated sticker to 500 frames and convert SVG to PNG or WebP before sending                                                                                                                                                                                                                                                                                                                                                 |
+| `0.25.0` | On SQLite, `GET /api/search` leaves `score` out of the hits of a key restricted to sessions or chats, because it is computed over the whole index; the hits stay in relevance order                                                                                                                                            | Read `hit.score` as optional                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `0.25.0` | `PUT /api/infra/config` answers `400` for a database or Redis port outside 1-65535, a negative or fractional pool size and a local storage path the app cannot create or write                                                                                                                                                 | Fix the value in the request; it used to be stored and the next boot refused it                                                                                                                                                                                                                                                                                                                                                                                                |
+| `0.25.0` | Boot fails on a `PORT` with surrounding whitespace and on a `WEBHOOK_SHUTDOWN_DRAIN_MS` that is not a non-negative integer (for example `30s`)                                                                                                                                                                                 | Remove the padding or the unit                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `0.25.0` | New Baileys pairings show `Ubuntu` as the linked-device name                                                                                                                                                                                                                                                                   | Set `BAILEYS_BROWSER_NAME=OpenWA` to keep the old name; linked sessions are unaffected                                                                                                                                                                                                                                                                                                                                                                                         |
+| `0.25.0` | `backup.sh` and `restore.sh` exit with status 2 on an unparsable or unreadable `./.env` or `.env.generated`, read the default SQLite paths under `OPENWA_DATA_DIR`, and with `DATABASE_SSL=true` verify the PostgreSQL certificate as the app does                                                                             | Fix the line or the permissions, or pass the key in the environment; trust a private CA through `NODE_EXTRA_CA_CERTS` or `PGSSLROOTCERT`                                                                                                                                                                                                                                                                                                                                       |
+| `0.25.0` | With `DATABASE_SSL=true` the PostgreSQL certificate is verified against `DATABASE_HOST` even when it is an IP address                                                                                                                                                                                                          | Use the certificate's DNS name as the host or add the IP to its subject alternative names; `DATABASE_SSL_REJECT_UNAUTHORIZED=false` remains the escape hatch                                                                                                                                                                                                                                                                                                                   |
+| `0.25.0` | The first boot builds three indexes on `messages` without `CONCURRENTLY` (about 240 MB per million messages; on PostgreSQL writes wait), and the startup probe of the Helm chart or of the docs/13 StatefulSet restarts a pod whose boot outlasts about 295 s                                                                  | On a large table run the migrations first (section 14.5), or raise `startupProbe.failureThreshold`                                                                                                                                                                                                                                                                                                                                                                             |
+| `0.25.0` | Rolling back to 0.24.0 strands webhook outbox rows in state `queued`, and the upgrade deletes duplicate terminal `webhook_delivery_failures` rows                                                                                                                                                                              | Drain or accept the queued rows before a rollback; the deleted duplicates are not restored                                                                                                                                                                                                                                                                                                                                                                                     |
+| `0.25.0` | A Baileys voice note goes out with flat waveform bars when no ffmpeg binary is found, and an `FFMPEG_PATH` wrapper script sees only `PATH`, the library paths, `HOME`, the temp directories, `LANG`, `LC_ALL` and `SystemRoot` of the gateway's environment                                                                    | Use the official image, which ships ffmpeg, and export what a wrapper script needs inside the script                                                                                                                                                                                                                                                                                                                                                                           |
 | `0.24.0` | A live key refused by its `allowedIps` (including an undeterminable client IP) or its `allowedSessions` answers `403` instead of `401`; `401` now means only a missing, unknown, revoked or expired key                                                                                                                        | Handle `403` for these refusals: SDK callers catch the forbidden error (Go `ErrForbidden`) instead of the auth error                                                                                                                                                                                                                                                                                                                                                           |
 | `0.24.0` | Every `POST /mcp` request needs a valid API key: `initialize` and `tools/list` without one answer `401`, a tool call with a missing or invalid key gets `401` instead of an `isError` result, and a key with `allowedIps` is refused with `403` on every request                                                               | Configure the API key in every MCP client, including one that only lists tools, and use a key without `allowedIps` for MCP                                                                                                                                                                                                                                                                                                                                                     |
 | `0.24.0` | `GET /api/sessions/:sessionId/contacts/check/:number` and the MCP `ContactCheckNumber` tool require an OPERATOR key; a VIEWER key gets `403`                                                                                                                                                                                   | Give number-check integrations an OPERATOR key                                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -860,6 +908,7 @@ docker compose run --rm openwa-api npm run migration:run:prod
 | `0.24.0` | `main.sqlite` (API keys and audit log) runs its `migrations-main/` chain at every boot instead of defaulting to synchronize, adopting an older file in place; boot stops with a `MainSchemaMismatchError` when the ledger records a migration this release does not ship, or an entity column is still missing after the chain | Back up `main.sqlite` before upgrading. The refusal names the migration or column; [05 - Database Design, section 5.6](./05-database-design.md#56-migration-strategy) gives the recovery for each                                                                                                                                                                                                                                                                              |
 | `0.24.0` | The built-in storage runs `pgsty/silo` in place of the withdrawn `minio/minio` image; the compose `minio` service no longer starts without `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`, and a recreated dashboard built-in `openwa-minio` publishes no host ports                                                            | Recreate the container and set the credentials as the Storage Migration part of section 14.3 describes                                                                                                                                                                                                                                                                                                                                                                         |
 | `0.24.0` | `POST /api/sessions/:sessionId/messages/send-product` passes the `message:sending` plugin gate (type `product`, input `{ chatId, productId, body }`); a rewritten `chatId` is ignored                                                                                                                                          | Branch on `source`/`type` before reading send-DTO fields; a veto now answers `400`                                                                                                                                                                                                                                                                                                                                                                                             |
+| `0.24.0` | Typed SDK clients: batch cancel (JavaScript `cancelBatch`, Go `CancelBatch`, Java `cancelBatch`, Python `cancel_batch`) returns `BatchCancelResponse` (`batchId`, `status`, `progress`) instead of `BatchStatusResponse`, whose `results` and timestamps the route never sent                                                  | TypeScript, Go and Java: change the declared result type to `BatchCancelResponse`. Typed Python: update annotations. Read per-recipient results from `batchStatus` / `BatchStatus` / `batch_status`. PHP needs no change; the wire response is unchanged                                                                                                                                                                                                                       |
 | `0.23.6` | A media URL passed to a send route or to `POST /media/convert/voice` or `.../convert/video`, and the link preview of a text send, are fetched through the egress proxy of the session named in the request instead of leaving from the gateway's own address                                                                   | Set `SESSION_PROXY_URL_FETCH=false` if a session proxy is a WhatsApp-only route that cannot reach arbitrary media hosts                                                                                                                                                                                                                                                                                                                                                        |
 | `0.23.0` | Typed SDK clients: `markRead` and `subscribePresence` each take their own request type instead of the shared `MarkChatRequest`, which now serves `markUnread` alone                                                                                                                                                            | Go and Java: swap the type at both call sites. Typed Python: only at `markRead`, its `subscribePresence` body being structurally identical. JavaScript and PHP need no change; the wire body is unchanged                                                                                                                                                                                                                                                                      |
 | `0.22.0` | Baileys refuses a reply whose quoted id, or a forward whose `fromChatId`, does not name the addressed chat, with the `404` whatsapp-web.js already answered; leaving a group, unsubscribing from a channel and labelling a channel surface WhatsApp's refusal; membership requests for an id that is not a group are refused   | Handle a refusal on those six calls, which previously answered `200` whatever happened                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -929,11 +978,20 @@ if [ -f "$BACKUP_DIR/database.sql" ]; then
     # statements fail and its rows mix with theirs. This is the built-in PostgreSQL (the compose
     # `postgres` service, or the openwa-postgres container Dashboard > Infrastructure created, which
     # carries no compose labels, so step 1 left it running). docker start covers a leftover or
-    # dashboard-created container; compose creates the service only when none exists. For an external
-    # server, rename the database and load the dump as step 3 of 11 - Runbook: Restore from Backup
-    # shows. The upgraded database is kept under a _pre_restore_ name, and sed drops the pg_dump 17
-    # line PostgreSQL 16 rejects.
-    docker start openwa-postgres 2>/dev/null || docker compose --profile postgres up -d postgres
+    # dashboard-created container; compose creates the service only when none exists and .env points
+    # at it. For an external server the script stops: rename the database and load the dump as step 3
+    # of 11 - Runbook: Restore from Backup shows, then run steps 2-6 below by hand without this
+    # PostgreSQL block: nothing after step 1 is restored yet. The upgraded database is kept under a
+    # _pre_restore_ name, and sed drops the pg_dump 17 line PostgreSQL 16 rejects.
+    if ! docker start openwa-postgres 2>/dev/null; then
+        grep -qE '^DATABASE_HOST=(postgres|openwa-postgres)$' .env || {
+            echo "External PostgreSQL: rollback INCOMPLETE, nothing after step 1 has been restored."
+            echo "Load $BACKUP_DIR/database.sql by hand (11 - Runbook: Restore from Backup, step 3),"
+            echo "then run steps 2-6 of this script by hand without the PostgreSQL block."
+            exit 1
+        }
+        docker compose --profile postgres up -d postgres
+    fi
     docker exec openwa-postgres sh -c 'until pg_isready -q -U "$POSTGRES_USER"; do sleep 1; done'
     docker exec openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
       -c "ALTER DATABASE \"$POSTGRES_DB\" RENAME TO \"${POSTGRES_DB}_pre_restore_$(date +%Y%m%d%H%M%S)\"" \

@@ -1,6 +1,6 @@
 import type { WAMessage, WAMessageKey, WASocket } from '@whiskeysockets/baileys';
 import { ChatSummary, Contact, MediaInput } from '../interfaces/whatsapp-engine.interface';
-import { resolveMediaBuffer } from './baileys-messaging';
+import { assertReadableImage, resolveMediaBuffer } from './baileys-messaging';
 import { type createLogger } from '../../common/services/logger.service';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
@@ -8,6 +8,7 @@ import { RecipientUnreachableError } from '../../common/errors/recipient-unreach
 import { LidNotMappedError } from '../../common/errors/lid-not-mapped.error';
 import { parseWaId, userPart } from '../identity/wa-id';
 import { storedKeyInChat } from './baileys-message-mapper';
+import { refusedStatusCode } from './baileys-groups';
 
 /**
  * Contacts/profile/chats-domain operations extracted from BaileysAdapter. The adapter keeps the
@@ -90,6 +91,16 @@ export class BaileysContacts {
       // underneath — do not harmonise the two into a shared helper.
       if (err instanceof EngineTransportError) {
         throw err;
+      }
+      // Only WhatsApp's own error answer (a numeric code: 404 item-not-found, 401 not-authorized) is
+      // that verdict. A socket that closed mid-lookup carries none and must not read as "no picture".
+      const code = refusedStatusCode(err);
+      if (code === undefined) {
+        throw new EngineTransportError('WhatsApp did not answer the profile picture lookup');
+      }
+      // A rate limit, server timeout (408/429) or server error (5xx) is not a verdict about the picture either.
+      if (code === 408 || code === 429 || code >= 500) {
+        throw new EngineTransportError(`WhatsApp could not answer the profile picture lookup (code ${code})`);
       }
       this.host.logger.debug('profilePictureUrl failed; no picture or hidden', {
         contactId,
@@ -198,6 +209,7 @@ export class BaileysContacts {
     // updateProfilePicture takes a WAMediaUpload; resolveMediaBuffer covers Buffer | base64 | URL,
     // the same conversion the media sends use.
     const { data } = await resolveMediaBuffer(media, this.host.sessionProxyUrl());
+    await assertReadableImage(data);
     await this.confirmed(this.sock().updateProfilePicture(selfJid, data), 'the profile picture change');
   }
 

@@ -8,6 +8,29 @@ export interface CorsPolicy {
 }
 
 /**
+ * A CORS_ORIGINS entry as a browser sends it in `Origin`: scheme, host and port, with no path or trailing
+ * slash. An address copied from the bar of a browser carries both and would never equal a header.
+ * Anything that is not an http(s) URL is kept as written.
+ */
+function asOrigin(entry: string): string {
+  if (entry === '*') return entry;
+  try {
+    const url = new URL(entry);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : entry;
+  } catch {
+    return entry;
+  }
+}
+
+/** The CORS_ORIGINS entries that are used without part of what was written (a path or a trailing slash). */
+export function rewrittenCorsOrigins(corsOriginsEnv?: string): string[] {
+  return (corsOriginsEnv ?? '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(o => o && asOrigin(o) !== o);
+}
+
+/**
  * Resolves the effective CORS policy from CORS_ORIGINS + NODE_ENV.
  * - Dev: wildcard allowed (no credentials with wildcard — spec-compliant).
  * - Prod: a wildcard origin is REFUSED (collapses to same-origin only) so a
@@ -17,7 +40,8 @@ export function resolveCorsPolicy(corsOriginsEnv?: string, nodeEnv?: string): Co
   const origins = corsOriginsEnv
     ?.split(',')
     .map(o => o.trim())
-    .filter(Boolean) ?? ['*'];
+    .filter(Boolean)
+    .map(asOrigin) ?? ['*'];
   const hasWildcard = origins.includes('*');
 
   // In production a wildcard origin is refused: collapse to same-origin only.
@@ -128,8 +152,8 @@ const FORBIDDEN_PROD_SECRETS = new Set([
 
 /**
  * Whether to warn that API_KEY_PEPPER is unset in production. Without a pepper, stored API-key hashes
- * fall back to plain SHA-256 (still functional). Advisory only — enabling a pepper re-hashes keys and
- * invalidates existing ones (see api-key-hash.ts), so it stays opt-in and must never be enforced.
+ * fall back to plain SHA-256 (still functional). Advisory only: enabling a pepper on an install with keys
+ * locks every key out (see api-key-hash.ts), so it stays opt-in and must never be enforced.
  */
 export function isApiKeyPepperMissingInProduction(nodeEnv?: string, apiKeyPepper?: string): boolean {
   return nodeEnv === 'production' && !apiKeyPepper?.trim();
@@ -196,8 +220,8 @@ export interface SecretCheckEnv {
  * whenever it is set. Throws with the offending var names so the operator can fix them.
  */
 export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
-  // Deny-list, not an allow-list: main.ts calls this BEFORE NestFactory.create, so NODE_ENV has not
-  // been through boot validation yet and is still an arbitrary string here. Recognising only
+  // Deny-list, not an allow-list: main.ts runs validateEnv first, which already rejects an unknown
+  // NODE_ENV, but this guard must not depend on that ordering. Recognising only
   // 'production' meant every unrecognised value — a `prod` typo, a `staging` deployment — skipped the
   // guard silently, including the ALLOW_DEV_API_KEY rejection below. Only the two values that are
   // deliberately not production (and an unset or blank variable, the standard Node default for local

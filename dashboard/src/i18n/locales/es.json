@@ -36,6 +36,7 @@
     "hoursAgo_other": "Hace {{count}} horas",
     "hoursAgo_many": "Hace {{count}} horas",
     "optional": "opcional",
+    "fieldTooLong": "Limitado a {{max}} caracteres (ahora {{count}}).",
     "language": "Idioma",
     "back": "Atrás",
     "next": "Siguiente",
@@ -97,6 +98,7 @@
     "loadingMessages": "Cargando mensajes...",
     "loadingOlderMessages": "Cargando mensajes anteriores...",
     "loadOlderMessagesError": "No se pudieron cargar los mensajes anteriores. Desplázate hacia arriba para reintentar.",
+    "loadOlderMessagesRetryHint": "Desplázate hacia arriba para reintentar.",
     "noMessagesInChat": "Aún no hay mensajes. ¡Envía el primero para empezar!",
     "downloadDocument": "Descargar documento",
     "actions": {
@@ -125,7 +127,6 @@
       "unknownType": "Tipo desconocido"
     },
     "you": "Tú",
-    "youPrefix": "Tú: ",
     "yesterday": "Ayer",
     "attachTitle": "Enviar archivo / imagen",
     "emojiTitle": "Elegir emoji",
@@ -353,7 +354,7 @@
       "configured": "{{host}} ({{type}})",
       "noProxy": "No hay ningún proxy configurado",
       "hasCredentials": "Las credenciales están guardadas, pero no se muestran. Introduce una URL completa para cambiarlas.",
-      "hint": "Los cambios se aplican en el próximo inicio de la sesión, no a una conexión en curso. El proxy debe ser real y accesible: un valor inaccesible bloquea la entrega del QR y el inicio devuelve 504.",
+      "hint": "Los cambios se aplican en el próximo inicio de la sesión, no a una conexión en curso. El proxy debe ser real y accesible: un valor inaccesible bloquea la entrega del QR. Con whatsapp-web.js el inicio devuelve 504; con Baileys el inicio se completa y la sesión sigue reintentando.",
       "createHint": "Solo es necesario cuando tu red no puede llegar a WhatsApp directamente. Debe ser un proxy real y accesible.",
       "invalidUrl": "Introduce una URL de proxy http, https, socks4 o socks5 válida.",
       "saveSuccessTitle": "Proxy guardado",
@@ -493,11 +494,9 @@
       "valueLabel": "Valor de filtro"
     },
     "columns": {
-      "url": "URL",
       "events": "Eventos",
       "session": "Sesión",
-      "status": "Estado",
-      "actions": "Acciones"
+      "status": "Estado"
     },
     "empty": {
       "title": "No hay webhooks configurados",
@@ -537,6 +536,7 @@
       "session.reconnect_loop": "Cuando una sesión sigue sin poder reconectarse",
       "session.restriction": "Cuando WhatsApp restringe la cuenta o levanta una restricción",
       "presence.update": "Cuando un chat suscrito se conecta, escribe o se desconecta",
+      "event.response": "Cuando un invitado responde a un evento de WhatsApp (asistirá, no asistirá, quizás)",
       "group.join": "Cuando participantes se unen a un grupo o son añadidos",
       "group.leave": "Cuando participantes salen de un grupo o son eliminados",
       "group.update": "Cuando cambian el nombre, la descripción o los ajustes de un grupo",
@@ -627,7 +627,6 @@
       "revoke": "Revocar"
     },
     "actions": {
-      "copy": "Copiar",
       "revoke": "Revocar",
       "delete": "Eliminar",
       "edit": "Editar acceso"
@@ -660,8 +659,9 @@
     },
     "chats": {
       "label": "Acceso a chats (opcional)",
-      "hint": "Un chat por línea: un ID de grupo que termina en @g.us, un ID de contacto que termina en @c.us o @lid, o un número de teléfono. Déjalo vacío para todos los chats. Una clave restringida a chats solo puede usar las rutas abiertas a ese tipo de clave; el WebSocket de eventos y MCP la rechazan.",
-      "invalid": "No es un ID de chat ni un número de teléfono: {{value}}"
+      "hint": "Un chat por línea: un ID de grupo que termina en @g.us, un ID de contacto que termina en @c.us o @lid, o un número de teléfono. Déjalo vacío para todos los chats. Una clave restringida a chats solo puede usar las rutas abiertas a ese tipo de clave; su acceso por el WebSocket de eventos y MCP se limita a esos chats.",
+      "invalid": "No es un ID de chat ni un número de teléfono: {{value}}",
+      "tooMany": "Demasiados chats ({{count}}): una clave puede listar como máximo {{max}}."
     },
     "expiry": {
       "label": "Caduca el (opcional)",
@@ -892,7 +892,7 @@
       "sslRejectUnauthorized": "Verificar certificado SSL",
       "sslRejectUnauthorizedDesc": "Rechazar certificados autofirmados o no válidos. Desactívalo para Postgres gestionado con certificados autofirmados (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Migraciones de la base de datos",
-      "migrationsStatus": "El esquema se sincroniza automáticamente con TypeORM",
+      "migrationsStatus": "Las migraciones pendientes se aplican automáticamente al iniciar",
       "migrationsHint": "Las migraciones se gestionan automáticamente. Usa la CLI para migraciones manuales."
     },
     "engine": {
@@ -915,7 +915,7 @@
     "redis": {
       "title": "Redis",
       "enable": "Habilitar Redis",
-      "enableDesc": "Necesario para caché, almacenamiento de sesiones y colas BullMQ",
+      "enableDesc": "Se usa para caché, colas BullMQ, contadores de límite de solicitudes y la distribución de WebSocket entre varios nodos",
       "useBuiltIn": "Usar contenedor Redis integrado",
       "builtInDesc": "OpenWA gestionará un contenedor Redis por ti",
       "queueTitle": "Habilitar sistema de colas BullMQ",
@@ -927,7 +927,7 @@
       "failed": "Fallido",
       "viewBullMq": "Ver panel BullMQ",
       "disabledTitle": "Redis está deshabilitado",
-      "disabledDesc": "Habilita Redis para caché, almacenamiento de sesiones y colas de mensajes BullMQ.",
+      "disabledDesc": "Habilita Redis para caché, colas de mensajes BullMQ, contadores de límite de solicitudes y la distribución de WebSocket entre varios nodos.",
       "passwordOptional": "(opcional)",
       "bullMqUrlCopied": "URL del panel de Bull MQ copiada",
       "bullMqUrlHint": "Ábrelo con una clave de API ADMIN: una pestaña del navegador no puede autenticarse."
@@ -1061,7 +1061,7 @@
       "healthFail": "Comprobación de salud fallida",
       "healthError": "Error en la comprobación de salud",
       "savedTitle": "Configuración guardada",
-      "savedDesc": "Es necesario reiniciar el servidor para aplicar los cambios.",
+      "savedDesc": "Los cambios surten efecto sin reiniciar el servidor.",
       "saveFailed": "Error al guardar",
       "installed": "Plugin instalado",
       "installFailed": "Error en la instalación",

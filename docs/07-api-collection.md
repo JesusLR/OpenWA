@@ -22,7 +22,7 @@ Every request carries the key in the `X-API-Key` header — REST auth is **heade
 
 ### Responses
 
-Responses are the **raw payload** — no `{ success, data }` envelope. A resource route returns the object directly; a list route returns a bare JSON array. Errors return the NestJS default shape `{ "statusCode", "message", "error" }`. Add `Content-Type: application/json` only when sending a body.
+Responses are the **raw payload** — no `{ success, data }` envelope. A resource route returns the object directly; most list routes return a bare JSON array, and the object-shaped ones are messages (`{ messages, total, unknownTimestampTotal? }`), status (`{ statuses }`), search (`{ hits, total, tookMs, provider }`), catalog products (`{ products, pagination }`) and audit (`{ data, total }`). Errors return the NestJS default shape `{ "statusCode", "message", "error" }`. Add `Content-Type: application/json` only when sending a body.
 
 ### Sections
 
@@ -109,7 +109,8 @@ curl -X POST "$BASE/api/sessions" \
 
 With an optional per-session egress proxy — only if your network can't reach WhatsApp directly. The
 proxy **must be a real, reachable host**; an unreachable value silently blocks the WhatsApp WebSocket
-(no QR is ever delivered) and `POST /api/sessions/:sessionId/start` returns `504` after ~30s.
+(no QR is ever delivered): on whatsapp-web.js `POST /api/sessions/:sessionId/start` returns `504`
+after ~30s; on Baileys the start succeeds and the session keeps retrying.
 
 Setting `proxyUrl` requires an unscoped ADMIN key; any other key gets `403`.
 
@@ -184,7 +185,7 @@ curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/force-kill
 
 #### POST /api/sessions/:sessionId/pairing-code
 
-Request an 8-char pairing code via phone number (OPERATOR).
+Request an 8-char pairing code via phone number (OPERATOR). On whatsapp-web.js, request a code only for a number you are prepared to re-link: a request for a number that already has a linked session has been observed to end with WhatsApp revoking that device. Baileys was not affected in the same tests; link by QR when a session of that number must stay up.
 
 ```bash
 curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/pairing-code" \
@@ -341,7 +342,7 @@ curl "$BASE/api/sessions/$SESSION_ID/messages?chatId=628123456789@c.us&limit=20&
 
 #### GET /api/sessions/:sessionId/messages/:chatId/history
 
-Fetch chat history live from WhatsApp, bypassing the DB.
+Fetch chat history live from WhatsApp, bypassing the DB. whatsapp-web.js only: Baileys answers `501`.
 
 ```bash
 curl "$BASE/api/sessions/$SESSION_ID/messages/628123456789@c.us/history?limit=100&deep=true" \
@@ -350,7 +351,7 @@ curl "$BASE/api/sessions/$SESSION_ID/messages/628123456789@c.us/history?limit=10
 
 #### GET /api/sessions/:sessionId/messages/:chatId/:messageId/reactions
 
-Get reactions for a message, grouped by emoji.
+Get reactions for a message, grouped by emoji. whatsapp-web.js only: Baileys answers `501`.
 
 ```bash
 curl "$BASE/api/sessions/$SESSION_ID/messages/628123456789@c.us/true_628123456789@c.us_3EB0ABCD/reactions" \
@@ -399,7 +400,7 @@ curl -X POST "$BASE/api/sessions/$SESSION_ID/messages/unpin" \
 
 Download a message's stored media: the archived file when one exists (`CHAT_MEDIA_ARCHIVE_ENABLED`,
 plus `CHAT_MEDIA_ARCHIVE_OUTBOUND` for media this account sent), else the inline copy on the message
-row — which covers media sent by this account either way; `404` when neither holds bytes.
+row — which covers media sent by this account either way, except a send made by `url`, whose bytes the gateway does not store (on whatsapp-web.js the own-send echo may still hold them, so that route can answer `200` or `404`); `404` when neither holds bytes.
 
 ```bash
 curl "$BASE/api/sessions/$SESSION_ID/messages/628123456789@c.us/true_628123456789@c.us_3EB0ABCD/media" \
@@ -723,7 +724,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/groups/120363021234567890@g.us/invit
 
 #### POST /api/sessions/:sessionId/groups
 
-Create a new group with an initial set of participants (OPERATOR).
+Create a new group with an initial set of participants (OPERATOR). Baileys only: whatsapp-web.js answers `501`.
 
 ```bash
 curl -X POST "$BASE/api/sessions/$SESSION_ID/groups" \
@@ -935,11 +936,11 @@ curl -X DELETE "$BASE/api/sessions/$SESSION_ID/templates/$TEMPLATE_ID" \
 
 ### 07.8 Catalog & Channels
 
-The catalog routes work on the **Baileys** engine (WhatsApp Business accounts) — `getCatalog`/`getProducts`/`getProduct` read the session's own catalog and `sendProduct` sends a native product card. On **whatsapp-web.js** they raise `EngineNotSupportedError` (`501 Not Implemented`) — the library has no catalog API at all; on that engine the readiness check runs first, so a session that exists but is not yet READY returns `409` instead. The per-engine gaps are listed in `docs/29-engine-capability-matrix.md`. The channel routes that follow are a separate group with real engine support.
+The catalog routes work on the **Baileys** engine (WhatsApp Business accounts) — `getCatalog`/`getProducts`/`getProduct` read the session's own catalog and `sendProduct` sends a native product card. On **whatsapp-web.js** they raise `EngineNotSupportedError` (`501 Not Implemented`) — the library has no catalog API at all; on that engine the readiness check runs first, so a session that exists but is not yet READY returns `409` instead. The per-engine gaps are listed in `docs/29-engine-capability-matrix.md`. The channel routes that follow are a separate group, and each engine answers `501` for some of them: whatsapp-web.js for `subscribe`, admin demotion and ownership transfer, Baileys for listing subscribed channels and reading a channel's messages.
 
 #### GET /api/sessions/:sessionId/catalog
 
-Get business catalog info for the session. On Baileys returns the first catalog collection's metadata (`200`, or `null` when the business has no collections); on whatsapp-web.js returns `501`.
+Get business catalog info for the session. On Baileys returns the first catalog collection's metadata (`200`, or an empty `200` body when the business has no collections); on whatsapp-web.js returns `501`.
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog" \
@@ -957,7 +958,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog/products?page=1&limit=20" \
 
 #### GET /api/sessions/:sessionId/catalog/products/:productId
 
-Get a specific catalog product by id. On Baileys returns the product (`200`) or `null` for an unknown id; on whatsapp-web.js returns `501`.
+Get a specific catalog product by id. On Baileys returns the product (`200`) or an empty `200` body for an unknown id; on whatsapp-web.js returns `501`.
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog/products/PROD_12345" \
@@ -1025,7 +1026,7 @@ curl -X DELETE "$BASE/api/sessions/$SESSION_ID/channels/120363000000000000@newsl
 ### 07.9 Labels & Status
 
 ```bash
-# List all labels for a session (WhatsApp Business only)
+# List all labels for a session (WhatsApp Business only; Baileys answers 501 for the label reads: list, get and a chat's labels)
 curl -X GET "$BASE/api/sessions/$SESSION_ID/labels" \
   -H "X-API-Key: $API_KEY"
 ```
@@ -1141,9 +1142,11 @@ curl -X GET "$BASE/api/webhooks?limit=100&offset=0" \
 
 #### GET /api/webhooks/delivery-failures
 
-List webhook deliveries that failed or were not sent (attempts 0, pending replay), most recent first
-(ADMIN; results stay confined to the key's allowed sessions). `lastStatusCode` is `null` when the
-failure was a network/timeout/SSRF error rather than a non-2xx response.
+List webhook deliveries that failed or were not sent (attempts 0), most recent first (ADMIN; results
+stay confined to the key's allowed sessions). A shed or shutdown-refused delivery is replayed by the
+outbox until its replay budget runs out; an oversize payload or a preflight failure on first dispatch
+is not replayed. `lastStatusCode` is `null` when the failure was a network/timeout/SSRF error rather
+than a non-2xx response.
 
 ```bash
 curl -X GET "$BASE/api/webhooks/delivery-failures?limit=100&offset=0" \
@@ -1382,7 +1385,7 @@ ADMIN-only operations (except the public health check and the MCP transport). As
 
 #### GET /api/infra/health
 
-Public liveness probe.
+Public liveness probe. It answers `503` from the moment shutdown teardown begins; `GET /api/health/live` keeps answering.
 
 ```bash
 curl "$BASE/api/infra/health"
@@ -1608,7 +1611,7 @@ curl -X PUT "$BASE/api/plugins/chat-flow/config" \
 
 #### PUT /api/plugins/:id/config/:sessionId
 
-Set (or clear with `{}`) a per-session plugin config override. The override is stored under the session UUID and resolved against the UUID carried by each event, so an id that is not a live session's UUID never takes effect.
+Set a per-session plugin config override, or clear it by sending `{ "config": {} }`. The override is stored under the session UUID and resolved against the UUID carried by each event, so an id that is not a live session's UUID never takes effect.
 
 ```bash
 curl -X PUT "$BASE/api/plugins/chat-flow/config/$SESSION_ID" \
@@ -1735,7 +1738,9 @@ cannot be widened via the query. See doc 26 for the provider contract.
 
 Search messages across sessions. `q` is required (non-empty after trim); optional filters are
 `sessionId`, `chatId`, `direction` (`incoming` | `outgoing`), `type`, `from`, `dateFrom`/`dateTo`
-(epoch ms), plus `limit` (default 50, clamped to `SEARCH_LIMIT_MAX` = 100) and `offset`. Hit
+(epoch ms), plus `limit` (default 50, clamped to `SEARCH_LIMIT_MAX` = 100) and `offset` (at most
+100000). `q` is at most 1000 characters and 32 words, and a longer one answers `400`. A key restricted to
+selected chats gets `403` for a `chatId` outside its list and for a plugin search provider. Hit
 `snippet` fields carry `<mark>` highlight markers — render them as text, never as HTML.
 
 ```bash
@@ -1747,8 +1752,8 @@ curl -X GET "$BASE/api/search?q=invoice&direction=incoming&limit=20" \
 
 Server-side transcoding into the shapes WhatsApp clients actually play. Disabled by default; set
 `MEDIA_CONVERSION_ENABLED=true`, and `ffmpeg` must be runnable (the official Docker image ships it)
-or the routes answer `503`. Nothing is converted implicitly — run media through here first, then
-post the result.
+or the routes answer `503`; video conversion needs ffmpeg 4.4 or newer. Nothing is converted
+implicitly — run media through here first, then post the result.
 
 #### GET /api/sessions/:sessionId/media/convert
 

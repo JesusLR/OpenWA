@@ -125,7 +125,12 @@ func (s *SessionsService) Logout(ctx context.Context, sessionID string) (*Sessio
 	return &out, nil
 }
 
-// ForceKill terminates a stuck session immediately.
+// ForceKill terminates a stuck session immediately. It returns an *APIError with
+// StatusCode 502 and Code "SESSION_FORCE_KILL_INCOMPLETE" when the session was
+// stopped locally but the force-destroy threw or timed out, so the engine process
+// may still be running; the status is settled to disconnected and a retry
+// answers 400 because no engine is left to kill. Restart the node to reap a
+// leaked process.
 func (s *SessionsService) ForceKill(ctx context.Context, sessionID string) (*SessionResponse, error) {
 	var out SessionResponse
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/force-kill", nil, nil, &out)
@@ -145,7 +150,8 @@ func (s *SessionsService) QRCode(ctx context.Context, sessionID string) (*QrCode
 	return &out, nil
 }
 
-// RequestPairingCode requests a phone-pairing code.
+// RequestPairingCode requests a phone-pairing code. On whatsapp-web.js, never request one for a number that
+// already has a linked session: WhatsApp can revoke that device. Link it by QR instead.
 func (s *SessionsService) RequestPairingCode(ctx context.Context, sessionID string, body RequestPairingCodeRequest) (*PairingCodeResponse, error) {
 	var out PairingCodeResponse
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/pairing-code", nil, body, &out)

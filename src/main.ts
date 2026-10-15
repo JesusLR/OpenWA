@@ -29,6 +29,7 @@ import {
   isApiKeyPepperMissingInProduction,
   isMainDbSynchronizeInProduction,
   isNodeEnvUnset,
+  rewrittenCorsOrigins,
 } from './config/bootstrap-security';
 import { BullBoardAuthMiddleware } from './common/security/bull-board-auth.middleware';
 import { invalidTrustedProxies } from './common/utils/ip';
@@ -98,11 +99,13 @@ async function bootstrap() {
   });
 
   // Advisory (not enforced): without API_KEY_PEPPER, stored API-key hashes use plain SHA-256. Enabling
-  // a pepper re-hashes keys and invalidates existing ones, so we only nudge the operator (see api-key-hash.ts).
+  // a pepper on an install with keys locks every key out (see api-key-hash.ts), so we only nudge the operator.
   if (isApiKeyPepperMissingInProduction(process.env.NODE_ENV, process.env.API_KEY_PEPPER)) {
     bootstrapLogger.warn(
       'API_KEY_PEPPER is not set in production: stored API-key hashes use plain SHA-256. ' +
-      'Set API_KEY_PEPPER and re-issue keys to enable HMAC hashing.',
+        'Set API_KEY_PEPPER before the first boot to enable HMAC hashing; on an install with keys it locks out ' +
+        'every key until the previous pepper is restored, or api_keys is cleared and the instance restarted to ' +
+        'seed a new admin key.',
     );
   }
 
@@ -124,6 +127,15 @@ async function bootstrap() {
     );
   }
 
+  // Advisory: an origin copied from the address bar carries a path or a trailing slash that a browser never
+  // sends in `Origin`. It is used without them, which is what the operator meant.
+  const rewrittenOrigins = rewrittenCorsOrigins(process.env.CORS_ORIGINS);
+  if (rewrittenOrigins.length > 0) {
+    bootstrapLogger.warn(
+      `CORS_ORIGINS entries are used as an origin, without their path or trailing slash: ${rewrittenOrigins.join(', ')}`,
+    );
+  }
+
   // Fail fast on a media storage root the app cannot write to, BEFORE Nest builds the module graph:
   // StorageService only checks that the root EXISTS, so a root owned by another user passes boot and
   // fails later on the first media write instead (#1065). Runs ahead of NestFactory.create so
@@ -140,7 +152,15 @@ async function bootstrap() {
   // Disable Nest's default body parser so we can set an explicit size cap below. Framework lines
   // (route mapping, unhandled-exception stacks) go through the app logger so LOG_LEVEL, LOG_FORMAT and
   // the request id apply to them too.
-  const app = await NestFactory.create(AppModule, { bodyParser: false, logger: createLogger('Nest') });
+  // forceCloseConnections: the HTTP close runs after every destroy hook, and a request still in flight
+  // would hold it until the force-exit; destroying the open sockets there keeps it at 0 s in the
+  // shutdown budget (shutdown-budget.ts). It also cuts in-flight requests and WebSocket clients at that
+  // point (the socket.io server is not closed first), after the destroy hooks have run.
+  const app = await NestFactory.create(AppModule, {
+    bodyParser: false,
+    logger: createLogger('Nest'),
+    forceCloseConnections: true,
+  });
   appInstance = app;
 
   // Cross-replica WebSocket fan-out: when Redis is enabled, broadcasts reach clients on every
@@ -149,8 +169,8 @@ async function bootstrap() {
   app.useWebSocketAdapter(new RedisIoAdapter(app));
 
   // The production HTTP surface: request context, the CSP nonce, helmet, the SPA document handler,
-  // CORS, in-flight body budget, body parsers and the trailing-slash DELETE refusal. Extracted so the
-  // e2e lane runs the SAME stack instead of a copy of it (src/configure-app.ts).
+  // CORS, the encoded-NUL refusal, in-flight body budget, body parsers and the trailing-slash DELETE
+  // refusal. Extracted so the e2e lane runs the SAME stack instead of a copy of it (src/configure-app.ts).
   const { bodyLimit, inflightBudgetBytes } = configureApp(app);
   bootstrapLogger.log(`Request body caps: ${bodyLimit} per request, ${inflightBudgetBytes} bytes aggregate in flight`);
 

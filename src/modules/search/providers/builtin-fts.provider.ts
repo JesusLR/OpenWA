@@ -47,10 +47,10 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
   constructor(@InjectDataSource('data') private readonly dataSource: DataSource) {}
 
   /**
-   * Self-heals the FTS schema at bootstrap so search works under DATABASE_SYNCHRONIZE=true (the dev
-   * compose and the zero-config first-boot default), where TypeORM creates the `messages` table from
-   * the entity but NEVER runs migrations — so the migration that establishes `messages_fts` /
-   * `body_ts` is skipped and search would 501 on a fresh SQLite box. This re-applies the same
+   * Self-heals the FTS schema at bootstrap so search works under an opted-in DATABASE_SYNCHRONIZE=true
+   * on SQLite (docker-compose.dev.yml sets it; the default is migrations), where TypeORM creates the
+   * `messages` table from the entity but NEVER runs migrations — so the migration that establishes
+   * `messages_fts` is skipped and search would 501 on a fresh SQLite box. This re-applies the same
    * idempotent DDL as the migration (1782400000000-AddMessagesFts); `IF NOT EXISTS` / `IF NOT` guards
    * make it a no-op once the schema exists, and on Postgres no DDL is issued at all when the catalog
    * already holds the column and index, so migrations-based deployments take no table lock. Probes the
@@ -138,9 +138,10 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
    *     and Postgres reads the catalog and issues no DDL, because `ALTER TABLE ... IF NOT EXISTS`
    *     still queues for ACCESS EXCLUSIVE on `messages` before it finds the column, stalling every
    *     message read and write behind any open transaction.
-   *   - synchronize-based deployments (dev compose / zero-config first boot): migrations are skipped,
-   *     so this is what actually brings the index up at boot. Without it search 501s on every fresh
-   *     SQLite box, contradicting docs/26's "zero-config, on by default" promise.
+   *   - synchronize-based SQLite deployments (DATABASE_SYNCHRONIZE=true, e.g. the dev compose):
+   *     migrations are skipped, so this is what actually brings the index up at boot. Without it
+   *     search 501s on every such box. Postgres refuses synchronize at boot, so the Postgres
+   *     branch only repairs a schema whose FTS migration objects are missing.
    * Returns true when the index is usable, false when the SQLite build lacks FTS5 (no schema left
    * behind — the route 501s cleanly via ensureFts).
    */
@@ -184,6 +185,21 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
     // were never added, and SQLite rejects the whole statement — so ordinary edits and deletes on
     // them fail, not merely searches. Reads `d."rowid"` rather than `d."id"`: same query plan,
     // without depending on the shadow table's column naming.
+    //
+    // A rowid-level gap check cannot see a renumbered table. TypeORM synchronize rebuilds `messages`
+    // on SQLite by copying the rows without their implicit rowid, so after any delete the survivors
+    // get new rowids and the index entries under them describe other messages. The triggers keep
+    // `docsize` in step with `messages`, so an index row with no message behind it only appears after
+    // such a rebuild, and any rebuild that renumbered a row leaves the old highest rowid behind. Drop
+    // the whole index then and let the gap repair below re-add every row.
+    const orphanRow: unknown[] = await this.dataSource.query(
+      `SELECT EXISTS(SELECT 1 FROM "messages_fts_docsize" d
+         WHERE NOT EXISTS (SELECT 1 FROM "messages" m WHERE m."rowid" = d."rowid")) AS orphan`,
+    );
+    if (Number((orphanRow as Array<{ orphan: number }>)[0]?.orphan)) {
+      this.logger.warn('FTS index holds rows the messages table no longer has; re-indexing every message');
+      await this.dataSource.query(`INSERT INTO "messages_fts"("messages_fts") VALUES ('delete-all')`);
+    }
     const gapRow: unknown[] = await this.dataSource.query(
       `SELECT EXISTS(SELECT 1 FROM "messages" m WHERE m."body" IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM "messages_fts_docsize" d WHERE d."rowid" = m."rowid")) AS missing`,
@@ -298,7 +314,9 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
    * unchanged. Postgres already uses the tolerant websearch_to_tsquery and needs no equivalent.
    */
   private static toFts5Query(raw: string): string {
-    const tokens = raw.trim().split(/\s+/).filter(Boolean);
+    // A repeated token is dropped: `a a` is `a` under implicit AND, but FTS5 would pay for each copy
+    // on every matching row.
+    const tokens = [...new Set(raw.trim().split(/\s+/).filter(Boolean))];
     if (tokens.length === 0) return '""';
     return tokens.map(tok => `"${tok.replace(/"/g, '""')}"`).join(' ');
   }
@@ -318,7 +336,13 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
     const where: string[] = [`messages_fts MATCH ${ph()}`];
     params.push(BuiltInFtsProvider.toFts5Query(q.q));
     this.applyFilters(where, params, q, 'm.', ph);
-    const cols = `m."id", m."waMessageId" AS wa_message_id, m."sessionId" AS session_id, m."chatId" AS chat_id, m."from" AS "from", m."body", m."timestamp", m."type", m."direction", snippet(messages_fts, 0, '<mark>', '</mark>', '…', ${MAX_SNIPPET_WORDS}) AS snippet, rank AS score`;
+    // bm25 weighs a term by how many messages the whole index holds, so the value of a hit a caller
+    // scoped to some sessions or chats may read still reflects the ones it may not. It keeps ordering the
+    // hits; only the value is withheld. An empty session list is no restriction (applyFilters), an empty
+    // chat list is a restriction to nothing.
+    const scoped = q.chatIds !== undefined || (q.sessionIds?.length ?? 0) > 0;
+    const score = scoped ? 'NULL' : 'rank';
+    const cols = `m."id", m."waMessageId" AS wa_message_id, m."sessionId" AS session_id, m."chatId" AS chat_id, m."from" AS "from", m."body", m."timestamp", m."type", m."direction", snippet(messages_fts, 0, '<mark>', '</mark>', '…', ${MAX_SNIPPET_WORDS}) AS snippet, ${score} AS score`;
     const sql = `SELECT ${cols} FROM messages_fts JOIN messages m ON m."rowid" = messages_fts."rowid" WHERE ${where.join(' AND ')} ORDER BY rank, m."timestamp" DESC, m."id" DESC LIMIT ${ph()} OFFSET ${ph()}`;
     params.push(limit, offset);
     return { sql, params };
@@ -359,6 +383,12 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
       where.push(`${prefix}"chatId" = ${ph()}`);
       params.push(q.chatId);
     }
+    if (q.chatIds?.length === 0) where.push('1 = 0');
+    else if (q.chatIds) {
+      const placeholders = q.chatIds.map(() => ph()).join(',');
+      where.push(`${prefix}"chatId" IN (${placeholders})`);
+      params.push(...q.chatIds);
+    }
     if (q.from) {
       where.push(`${prefix}"from" = ${ph()}`);
       params.push(q.from);
@@ -377,11 +407,11 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
     // (WhatsApp messageTimestamp — see the inbound mappers in the engine adapters). Bind ms→seconds
     // at the boundary, otherwise `seconds >= ms` is false for every modern row and dateFrom/dateTo
     // silently exclude all results.
-    if (q.dateFrom) {
+    if (q.dateFrom != null) {
       where.push(`${prefix}"timestamp" >= ${ph()}`);
       params.push(Math.floor(q.dateFrom / 1000));
     }
-    if (q.dateTo) {
+    if (q.dateTo != null) {
       where.push(`${prefix}"timestamp" <= ${ph()}`);
       params.push(Math.floor(q.dateTo / 1000));
     }

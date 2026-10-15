@@ -18,11 +18,16 @@ import {
   NAVIGATION_REINJECT_GRACE_MS,
   NAVIGATION_EPISODE_CAP_MS,
 } from './whatsapp-web-js.adapter';
+import { downloadMediaInPage } from './wwebjs-messaging';
+import { LoggerService } from '../../common/services/logger.service';
 import { resolveOnboardingContinueLabels } from './wwebjs-onboarding';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import { resolveEngineInitTimeoutMs } from '../engine-init-timeout';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 import * as path from 'path';
+import * as ts from 'typescript';
+import * as vm from 'vm';
 import * as qrcode from 'qrcode';
 import { InternalServerErrorException, UnprocessableEntityException, BadRequestException } from '@nestjs/common';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
@@ -40,6 +45,7 @@ import { LabelNotFoundError } from '../../common/errors/label-not-found.error';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
 import * as loadRemoteMediaModule from '../../common/media/load-remote-media';
 import { fetch as undiciFetch } from 'undici';
+import { lookup } from 'dns/promises';
 
 // Allowlisted hosts are PINNED to their DNS answer (ssrf-guard pins allowlisted hosts to their DNS answers), so the specs that exercise
 // the SSRF_ALLOWED_HOSTS escape-hatch need a deterministic resolver. Default answers are PUBLIC
@@ -72,6 +78,15 @@ jest.mock('qrcode', () => ({
 // namespace wrapper that `import * as childProcess` yields has non-configurable members, so
 // jest.spyOn cannot redefine execFile on it. The adapter reads execFile live off this same object.
 const childProcess = jest.requireActual<typeof import('child_process')>('child_process');
+
+/**
+ * Serve a message's media download from `download`: production reads it through the page
+ * (downloadCappedMedia), and the same mock stays reachable as `downloadMedia` for assertions.
+ */
+const onPage = <T extends jest.Mock>(download: T) => ({
+  downloadMedia: download,
+  client: { pupPage: { evaluate: download } },
+});
 
 describe('wwebjsAckToDeliveryStatus (engine ack-int -> neutral DeliveryStatus boundary, #265)', () => {
   // Regression-locks the integer boundary the decoupling moved behaviour into, incl. the
@@ -380,9 +395,28 @@ describe('WhatsAppWebJsAdapter initialize() retry on a navigation-killed first i
     });
     const onError = jest.fn();
 
-    await expect(adapter.initialize({ onError })).rejects.toThrow(EXEC_CTX);
+    await expect(adapter.initialize({ onError })).resolves.toBeUndefined();
 
     expect(clientInitSpy).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  // The stop's destroy closes the browser, which rejects the pending launch. That rejection is the
+  // stop landing, not a start failure: no FAILED status, no onError, like the other teardown exits.
+  it('settles DISCONNECTED without onError when a stop closes the launching browser', async () => {
+    const adapter = newAdapter();
+    const states: EngineStatus[] = [];
+    clientInitSpy.mockImplementationOnce(async () => {
+      await adapter.disconnect();
+      throw new Error('Protocol error (Runtime.callFunctionOn): Target closed');
+    });
+    const onError = jest.fn();
+
+    await expect(adapter.initialize({ onError, onStateChanged: state => states.push(state) })).resolves.toBeUndefined();
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(states).not.toContain(EngineStatus.FAILED);
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
   });
 
   // A stop, delete or logout that lands while Chromium is still launching runs Client.destroy()
@@ -633,7 +667,13 @@ describe('loadRemoteMedia — routes through the SSRF-pinned media fetch', () =>
   });
 
   it('honors the SSRF_ALLOWED_HOSTS escape-hatch for trusted internal media stores', async () => {
+    // 'minio' resolves to a private address, so only the allow-list can let it through.
+    jest.mocked(lookup).mockResolvedValueOnce([{ address: '10.0.0.5', family: 4 }] as never);
+    await expect(loadRemoteMedia('http://minio:9000/bucket/x.png', undefined)).rejects.toBeInstanceOf(SsrfBlockedError);
+    expect(undiciFetch).not.toHaveBeenCalled();
+
     process.env.SSRF_ALLOWED_HOSTS = 'minio';
+    jest.mocked(lookup).mockResolvedValueOnce([{ address: '10.0.0.5', family: 4 }] as never);
     (undiciFetch as jest.Mock).mockResolvedValue(fakeResponse([1], { 'content-type': 'image/png' }));
 
     const media = await loadRemoteMedia('http://minio:9000/bucket/x.png', undefined);
@@ -922,7 +962,7 @@ describe('WhatsAppWebJsAdapter.getChatHistory enrichment (parity with the live p
       hasMedia: true,
       hasQuotedMsg: false,
       _data: { size: 12 * 1024 * 1024, mimetype: 'image/jpeg' },
-      downloadMedia: jest.fn(),
+      ...onPage(jest.fn()),
     };
     const chat = { fetchMessages: jest.fn().mockResolvedValue([mediaMsg]) };
     const client = { getChatById: jest.fn().mockResolvedValue(chat) };
@@ -952,7 +992,7 @@ describe('WhatsAppWebJsAdapter.getChatHistory enrichment (parity with the live p
       hasMedia: true,
       hasQuotedMsg: false,
       _data: { size: data.length, mimetype: 'image/jpeg' },
-      downloadMedia: jest.fn().mockResolvedValue({ data, mimetype: 'image/jpeg' }),
+      ...onPage(jest.fn().mockResolvedValue({ data, mimetype: 'image/jpeg' })),
     });
     const clientFor = (...msgs: unknown[]) => ({
       getChatById: jest.fn().mockResolvedValue({ fetchMessages: jest.fn().mockResolvedValue(msgs) }),
@@ -1000,6 +1040,29 @@ describe('WhatsAppWebJsAdapter.getChatHistory enrichment (parity with the live p
       expect(out[0].media).toEqual({ mimetype: 'image/jpeg', data: 'QUJD' });
       expect(out[1].media).toEqual({ mimetype: 'image/jpeg', data: 'QUJD' });
       expect(m2.downloadMedia).toHaveBeenCalled();
+    });
+
+    // The per-item cap is clamped to MEDIA_DOWNLOAD_MAX_BYTES, so an override above it must not
+    // inflate the aggregate budget derived from it either.
+    it('derives the per-item-cap budget from the clamped cap, not a larger override', async () => {
+      process.env[ENV] = '4';
+      const origMax = process.env.MEDIA_DOWNLOAD_MAX_BYTES;
+      process.env.MEDIA_DOWNLOAD_MAX_BYTES = '3'; // budget = ceil(3 * 4 * 1.37) = 17 base64 chars
+      try {
+        const msgs = ['M16', 'M17', 'M18', 'M19', 'M20', 'M21'].map(id => ({
+          ...mediaMsg(id, 'QUJD'),
+          _data: { size: 3, mimetype: 'image/jpeg' },
+        }));
+
+        const out = await readyAdapter(clientFor(...msgs)).getChatHistory('status@broadcast', 50, true, 1024 * 1024);
+
+        expect(out.slice(0, 5).map(m => m.media)).toEqual(Array(5).fill({ mimetype: 'image/jpeg', data: 'QUJD' }));
+        expect(out[5].media).toEqual({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 3 });
+        expect(msgs[5].downloadMedia).not.toHaveBeenCalled();
+      } finally {
+        if (origMax === undefined) delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
+        else process.env.MEDIA_DOWNLOAD_MAX_BYTES = origMax;
+      }
     });
 
     it('stops the read loop when the abort signal fires (client disconnect)', async () => {
@@ -1225,7 +1288,7 @@ describe('WhatsAppWebJsAdapter channels (#625 — wwebjs Client has no getChanne
 
     expect(getChannels).toHaveBeenCalled();
     expect(fetchMessages).toHaveBeenCalledWith({ limit: 10 });
-    expect(result).toEqual([{ id: 'M1', body: 'hello', timestamp: 1700000000, hasMedia: false, mediaUrl: undefined }]);
+    expect(result).toEqual([{ id: 'M1', body: 'hello', timestamp: 1700000000, hasMedia: false }]);
   });
 
   it('getChannelMessages surfaces a not-found channel as ChannelNotFoundError (→ 404), not a silent []', async () => {
@@ -1399,12 +1462,48 @@ describe('WhatsAppWebJsAdapter channel-JID guard (#554 — wwebjs Channel lacks 
     // WA Web yields no code when the account is not an admin of the group. String(undefined)
     // turned that into the literal 'undefined', which the controller rendered as the link
     // "https://chat.whatsapp.com/undefined" and returned with a 200.
-    it.each([
-      ['getGroupInviteCode', 'getInviteCode', (a: WhatsAppWebJsAdapter) => a.getGroupInviteCode('g@g.us')],
-      ['revokeGroupInviteCode', 'revokeInvite', (a: WhatsAppWebJsAdapter) => a.revokeGroupInviteCode('g@g.us')],
-    ])('%s treats a missing code as a refusal, not the string "undefined"', async (_name, method, call) => {
-      const stub = jest.fn().mockResolvedValue(undefined);
-      await expect(call(readyAdapter(groupChat({ [method]: stub })))).rejects.toBeInstanceOf(EngineRefusedError);
+    it('getGroupInviteCode treats a missing code as a refusal, not the string "undefined"', async () => {
+      const getInviteCode = jest.fn().mockResolvedValue(undefined);
+      await expect(readyAdapter(groupChat({ getInviteCode })).getGroupInviteCode('g@g.us')).rejects.toBeInstanceOf(
+        EngineRefusedError,
+      );
+    });
+
+    describe('revokeGroupInviteCode', () => {
+      const globals = globalThis as unknown as { window?: unknown };
+      afterEach(() => delete globals.window);
+
+      // Runs the in-page function in Node against a stubbed WA Web module registry, the way the page would.
+      const revokeWith = (resetGroupInviteCode: jest.Mock): Promise<string> => {
+        globals.window = {
+          require: (m: string) =>
+            m === 'WAWebWidFactory' ? { createWid: (id: string) => ({ id }) } : { resetGroupInviteCode },
+        };
+        const evaluate = jest.fn(<T, A>(fn: (arg: A) => Promise<T>, arg: A) => fn(arg));
+        // What upstream's GroupChat.revokeInvite hands back for a refusal: the page error, its name lost.
+        const revokeInvite = jest.fn().mockRejectedValue(new Error('Evaluation failed: ServerStatusCodeError'));
+        return readyAdapter({ ...groupChat({ revokeInvite }), pupPage: { evaluate } }).revokeGroupInviteCode('g@g.us');
+      };
+
+      it('returns the new code', async () => {
+        await expect(revokeWith(jest.fn().mockResolvedValue({ code: 'NEW123' }))).resolves.toBe('NEW123');
+      });
+
+      // A non-admin revoke is refused by WA Web with ServerStatusCodeError, which used to reach the
+      // caller as a raw 500 while the route declares 403.
+      it('answers a non-admin refusal with EngineRefusedError (403)', async () => {
+        const refusal = Object.assign(new Error('403'), { name: 'ServerStatusCodeError' });
+        await expect(revokeWith(jest.fn().mockRejectedValue(refusal))).rejects.toBeInstanceOf(EngineRefusedError);
+      });
+
+      it('treats a missing code as a refusal, not the string "undefined"', async () => {
+        await expect(revokeWith(jest.fn().mockResolvedValue(undefined))).rejects.toBeInstanceOf(EngineRefusedError);
+      });
+
+      it('keeps any other page failure unchanged', async () => {
+        const failure = new TypeError('resetGroupInviteCode is not a function');
+        await expect(revokeWith(jest.fn().mockRejectedValue(failure))).rejects.toBe(failure);
+      });
     });
   });
 
@@ -3213,7 +3312,7 @@ describe('WhatsAppWebJsAdapter status methods', () => {
           timestamp: 1700000030,
           hasMedia: true,
           _data: { mimetype: 'image/png', size: 3 },
-          downloadMedia,
+          ...onPage(downloadMedia),
         },
       ],
     };
@@ -3538,7 +3637,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       fromMe: true,
       hasMedia: true,
       _data: { mimetype: 'image/png', size: 3 },
-      downloadMedia: jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' }),
+      ...onPage(jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' })),
       getContact: jest.fn().mockResolvedValue(null),
       hasQuotedMsg: false,
     };
@@ -3556,6 +3655,48 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     expect(msg.media?.mimetype).toBe('image/png');
     expect(msg.media?.data).toBe('QUJD');
     expect(msg.media?.omitted).toBeUndefined();
+  });
+
+  it('logs an own-send echo whose base cannot be built instead of dropping it silently', async () => {
+    // The echo runs in an async function whose rejection holdWhileProcessing consumes, so an unreadable
+    // `to` (a WhatsApp Web build renaming the field) vanished without a log line or the unhandled-rejection
+    // metric. The incoming handler logs the same defect; the echo must too. It is not admitted either, since
+    // its chat is unknown, so there is no ticket to settle.
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-echo-unreadable',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const logger = (adapter as unknown as { logger: { error: jest.Mock } }).logger;
+    const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onMessageCreate = jest.fn();
+    const admitInbound = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate, admitInbound };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+
+    client.emit('message_create', {
+      id: { _serialized: 'OWN_UNREADABLE_1' },
+      from: '628123@c.us',
+      to: undefined,
+      body: '',
+      type: 'chat',
+      timestamp: 1700000074,
+      fromMe: true,
+      hasMedia: false,
+      hasQuotedMsg: false,
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    expect(onMessageCreate).not.toHaveBeenCalled();
+    expect(admitInbound).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith('Error processing outgoing message', expect.stringContaining('endsWith'));
   });
 
   it('does not download the media of an own status post echo', async () => {
@@ -3587,7 +3728,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       fromMe: true,
       hasMedia: true,
       _data: { mimetype: 'image/png', size: 3 },
-      downloadMedia: jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' }),
+      ...onPage(jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' })),
       hasQuotedMsg: false,
     };
 
@@ -3631,7 +3772,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       fromMe: true,
       hasMedia: true,
       _data: { mimetype: 'image/png', size: 3 },
-      downloadMedia: jest.fn().mockRejectedValue(new Error('media gone')),
+      ...onPage(jest.fn().mockRejectedValue(new Error('media gone'))),
       getContact: jest.fn().mockResolvedValue(null),
       hasQuotedMsg: false,
     };
@@ -3680,7 +3821,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       hasMedia: true,
       _data: { mimetype: 'image/jpeg', size: 2048 },
       // The minified page-side throw a WhatsApp Web build surfaces through Puppeteer.
-      downloadMedia: jest.fn().mockRejectedValue(new Error('t: t')),
+      ...onPage(jest.fn().mockRejectedValue(new Error('t: t'))),
       getContact: jest.fn().mockResolvedValue(null),
       hasQuotedMsg: false,
     };
@@ -4802,6 +4943,29 @@ describe('outbound document mode (#989)', () => {
       );
     });
 
+    // Status media takes the same route default: a URL posted without a declared type keeps a specific
+    // fetched type, and a generic one would otherwise reach WA Web and turn a photo into a document.
+    it.each<['postImageStatus' | 'postVideoStatus' | 'postVoiceStatus', string, string]>([
+      ['postImageStatus', 'image/png', 'image/png'],
+      ['postImageStatus', 'application/octet-stream', 'image/jpeg'],
+      ['postVideoStatus', '', 'video/mp4'],
+      ['postVoiceStatus', 'binary/octet-stream', 'audio/ogg; codecs=opus'],
+    ])('%s from a URL served as %j goes out as %s', async (post, fetched, expected) => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': fetched }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage })[post](
+        { mimetype: 'application/octet-stream', data: 'https://files.example.com/status' },
+        {},
+      );
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        'status@broadcast',
+        expect.objectContaining({ mimetype: expected }),
+        expect.anything(),
+      );
+    });
+
     it('leaves a document with a generic fetched type as it is', async () => {
       (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'binary/octet-stream' }));
       const sendMessage = jest.fn().mockResolvedValue(sentMessage);
@@ -5139,6 +5303,51 @@ describe('votePoll', () => {
     const adapter = ready(chatWith([]));
     await expect(adapter.votePoll('628@c.us', 'OLD', ['x'])).rejects.toBeInstanceOf(MessageNotFoundError);
   });
+
+  describe('option texts checked against the poll', () => {
+    const poll = (vote: jest.Mock) => ({
+      id: { _serialized: 'P1' },
+      pollOptions: [
+        { name: 'Pizza', localId: 0 },
+        { name: 'Sushi', localId: 1 },
+      ],
+      vote,
+    });
+
+    it('refuses options that match none of the poll texts with 400, never sending the empty vote', async () => {
+      // vote() would send an empty selection here, which clears the account's vote, while the route
+      // answered 200 (the hidden defect behind #1738).
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      const err = await adapter.votePoll('628@c.us', 'P1', ['pizza', 'Burger']).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect((err as BadRequestException).getResponse()).toEqual(
+        expect.objectContaining({ code: 'POLL_OPTION_NOT_FOUND', validOptions: ['Pizza', 'Sushi'] }),
+      );
+      expect((err as Error).message).toMatch(/"Pizza", "Sushi"/);
+      expect(vote).not.toHaveBeenCalled();
+    });
+
+    it('still votes when at least one text matches, as before', async () => {
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      await adapter.votePoll('628@c.us', 'P1', ['Pizza', 'Burger']);
+
+      expect(vote).toHaveBeenCalledWith(['Pizza', 'Burger']);
+    });
+
+    it('keeps an explicit empty array as a deliberate clear', async () => {
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      await adapter.votePoll('628@c.us', 'P1', []);
+
+      expect(vote).toHaveBeenCalledWith([]);
+    });
+  });
 });
 
 describe('pinMessage / unpinMessage', () => {
@@ -5355,15 +5564,17 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const makeMsg = (id: string): unknown => ({
       id: { _serialized: id },
       _data: { size: 100, mimetype: 'image/png' },
-      downloadMedia: jest.fn(() => {
-        inFlight++;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        const d = defer<{ mimetype: string; data: string }>();
-        downloads.push(d);
-        return d.promise.finally(() => {
-          inFlight--;
-        });
-      }),
+      ...onPage(
+        jest.fn(() => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          const d = defer<{ mimetype: string; data: string }>();
+          downloads.push(d);
+          return d.promise.finally(() => {
+            inFlight--;
+          });
+        }),
+      ),
     });
     const cap = (m: unknown): Promise<unknown> =>
       (adapter as unknown as { capInboundMediaFor: (msg: unknown) => Promise<unknown> }).capInboundMediaFor(m);
@@ -5408,13 +5619,15 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const makeMsg = (id: string): unknown => ({
       id: { _serialized: id },
       _data: { size: 100, mimetype: 'image/png' },
-      downloadMedia: jest.fn(() => {
-        started.push(id);
-        // Every download takes 60 ms, inside the 100 ms deadline on its own.
-        return new Promise(resolve =>
-          setTimeout(() => resolve({ mimetype: 'image/png', data: Buffer.from(id).toString('base64') }), 60),
-        );
-      }),
+      ...onPage(
+        jest.fn(() => {
+          started.push(id);
+          // Every download takes 60 ms, inside the 100 ms deadline on its own.
+          return new Promise(resolve =>
+            setTimeout(() => resolve({ mimetype: 'image/png', data: Buffer.from(id).toString('base64') }), 60),
+          );
+        }),
+      ),
     });
     const cap = (m: unknown): Promise<{ data?: string; omitted?: boolean }> =>
       (
@@ -5449,12 +5662,14 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const makeMsg = (id: string, behavior: 'reject' | 'resolve'): unknown => ({
       id: { _serialized: id },
       _data: { size: 100, mimetype: 'image/png' },
-      downloadMedia: jest.fn(() => {
-        calls.push(id);
-        return behavior === 'reject'
-          ? Promise.reject(new Error('download blew up'))
-          : Promise.resolve({ mimetype: 'image/png', data: Buffer.from('ok').toString('base64') });
-      }),
+      ...onPage(
+        jest.fn(() => {
+          calls.push(id);
+          return behavior === 'reject'
+            ? Promise.reject(new Error('download blew up'))
+            : Promise.resolve({ mimetype: 'image/png', data: Buffer.from('ok').toString('base64') });
+        }),
+      ),
     });
     const cap = (m: unknown): Promise<unknown> =>
       (adapter as unknown as { capInboundMediaFor: (msg: unknown) => Promise<unknown> }).capInboundMediaFor(m);
@@ -5469,6 +5684,379 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const media = (await cap(makeMsg('good', 'resolve'))) as { mimetype: string; data: string };
     expect(media.data).toBe(Buffer.from('ok').toString('base64'));
     expect(calls).toEqual(['bad', 'good']);
+  });
+
+  it('never lets a per-call override raise the cap above MEDIA_DOWNLOAD_MAX_BYTES', async () => {
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1000';
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'true';
+
+    const adapter = newAdapter();
+    const downloadMedia = jest.fn(() => Promise.resolve({ mimetype: 'video/mp4', data: 'x'.repeat(2000) }));
+    const msg = { id: { _serialized: 'big' }, _data: { size: 1500, mimetype: 'video/mp4' }, ...onPage(downloadMedia) };
+    const cap = (m: unknown, override: number): Promise<unknown> =>
+      (adapter as unknown as { capInboundMediaFor: (msg: unknown, o: number) => Promise<unknown> }).capInboundMediaFor(
+        m,
+        override,
+      );
+
+    // The declared 1500 bytes is over the global 1000 cap, so the larger override must not admit it.
+    await expect(cap(msg, 5000)).resolves.toEqual(
+      expect.objectContaining({ mimetype: 'video/mp4', omitted: true, sizeBytes: 1500 }),
+    );
+    expect(downloadMedia).not.toHaveBeenCalled();
+  });
+
+  it('drops a downloaded payload over the per-call override when no size was declared', async () => {
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1000';
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'true';
+
+    const adapter = newAdapter();
+    const data = Buffer.alloc(300).toString('base64');
+    const downloadMedia = jest.fn(() => Promise.resolve({ mimetype: 'image/jpeg', data }));
+    const msg = { id: { _serialized: 'undeclared' }, _data: {}, ...onPage(downloadMedia) };
+    const cap = (m: unknown, override: number): Promise<unknown> =>
+      (adapter as unknown as { capInboundMediaFor: (msg: unknown, o: number) => Promise<unknown> }).capInboundMediaFor(
+        m,
+        override,
+      );
+
+    // Nothing declared, so the pre-gate admits it; the real 300 bytes is under the global cap but over 100.
+    await expect(cap(msg, 100)).resolves.toEqual(
+      expect.objectContaining({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 300 }),
+    );
+    expect(downloadMedia).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The cap on what the page actually decrypted. The pre-gate only sees the size the sender declares,
+ * so a message that understates it passes; downloadMediaInPage runs here against a stand-in `window`
+ * whose download returns more than that.
+ */
+describe('WhatsAppWebJsAdapter inbound media measured in the page', () => {
+  const g = globalThis as unknown as { window?: unknown };
+  const ENV_KEYS = ['MEDIA_DOWNLOAD_MAX_BYTES', 'MEDIA_DOWNLOAD_ENABLED'];
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved = {};
+    ENV_KEYS.forEach(k => (saved[k] = process.env[k]));
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1000';
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'true';
+    runInPage.mockClear();
+  });
+  afterEach(() => {
+    ENV_KEYS.forEach(k => {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    });
+    delete g.window;
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * A page holding message `M1`, whose decrypted media is `bytes` long; returns the encoder spy. `stage` is
+   * the media stage before the download, `resolvedStage` the one the page's own resolve step leaves.
+   */
+  function pageServing(
+    bytes: number,
+    page: { stage?: string; resolvedStage?: string; decrypt?: () => Promise<ArrayBuffer> } = {},
+  ): jest.Mock {
+    const toBase64 = jest.fn((buffer: ArrayBuffer) => Promise.resolve(Buffer.from(buffer).toString('base64')));
+    const pageMsg = {
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      mediaData: { mediaStage: page.stage ?? 'RESOLVED' },
+      downloadMedia: () => {
+        pageMsg.mediaData.mediaStage = page.resolvedStage ?? 'RESOLVED';
+        return Promise.resolve();
+      },
+    };
+    const decrypt = page.decrypt ?? (() => Promise.resolve(new ArrayBuffer(bytes)));
+    g.window = {
+      require: (name: string) =>
+        name === 'WAWebCollections'
+          ? {
+              Msg: {
+                get: (id: string) => (id === 'M1' ? pageMsg : undefined),
+                getMessagesById: () => Promise.resolve({ messages: [] }),
+              },
+            }
+          : { downloadManager: { downloadAndMaybeDecrypt: decrypt } },
+      WWebJS: { arrayBufferToBase64Async: toBase64 },
+    };
+    return toBase64;
+  }
+
+  // The sender declares 10 bytes, well under the 1000-byte cap, so the pre-gate lets every case through.
+  const understated = (evaluate: jest.Mock) => ({
+    id: { _serialized: 'M1' },
+    _data: { size: 10, mimetype: 'video/mp4' },
+    ...onPage(evaluate),
+  });
+  const runInPage = jest.fn((fn: (arg: unknown) => Promise<unknown>, arg: unknown) => fn(arg));
+  const cap = (msg: unknown, override?: number): Promise<unknown> =>
+    (
+      new WhatsAppWebJsAdapter({
+        sessionId: 'media-2',
+        sessionDataPath: './data/sessions',
+        puppeteer: {},
+      }) as unknown as {
+        capInboundMediaFor: (m: unknown, o?: number) => Promise<unknown>;
+      }
+    ).capInboundMediaFor(msg, override);
+
+  it('drops a payload the page decrypted over the cap before encoding it, despite a small declared size', async () => {
+    const toBase64 = pageServing(5000);
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      omitted: true,
+      sizeBytes: 5000,
+    });
+    expect(toBase64).not.toHaveBeenCalled();
+    expect(runInPage).toHaveBeenCalledWith(downloadMediaInPage, { msgId: 'M1', maxBytes: 1000 });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      'Inbound media exceeds MEDIA_DOWNLOAD_MAX_BYTES; dropped payload, kept envelope',
+      expect.objectContaining({ msgId: 'M1', sizeBytes: 5000 }),
+    );
+  });
+
+  it('checks the payload in the page against a per-call override below the global cap', async () => {
+    const toBase64 = pageServing(700);
+
+    await expect(cap(understated(runInPage), 500)).resolves.toEqual(
+      expect.objectContaining({ omitted: true, sizeBytes: 700 }),
+    );
+    expect(runInPage).toHaveBeenCalledWith(downloadMediaInPage, { msgId: 'M1', maxBytes: 500 });
+    expect(toBase64).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, { stage?: string; resolvedStage?: string }, string]>([
+    ['a page that does not offer the media yet', { stage: 'REUPLOADING' }, 'null'],
+    ['media whose resolve step fails', { stage: 'INIT', resolvedStage: 'ERROR_MISSING' }, 'undefined'],
+  ])('says why %s leaves the omitted marker', async (_case, page, answer) => {
+    pageServing(3, page);
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+
+    await expect(cap(understated(runInPage))).resolves.toEqual(expect.objectContaining({ omitted: true }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      'Inbound media download returned nothing; emitting the omitted marker',
+      expect.objectContaining({ msgId: 'M1', answer }),
+    );
+  });
+
+  it('looks the message up by an id the WhatsApp Web build stores under $1', async () => {
+    // A bare `_serialized` read sends the page an empty id, which finds no message and comes back null.
+    pageServing(3);
+    const renamed = { ...understated(runInPage), id: { $1: 'M1' } };
+
+    await expect(cap(renamed)).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      data: Buffer.alloc(3).toString('base64'),
+    });
+    expect(runInPage).toHaveBeenCalledWith(downloadMediaInPage, { msgId: 'M1', maxBytes: 1000 });
+  });
+
+  it('still inlines a payload within the cap', async () => {
+    pageServing(3);
+
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      data: Buffer.alloc(3).toString('base64'),
+    });
+  });
+
+  // The comparison in the page and the one that plans the download are each one character from the wrong one.
+  it('inlines a payload of exactly the cap and drops one a byte over it', async () => {
+    pageServing(1000);
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      data: Buffer.alloc(1000).toString('base64'),
+    });
+
+    pageServing(1001);
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      omitted: true,
+      sizeBytes: 1001,
+    });
+  });
+
+  it('drops a payload over the cap by its received length even when the page reports it small', async () => {
+    const data = Buffer.alloc(2000).toString('base64');
+    const page = jest.fn().mockResolvedValue({ mimetype: 'video/mp4', data, sizeBytes: 10 });
+
+    await expect(cap(understated(page))).resolves.toEqual(expect.objectContaining({ omitted: true, sizeBytes: 2000 }));
+  });
+
+  // The rest of the page function is whatsapp-web.js's own download; these keep its outcomes intact.
+  type PageCase = { msgId?: string; stage?: string; resolvedStage?: string; decrypt?: () => Promise<ArrayBuffer> };
+  const notFound = () => Promise.reject(Object.assign(new Error('gone'), { status: 404 }));
+  it.each<[string, PageCase, null | undefined]>([
+    ['a message the page does not hold', { msgId: 'M2' }, null],
+    ['media the phone is re-uploading', { stage: 'REUPLOADING' }, null],
+    ['media whose resolve step fails', { stage: 'INIT', resolvedStage: 'ERROR_MISSING' }, undefined],
+    ['media still fetching after the resolve step', { stage: 'INIT', resolvedStage: 'FETCHING' }, undefined],
+    ['media the server no longer has', { decrypt: notFound }, undefined],
+  ])('returns %s as upstream does', async (_case, page, expected) => {
+    const toBase64 = pageServing(5, page);
+
+    await expect(downloadMediaInPage({ msgId: page.msgId ?? 'M1', maxBytes: 1000 })).resolves.toBe(expected);
+    expect(toBase64).not.toHaveBeenCalled();
+  });
+
+  it('resolves unresolved media in the page before downloading it', async () => {
+    pageServing(5, { stage: 'INIT' });
+
+    await expect(downloadMediaInPage({ msgId: 'M1', maxBytes: 1000 })).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      sizeBytes: 5,
+      data: Buffer.alloc(5).toString('base64'),
+    });
+  });
+
+  // puppeteer rebuilds a page exception from its class name alone, and WhatsApp Web's classes are minified
+  // (`t: t`), so the page names the rejection itself, with the build it came from.
+  it('names any other download error with its WhatsApp Web build', async () => {
+    const failure = Object.assign(new Error('bad type'), { name: 'InvalidMediaFileType', status: 500 });
+    pageServing(5, { decrypt: () => Promise.reject(failure) });
+    (g.window as { Debug?: unknown }).Debug = { VERSION: '2.3000.1' };
+
+    await expect(downloadMediaInPage({ msgId: 'M1', maxBytes: 1000 })).rejects.toThrow(
+      'InvalidMediaFileType: bad type (WhatsApp Web 2.3000.1)',
+    );
+  });
+
+  // WhatsApp Web rejects with more than errors: a bare string, or an object that carries only a status
+  // (upstream reads e.status === 404), and the operator reads the warning that names it.
+  it.each([
+    ['a bare string', 'download refused', 'download refused (WhatsApp Web 2.3000.1)'],
+    ['an object with only a status', { status: 500 }, 'status 500 (WhatsApp Web 2.3000.1)'],
+    [
+      'an object with a name and a status',
+      { name: 'MediaError', status: 410 },
+      'MediaError: status 410 (WhatsApp Web 2.3000.1)',
+    ],
+    ['nothing at all', undefined, 'unknown rejection (WhatsApp Web 2.3000.1)'],
+  ])('names a rejection that is %s', async (_label, rejection, expected) => {
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+    pageServing(5, { decrypt: () => Promise.reject(rejection) });
+    (g.window as { Debug?: unknown }).Debug = { VERSION: '2.3000.1' };
+
+    await expect(downloadMediaInPage({ msgId: 'M1', maxBytes: 1000 })).rejects.toThrow(expected);
+  });
+
+  // puppeteer ships downloadMediaInPage into the page as Function#toString(), so it can reach nothing of this
+  // module: a constant or helper it closes over resolves in Node, where every test above runs it, and throws
+  // ReferenceError in the page, where every download then fails. The source is compiled from the file with the
+  // project's compiler options and run in a context holding only the page's window and AbortController. The
+  // loaded copy is not used: coverage instruments it with counters the page does not have.
+  function shippedToPage(): typeof downloadMediaInPage {
+    const root = path.join(__dirname, '..', '..', '..');
+    const { config } = ts.readConfigFile(path.join(root, 'tsconfig.json'), name => fs.readFileSync(name, 'utf8')) as {
+      config: { compilerOptions: Record<string, unknown> };
+    };
+    const { options } = ts.convertCompilerOptionsFromJson({ ...config.compilerOptions, module: 'CommonJS' }, root);
+    const file = fs.readFileSync(path.join(__dirname, 'wwebjs-messaging.ts'), 'utf8');
+    const start = file.indexOf('async function downloadMediaInPage');
+    expect(start).toBeGreaterThan(-1);
+    const compiled = ts.transpileModule(file.slice(start, file.indexOf('\n}\n', start) + 2), {
+      compilerOptions: options,
+    }).outputText;
+    // Declared alongside whatever helpers the compiler hoisted, then sent as its own text, as puppeteer does.
+    const declared = vm.runInNewContext(`${compiled}\n;downloadMediaInPage`) as { toString(): string };
+    return vm.runInNewContext(`(${declared.toString()})`, {
+      window: (globalThis as unknown as { window: unknown }).window,
+      AbortController,
+    }) as typeof downloadMediaInPage;
+  }
+
+  const clip = { mimetype: 'video/mp4', filename: 'clip.mp4' };
+  it.each<[string, number, PageCase, unknown]>([
+    ['a payload within the cap', 3, {}, { ...clip, sizeBytes: 3, data: Buffer.alloc(3).toString('base64') }],
+    ['a payload over the cap', 5000, {}, { ...clip, sizeBytes: 5000, data: '' }],
+    ['unresolved media', 3, { stage: 'INIT' }, { ...clip, sizeBytes: 3, data: Buffer.alloc(3).toString('base64') }],
+    ['a message the page does not hold', 3, { msgId: 'M2' }, null],
+    ['media the phone is re-uploading', 3, { stage: 'REUPLOADING' }, null],
+    ['media whose resolve step fails', 3, { stage: 'INIT', resolvedStage: 'ERROR_MISSING' }, undefined],
+    ['media still fetching after the resolve step', 3, { stage: 'INIT', resolvedStage: 'FETCHING' }, undefined],
+    ['media the server no longer has', 3, { decrypt: notFound }, undefined],
+  ])('reaches nothing outside the page when it runs there: %s', async (_case, bytes, page, expected) => {
+    pageServing(bytes, page);
+
+    await expect(shippedToPage()({ msgId: page.msgId ?? 'M1', maxBytes: 1000 })).resolves.toEqual(expected);
+  });
+
+  it('reaches nothing outside the page when a download fails with any other error', async () => {
+    const failure = Object.assign(new Error('boom'), { status: 500 });
+    pageServing(3, { decrypt: () => Promise.reject(failure) });
+    (g.window as { Debug?: unknown }).Debug = { VERSION: '2.3000.1' };
+
+    await expect(shippedToPage()({ msgId: 'M1', maxBytes: 1000 })).rejects.toThrow(
+      'Error: boom (WhatsApp Web 2.3000.1)',
+    );
+  });
+
+  // downloadMediaInPage copies the page side of Message#downloadMedia. The fingerprint pins the whole
+  // upstream method, comments and formatting aside, so any whatsapp-web.js release that changes it fails
+  // here; the other checks hold the copy to upstream's modules, accessors, literals and call arguments.
+  // A tree an older OpenWA install patched carries the copy's `mimetype` option and is read without it.
+  it('matches the page download of the installed whatsapp-web.js', () => {
+    const squash = (src: string) =>
+      src
+        .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/ ?([^\w$ ]) ?/g, '$1')
+        .replace(/,(?=[)}\]])/g, '');
+    const upstreamFile = fs.readFileSync(require.resolve('whatsapp-web.js/src/structures/Message.js'), 'utf8');
+    const start = upstreamFile.indexOf('async downloadMedia()');
+    const method = squash(upstreamFile.slice(start, upstreamFile.indexOf('\n    /**', start))).replace(
+      'type:msg.type,mimetype:msg.mimetype,signal:',
+      'type:msg.type,signal:',
+    );
+    const upstream = method.slice(method.indexOf('async(msgId)=>'), method.indexOf('},this.id._serialized'));
+    const ours = fs.readFileSync(path.join(__dirname, 'wwebjs-messaging.ts'), 'utf8');
+    const fn = ours.slice(ours.indexOf('export async function downloadMediaInPage'));
+    const own = squash(fn.slice(0, fn.indexOf('\n}\n'))).split('const collection=')[1] ?? '';
+    const members = (src: string) => [...new Set([...src.matchAll(/(?<!\.)\.([A-Za-z_]\w*)/g)].map(m => m[1]))].sort();
+    const literals = (src: string) => [...new Set([...src.matchAll(/'(\w+)'/g)].map(m => m[1]))].sort();
+    const call = (src: string, name: string) =>
+      (new RegExp(`\\.${name}\\(\\{[^}]*\\}\\)`).exec(src)?.[0] ?? '').replace(/downloadQpl:\w+/, 'downloadQpl:qpl');
+
+    expect(start).toBeGreaterThan(-1);
+    expect(createHash('sha256').update(method).digest('hex')).toBe(
+      'f70f7cd8393bc60149745b7901bb96eece28a2940eaee4725e71ce615cf9ec73',
+    );
+    expect(literals(own)).toEqual(literals(upstream));
+    // The copy measures the decrypted length instead of reporting the declared `size`, and names a
+    // rejection from its `name`, class, `message`, `status` and the page's `Debug.VERSION`.
+    expect(members(own)).toEqual(
+      [
+        ...members(upstream).filter(m => m !== 'size'),
+        'byteLength',
+        'maxBytes',
+        'msgId',
+        'sizeBytes',
+        'name',
+        'message',
+        'constructor',
+        'Debug',
+        'VERSION',
+      ].sort(),
+    );
+    expect(call(own, 'downloadMedia')).toBe(call(upstream, 'downloadMedia'));
+    expect(call(own, 'downloadAndMaybeDecrypt')).toBe(
+      call(upstream, 'downloadAndMaybeDecrypt').replace('type:msg.type,', 'type:msg.type,mimetype:msg.mimetype,'),
+    );
   });
 });
 
@@ -5553,7 +6141,23 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
 
     client.emit('message_ack', { id: { _serialized: 'ACKED_MSG' } }, 3);
 
-    expect(onMessageAck).toHaveBeenCalledWith('ACKED_MSG', expect.any(String));
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_MSG', expect.any(String), undefined);
+  });
+
+  it('derives the acked message chat as Message._getChatId does', () => {
+    // Acks ride outbound messages, so the chat is the recipient; the direction flag keeps an
+    // inbound-shaped payload on its sender, the same derivation the revoked handler uses.
+    const { onMessageAck, client } = wireAckHandler();
+
+    client.emit(
+      'message_ack',
+      { id: { _serialized: 'ACKED_OUT' }, fromMe: true, from: 'me@c.us', to: '120363000@g.us' },
+      3,
+    );
+    client.emit('message_ack', { id: { _serialized: 'ACKED_IN' }, fromMe: false, from: '621@c.us', to: 'me@c.us' }, 2);
+
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_OUT', expect.any(String), '120363000@g.us');
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_IN', expect.any(String), '621@c.us');
   });
 
   it('reads a renamed `$1` id when the dependency has not normalized it', () => {
@@ -5563,7 +6167,7 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
 
     client.emit('message_ack', { id: { $1: 'ACKED_RENAMED' } }, 3);
 
-    expect(onMessageAck).toHaveBeenCalledWith('ACKED_RENAMED', expect.any(String));
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_RENAMED', expect.any(String), undefined);
   });
 
   it('drops an ack whose id cannot be read instead of passing undefined on', () => {
@@ -5603,7 +6207,7 @@ describe('WhatsAppWebJsAdapter createGroup (not available on this engine)', () =
   it('refuses before the engine is ready, like every other guarded method', async () => {
     const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
 
-    await expect(adapter.createGroup('team', ['628123456789@c.us'])).rejects.toBeDefined();
+    await expect(adapter.createGroup('team', ['628123456789@c.us'])).rejects.toBeInstanceOf(EngineNotReadyError);
   });
 });
 
@@ -6619,7 +7223,8 @@ describe('WhatsAppWebJsAdapter group join + settings + own profile', () => {
 
     // The nine write routes that previously threw a bare Error('Chat is not a group') for a
     // non-group id (surfacing as an opaque 500) now share this guard: unknown id, 1:1 id and
-    // status id are all GroupNotFoundError (404), like the guarded settings writes above.
+    // status id are all GroupNotFoundError (404), like the guarded settings writes above. The
+    // membership-request approve/reject writes went straight to the page and answered 500 the same way.
     it.each([
       ['addParticipants', (a: WhatsAppWebJsAdapter) => a.addParticipants('628111@c.us', ['628222@c.us'])],
       ['removeParticipants', (a: WhatsAppWebJsAdapter) => a.removeParticipants('628111@c.us', ['628222@c.us'])],
@@ -6630,6 +7235,16 @@ describe('WhatsAppWebJsAdapter group join + settings + own profile', () => {
       ['setGroupDescription', (a: WhatsAppWebJsAdapter) => a.setGroupDescription('628111@c.us', 'New description')],
       ['getGroupInviteCode', (a: WhatsAppWebJsAdapter) => a.getGroupInviteCode('628111@c.us')],
       ['revokeGroupInviteCode', (a: WhatsAppWebJsAdapter) => a.revokeGroupInviteCode('628111@c.us')],
+      ['approveGroupMembershipRequests', (a: WhatsAppWebJsAdapter) => a.approveGroupMembershipRequests('628111@c.us')],
+      ['rejectGroupMembershipRequests', (a: WhatsAppWebJsAdapter) => a.rejectGroupMembershipRequests('628111@c.us')],
+      [
+        'approveGroupMembershipRequests (named)',
+        (a: WhatsAppWebJsAdapter) => a.approveGroupMembershipRequests('628111@c.us', ['628222@c.us']),
+      ],
+      [
+        'rejectGroupMembershipRequests (named)',
+        (a: WhatsAppWebJsAdapter) => a.rejectGroupMembershipRequests('628111@c.us', ['628222@c.us']),
+      ],
     ])('%s answers 404 (GroupNotFoundError) when the id is not a group', async (_name, call) => {
       const getChatById = jest.fn().mockResolvedValue({ isGroup: false });
       await expect(call(readyAdapter({ getChatById }))).rejects.toBeInstanceOf(GroupNotFoundError);
@@ -7414,6 +8029,34 @@ describe('WhatsAppWebJsAdapter honest outcomes (no phantom success)', () => {
         (client as EventEmitter).emit('ready');
         expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
         expect(onActionRequired).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    // A page navigation re-runs the inject, which fires 'authenticated' and then 'ready' again.
+    it('stays ACTION_REQUIRED through a re-inject and arms no readiness deadline', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, evaluate, client } = promoteToReady();
+
+        (client as EventEmitter).emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+        for (let i = 0; i < 5; i++) {
+          evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+          await jest.advanceTimersByTimeAsync(5100);
+        }
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        const { reconcile: deadline } = adapter as unknown as { reconcile: { scheduleReadyReconcile: () => void } };
+        const reconcile = jest.spyOn(deadline, 'scheduleReadyReconcile');
+
+        (client as EventEmitter).emit('authenticated');
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        (client as EventEmitter).emit('ready');
+        await jest.advanceTimersByTimeAsync(0);
+
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        expect(reconcile).not.toHaveBeenCalled();
       } finally {
         jest.useRealTimers();
       }
@@ -8455,12 +9098,17 @@ describe('WhatsAppWebJsAdapter raw-id extraction hardening', () => {
   it('getChatsByLabel skips an undefined entry (deleted chat behind the label) instead of a 500', async () => {
     const getChatsByLabelId = jest
       .fn()
-      .mockResolvedValue([undefined, { id: { _serialized: '628111@c.us' }, name: 'Kept', isGroup: false }, { id: {} }]);
+      .mockResolvedValue([
+        undefined,
+        { id: { _serialized: '628111@c.us' }, name: 'Kept', isGroup: false, lastMessage: { type: 'image' } },
+        { id: {} },
+      ]);
 
     const result = await readyAdapter({ getChatsByLabelId }).getChatsByLabel('7');
 
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe('628111@c.us');
+    expect(result[0].lastMessageType).toBe('image');
   });
 
   // getNumberId returns a raw page-context Wid; on a WA Web build that renamed _serialized to $1,

@@ -34,7 +34,7 @@ describe('invokeTool', () => {
     expect(out).toEqual({ got: 5 });
   });
 
-  it('refuses a chat-restricted key (chat-scoped tool arguments are a later slice)', async () => {
+  it('refuses a chat-restricted key on a tool that declares no chat scope', async () => {
     const a = auth({ allowedChats: ['123@g.us'] });
     await expect(invokeTool(readTool, { n: 1 }, 'rawkey', a as unknown as AuthService)).rejects.toBeInstanceOf(
       ForbiddenException,
@@ -45,6 +45,21 @@ describe('invokeTool', () => {
     await expect(invokeTool(readTool, { n: 'x' }, 'rawkey', auth() as unknown as AuthService)).rejects.toBeInstanceOf(
       BadRequestException,
     );
+  });
+
+  // PostgreSQL rejects U+0000 in every text parameter, so an argument holding one failed the tool's
+  // query or write as an internal error.
+  it('refuses a NUL character anywhere in the input before the handler runs', async () => {
+    const handler = jest.fn();
+    const tool: ToolDescriptor = {
+      ...readTool,
+      inputSchema: z.object({ chatId: z.string(), vars: z.record(z.string(), z.string()) }),
+      handler,
+    };
+    await expect(
+      invokeTool(tool, { chatId: 'a@c.us', vars: { name: 'x\u0000' } }, 'rawkey', auth() as unknown as AuthService),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it('passes sessionId from input to validateApiKey when sessionScoped', async () => {

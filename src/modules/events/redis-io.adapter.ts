@@ -48,7 +48,7 @@ export function wsRedisOptions(): RedisOptions {
  *
  * Failure posture: if the pub/sub clients cannot be created the server falls back to the in-memory
  * adapter — the local node keeps working, only cross-node fan-out is lost — rather than refusing to
- * boot. A Redis outage after boot is ioredis's problem to retry; the adapter recovers on reconnect.
+ * boot. A Redis outage, at boot or after it, is ioredis's problem to retry; the adapter recovers on reconnect.
  */
 export class RedisIoAdapter extends IoAdapter {
   private pubClient?: Redis;
@@ -64,7 +64,11 @@ export class RedisIoAdapter extends IoAdapter {
 
     try {
       const pubClient = new Redis(wsRedisOptions());
-      const subClient = pubClient.duplicate();
+      // The adapter issues its SUBSCRIBE/PSUBSCRIBE once, at construction. With a bounded per-request
+      // retry, an outage at boot flushes them before Redis is ever reached, and ioredis only replays
+      // subscriptions the server confirmed, so the replica would never subscribe. This connection
+      // carries nothing else, so keep its commands queued until the first connect.
+      const subClient = pubClient.duplicate({ maxRetriesPerRequest: null });
       for (const [name, client] of [
         ['pub', pubClient],
         ['sub', subClient],
@@ -100,7 +104,9 @@ export class RedisIoAdapter extends IoAdapter {
     // Socket.IO's adapters unsubscribe from their Redis channels as the server closes. Tearing the
     // clients down FIRST left those unsubscribes to be issued on dead clients, and each rejection
     // surfaced as an unhandled rejection — a handful of ERROR lines on every graceful shutdown, for
-    // a shutdown that had in fact gone fine. Close the server first, then release the pair.
+    // a shutdown that had in fact gone fine. Close the server first, then release the pair. Under
+    // forceCloseConnections Nest skips the server close when the socket.io server shares the HTTP
+    // server, so only the pub/sub pair is released here and the HTTP close tears the sockets down.
     await super.close(server);
     await Promise.allSettled([this.quitClient(this.pubClient), this.quitClient(this.subClient)]);
     this.pubClient = undefined;

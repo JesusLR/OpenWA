@@ -56,7 +56,7 @@ RUN npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:2785/api/health/ready || exit 1
+    CMD curl -f "http://localhost:${PORT:-2785}/api/health/ready" || exit 1
 
 # dumb-init is PID 1; the entrypoint runs as root, fixes /app/data ownership, then drops to the
 # openwa user with gosu before it execs the command.
@@ -68,6 +68,12 @@ The image deliberately has no `USER openwa` directive and no `chown -R` over `/a
 walks every production dependency (#1045), so the entrypoint re-owns only the writable data volume
 and then drops privileges. Chromium comes from Chrome for Testing on amd64 and from Debian's
 `chromium` package on arm64; see the `Dockerfile` for the multi-arch build.
+
+The healthcheck probes the `PORT` of the container environment, falling back to 2785. To run the
+image on another port, pass `PORT` as an environment variable (`docker run -e PORT=8080 ...`): the
+probe never reads a mounted `.env` or `data/.env.generated`, so a `PORT` set only in one of those
+files moves the app but not the probe, and the container stays `unhealthy`. Boot refuses a `PORT`
+with surrounding whitespace, which the probe URL would carry verbatim.
 
 ### Docker Compose (Development)
 
@@ -161,6 +167,9 @@ version: '3.8'
 services:
   app:
     image: ghcr.io/rmyndharis/openwa:latest
+    # Teardown takes up to 63 s with every datastore on; raise this by the amount SHUTDOWN_DELAY_MS or
+    # WEBHOOK_SHUTDOWN_DRAIN_MS exceeds its default, or Docker's 10 s default kills the container mid-teardown.
+    stop_grace_period: 75s
     deploy:
       replicas: 1
       resources:
@@ -372,7 +381,7 @@ LOG_FORMAT=json
 # DATABASE_NAME=openwa
 # DATABASE_USERNAME=user
 # DATABASE_PASSWORD=pass
-# DATABASE_POOL_SIZE=20
+# DATABASE_POOL_SIZE=10
 # DATABASE_SSL=false
 
 # ===========================================
@@ -383,6 +392,8 @@ LOG_FORMAT=json
 # chat-media/<sessionId>/; media this account sent also needs CHAT_MEDIA_ARCHIVE_OUTBOUND=true.
 # With the archive off, chat media stays inline on the message row (up to MEDIA_DOWNLOAD_MAX_BYTES),
 # where GET /api/sessions/:sessionId/messages/:chatId/:messageId/media still serves it.
+# With the archive on, the row keeps its inline copy too unless MESSAGE_INLINE_MEDIA=archive, which
+# makes the store the only copy of archived media: back it up alongside the database.
 # On S3 every key sits under the S3_KEY_PREFIX root (default media/, so media/chat-media/...).
 # While S3 has not been reachable since boot, or its credentials are missing, files go to
 # STORAGE_LOCAL_PATH instead.
@@ -479,11 +490,14 @@ WEBHOOK_DISPATCH_MAX_QUEUED=1000
 # admitted before it (running, parked, or in their retries) are not counted. The direct delivery
 # used when Redis rejects an enqueue is not capped. Queued, it applies to every job attempt
 # that starts afterwards, including retries and jobs already waiting (the rest wait in the delayed
-# set without spending an attempt); only an attempt already running is not counted. The failing
-# state and the cap are held per process, not per cluster.
+# set without spending an attempt, each wait doubling up to 64 times WEBHOOK_RETRY_DELAY (at
+# least 1 s), plus up to as much again in jitter); only an attempt already running is not counted.
+# The failing state and the cap are held per process, not per cluster.
 # The first 2xx from the webhook lifts it. With the queue disabled, a session parks at most a
 # quarter of WEBHOOK_DISPATCH_MAX_QUEUED behind that limit and sheds the rest, so other sessions
-# keep room.
+# keep room. Each running, parked or backoff-waiting inline delivery holds its event's inline media
+# (up to 4/3 x WEBHOOK_MEDIA_INLINE_MAX_BYTES as base64), about 1.3 GiB per process at the defaults
+# when every slot is taken; lower these caps or enable the queue to reduce it.
 # WEBHOOK_DEGRADED_SESSION_CONCURRENCY=
 # Delivery attempts (total, including the first) are set per webhook with the retryCount API field (default 3, range 0-5).
 
@@ -531,8 +545,9 @@ export default () => ({
       .map(proxy => proxy.trim())
       .filter(Boolean),
   },
-  // Session data path and Puppeteer both live under `engine` — there is no top-level
-  // `session` or `puppeteer` key.
+  // Session data path and Puppeteer both live under `engine`; there is no top-level `puppeteer`
+  // key, and the top-level `session` (ownership leases) and `sessions` (concurrency cap) blocks do
+  // not hold the data path.
   engine: {
     type: process.env.ENGINE_TYPE || 'whatsapp-web.js',
     sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
@@ -997,9 +1012,9 @@ seen, so keep new renderers on that composition.
 > and still means "the process is alive". Alert on `openwa_stats_available == 0` for the degradation itself;
 > an alert written as `openwa_sessions_active == 0` would never fire for it, and one written with `absent()`
 > would. Because of the two caches, `openwa_stats_available` can keep reporting 1, and the series their last
-> values, for up to `STATS_CACHE_TTL_MS` + 5 s after the data database fails, so give an alert on it a `for:`
-> at least that long. `STATS_CACHE_TTL_MS=0` makes the signal live at the cost of a full overview query per
-> render.
+> values, for up to `STATS_CACHE_TTL_MS` + 5 s after the data database fails, so expect an alert on it to fire
+> up to that much later; a `for:` adds to that delay rather than offsetting it. `STATS_CACHE_TTL_MS=0` makes
+> the signal live at the cost of a full overview query per render.
 
 ### Grafana Dashboard Definition
 
@@ -1196,6 +1211,7 @@ multiple replicas against a shared session volume corrupt WhatsApp auth. Run exa
 instance per session-data volume (`replicas: 1`). Session claims and leases ship; the rest of the design
 that would be required to scale out is documented — as a future design sketch, not a shipped feature —
 in [13 - Horizontal Scaling Guide](./13-horizontal-scaling.md).
+
 ---
 
 <div align="center">

@@ -10,12 +10,14 @@ import {
   Param,
   All,
   Req,
+  Injectable,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { NestFactory } from '@nestjs/core';
 import request from 'supertest';
 import { App } from 'supertest/types';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { request as httpRequest } from 'http';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -23,6 +25,7 @@ import { configureApp } from '../src/configure-app';
 import { applyGlobalValidation } from '../src/config/app-validation';
 import { DASHBOARD_CSP_NONCE_PLACEHOLDER } from '../src/config/dashboard-csp';
 import { ActiveKeyIndex } from '../src/modules/auth/active-key-index';
+import { ShutdownService } from '../src/common/services/shutdown.service';
 import { documentErrorResponses, ERROR_RESPONSE_SCHEMA } from '../src/config/swagger.config';
 
 /**
@@ -73,13 +76,16 @@ class HttpSurfaceModule {}
 
 // A stand-in for the bundled document: the real dashboard/index.html carries the placeholder in a
 // meta element, which Plugins.tsx reads to copy the nonce onto its sandboxed iframe's scripts.
-const distDir = join(mkdtempSync(join(tmpdir(), 'openwa-surface-')), 'dashboard', 'dist');
+const surfaceRoot = mkdtempSync(join(tmpdir(), 'openwa-surface-'));
+const distDir = join(surfaceRoot, 'dashboard', 'dist');
 mkdirSync(distDir, { recursive: true });
 writeFileSync(
   join(distDir, 'index.html'),
   `<!doctype html><html><head><meta name="openwa-csp-nonce" content="${DASHBOARD_CSP_NONCE_PLACEHOLDER}" />` +
     `</head><body><script nonce="${DASHBOARD_CSP_NONCE_PLACEHOLDER}"></script></body></html>`,
 );
+// The e2e globalTeardown sweeps only openwa-e2e-* entries, so this suite removes its own fixture.
+afterAll(() => rmSync(surfaceRoot, { recursive: true, force: true }));
 
 describe('production HTTP surface (configureApp)', () => {
   let app: INestApplication<App>;
@@ -149,6 +155,31 @@ describe('production HTTP surface (configureApp)', () => {
       .send({});
 
     expect(res.headers['access-control-allow-origin']).toBe('https://allowed.example');
+  });
+
+  // Neither send-idempotency header is CORS-safelisted: a browser sends Idempotency-Key only if the preflight
+  // lists it, and reads Idempotent-Replayed only if the response exposes it.
+  const listed = (header: string | undefined): string[] => (header ?? '').split(',').map(name => name.trim());
+
+  it('lists Idempotency-Key in the preflight answer for an allowed Origin', async () => {
+    const res = await request(app.getHttpServer())
+      .options('/api/echo')
+      .set('Origin', 'https://allowed.example')
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'idempotency-key');
+
+    expect(res.headers['access-control-allow-origin']).toBe('https://allowed.example');
+    expect(listed(res.headers['access-control-allow-headers'])).toContain('Idempotency-Key');
+  });
+
+  it('exposes Idempotent-Replayed to an allowed Origin', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/api/echo')
+      .set('Content-Type', 'application/json')
+      .set('Origin', 'https://allowed.example')
+      .send({});
+
+    expect(listed(res.headers['access-control-expose-headers'])).toContain('Idempotent-Replayed');
   });
 
   it('denies a disallowed Origin by omitting the CORS headers, not by failing the request', async () => {
@@ -260,6 +291,28 @@ describe('production HTTP surface (configureApp)', () => {
     expect(ingressHits).toEqual(['DELETE /api/ingress/p/i/hook/', 'DELETE /API/ingress/p/i/hook/']);
   });
 
+  it('refuses a path or query that decodes to a NUL character before any route runs', async () => {
+    ingressHits.length = 0;
+    for (const path of ['/api/sessions/abc%00', '/api/sessions/abc?name=%00', '/api/ingress/p%00/i/hook']) {
+      const res = await request(app.getHttpServer()).get(path).set('Origin', 'https://allowed.example').expect(400);
+      expect(res.body).toMatchObject({ statusCode: 400, error: 'Bad Request' });
+      expect(res.headers['x-request-id']).toBeDefined();
+      expect(res.headers['access-control-allow-origin']).toBe('https://allowed.example');
+    }
+    expect(ingressHits).toEqual([]);
+    // %2500 decodes to the text "%00", not to a NUL, so it still reaches the route.
+    await request(app.getHttpServer()).get('/api/sessions/abc%2500').expect(200);
+  });
+
+  it('refuses a body holding a NUL character at any depth', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/api/echo')
+      .set('Content-Type', 'application/json')
+      .send({ items: [{ variables: { name: 'a\u0000b' } }] });
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ statusCode: 400, error: 'Bad Request' });
+  });
+
   it('answers a compressed body with 415 rather than charging the budget its inflated size', async () => {
     const res = await request(app.getHttpServer())
       .post('/api/echo')
@@ -353,6 +406,105 @@ describe('in-flight body budget tiers (configureApp)', () => {
       expect(keyed.status).toBe(201);
     } finally {
       held.destroy();
+    }
+  });
+});
+
+describe('requests during shutdown teardown (configureApp)', () => {
+  // Nest keeps the listener open until every destroy hook has finished, so the hook below can still
+  // reach the server: it records what a client arriving mid-teardown gets back.
+  let base = '';
+  const handled: string[] = [];
+  const duringTeardown: Record<string, request.Response> = {};
+  let slowEntered!: () => void;
+  const slowAdmitted = new Promise<void>(resolve => (slowEntered = resolve));
+  let releaseSlow!: () => void;
+  const slowReleased = new Promise<void>(resolve => (releaseSlow = resolve));
+
+  @Controller()
+  class TeardownProbeController {
+    @Get('work')
+    work() {
+      handled.push('work');
+      return { ok: true };
+    }
+
+    @Get('slow')
+    async slow() {
+      handled.push('slow');
+      slowEntered();
+      await slowReleased;
+      return { ok: true };
+    }
+
+    @Get('health/live')
+    live() {
+      return { status: 'ok' };
+    }
+  }
+
+  @Injectable()
+  class TeardownProbe implements OnModuleDestroy {
+    async onModuleDestroy() {
+      for (const path of ['/api/work', '/api/health/live']) {
+        duringTeardown[path] = await request(base).get(path).set('Connection', 'keep-alive');
+      }
+      releaseSlow();
+    }
+  }
+
+  @Module({ controllers: [TeardownProbeController], providers: [ShutdownService, TeardownProbe] })
+  class TeardownSurfaceModule {}
+
+  it('refuses new requests once teardown begins, while admitted requests and the health probes complete', async () => {
+    const app = await NestFactory.create<INestApplication<App>>(TeardownSurfaceModule, {
+      bodyParser: false,
+      logger: false,
+    });
+    configureApp(app);
+    applyGlobalValidation(app);
+    await app.listen(0, '127.0.0.1');
+    base = await app.getUrl();
+
+    let exited!: () => void;
+    const exitCalled = new Promise<void>(resolve => (exited = resolve));
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation((() => exited()) as never);
+    let teardownStarted = false;
+    try {
+      const shutdown = app.get(ShutdownService);
+      shutdown.setShutdownCallback(() => app.close());
+
+      // The drain: readiness reports 503 so the balancer stops routing, but traffic is still served.
+      shutdown.markShuttingDown();
+      expect((await request(base).get('/api/work')).status).toBe(200);
+
+      const slow = request(base)
+        .get('/api/slow')
+        .then(res => res);
+      await slowAdmitted;
+      teardownStarted = true;
+      shutdown.shutdown(0);
+      await exitCalled;
+
+      const refused = duringTeardown['/api/work'];
+      expect(refused.status).toBe(503);
+      expect(refused.headers.connection).toBe('close');
+      expect(refused.body).toEqual({
+        statusCode: 503,
+        message: 'Server is shutting down',
+        error: 'Service Unavailable',
+      });
+      // The handler never ran for the refused request: only the drain-time call and the slow one did.
+      expect(handled).toEqual(['work', 'slow']);
+      expect(duringTeardown['/api/health/live'].status).toBe(200);
+      expect((await slow).status).toBe(200);
+    } finally {
+      exitSpy.mockRestore();
+      // A failure before teardown would otherwise leave the listener and the slow handler open.
+      if (!teardownStarted) {
+        releaseSlow();
+        await app.close();
+      }
     }
   });
 });

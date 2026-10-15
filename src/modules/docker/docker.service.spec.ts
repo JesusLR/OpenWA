@@ -82,7 +82,7 @@ describe('DockerService.buildDockerOptions', () => {
 });
 
 describe('DockerService.stopManagedService (stop-only teardown)', () => {
-  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.4.2 never reads its
+  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.5.0 never reads its
   // DELETE env flag (deletion is admitted only as an undocumented side effect of its POST
   // method gate), so the code must not depend on container.remove() at all.
   const makeService = (container: unknown) => {
@@ -238,14 +238,20 @@ describe('DockerService.onModuleInit', () => {
 
   it('logs a warning but still resolves when bootstrap orchestration fails', async () => {
     process.env.REDIS_BUILTIN = 'true';
-    DockerMock.mockImplementation(() => ({
+    const docker = {
       ...happyDocker(),
       pull: (_image: string, cb: (err: Error | null, stream: null) => void) => cb(new Error('pull denied'), null),
-    }));
+    };
+    DockerMock.mockImplementation(() => docker);
     const service = new DockerService();
+    const warn = jest
+      .spyOn((service as unknown as { logger: { warn: () => void } }).logger, 'warn')
+      .mockImplementation(() => undefined);
 
     await expect(service.onModuleInit()).resolves.toBeUndefined();
     expect(service.isDockerAvailable()).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[Bootstrap Orchestration] Issues'));
+    expect(docker.createContainer).not.toHaveBeenCalled();
   });
 });
 
@@ -271,6 +277,7 @@ describe('prestartBuiltinDatabase', () => {
     expect(docker.listContainers).toHaveBeenCalledWith({
       all: true,
       filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
     });
     expect(container.start).toHaveBeenCalledTimes(1);
   });
@@ -407,6 +414,7 @@ describe('DockerService.getContainerByService label match and guard rails', () =
     expect(listContainers).toHaveBeenCalledWith({
       all: true,
       filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
     });
     expect(getContainer).toHaveBeenCalledWith('label-hit-1');
     expect(result).toEqual({ id: 'label-hit-1' });

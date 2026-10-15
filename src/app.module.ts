@@ -10,7 +10,7 @@ import { createThrottlerRedisClient } from './common/throttler/throttler-redis.c
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { createBootDataSource } from './database/pg-boot-migrations';
-import { createMainDataSource, mainConnectionOptions } from './database/main-connection';
+import { createMainDataSource, mainConnectionOptions, SQLITE_BUSY_TIMEOUT_MS } from './database/main-connection';
 import { SessionModule } from './modules/session/session.module';
 import { MessageModule } from './modules/message/message.module';
 import { TemplateModule } from './modules/template/template.module';
@@ -143,7 +143,8 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
       inject: [ConfigService],
       // The postgres branch runs its boot migrations under a cross-replica advisory lock inside
       // this factory (see pg-boot-migrations.ts) instead of TypeORM's unsynchronized built-in
-      // migrationsRun; the sqlite branches keep the library's default construction + initialize.
+      // migrationsRun; SQLite with synchronize is initialized there too, to deduplicate terminal webhook
+      // failures before the schema sync, and other sqlite options keep the library's default path.
       dataSourceFactory: createBootDataSource,
       useFactory: (configService: ConfigService) => {
         const dbType = configService.get<'sqlite' | 'postgres'>('dataDatabase.type', 'sqlite');
@@ -223,6 +224,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
           name: 'data',
           type: 'better-sqlite3' as const,
           database: configService.get<string>('dataDatabase.database', './data/openwa.sqlite'),
+          timeout: SQLITE_BUSY_TIMEOUT_MS,
           synchronize,
           migrationsRun: !synchronize,
         };

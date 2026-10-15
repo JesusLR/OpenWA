@@ -1,6 +1,6 @@
 import { ConflictException } from '@nestjs/common';
 import { SessionTakeoverService } from './session-takeover.service';
-import { SessionStoppedException } from '../session/session-engine-controls';
+import { ServerShuttingDownException, SessionStoppedException } from '../session/session-engine-controls';
 import { Session, SessionStatus } from '../session/entities/session.entity';
 import type { SessionService } from '../session/session.service';
 import type { SessionOwnershipService } from '../session/session-ownership.service';
@@ -27,7 +27,7 @@ describe('SessionTakeoverService', () => {
 
   const build = (
     rows: Session[],
-    opts: { autoStart?: boolean; startImpl?: jest.Mock } = {},
+    opts: { autoStart?: boolean; startImpl?: jest.Mock; maxConcurrent?: number; slotHolders?: number } = {},
   ): {
     svc: SessionTakeoverService;
     start: jest.Mock;
@@ -40,10 +40,12 @@ describe('SessionTakeoverService', () => {
         ({
           features: { autoStartSessions: opts.autoStart ?? true },
           'session.takeoverSweepMs': 30_000,
+          'sessions.maxConcurrent': opts.maxConcurrent,
         })[key as 'features'] ?? def,
     } as unknown as ConfigService;
+    const hasStartCapacity = jest.fn((max: number) => (opts.slotHolders ?? 0) < max);
     const svc = new SessionTakeoverService(
-      { start, markLapsedDisconnected } as unknown as SessionService,
+      { start, markLapsedDisconnected, hasStartCapacity } as unknown as SessionService,
       {
         lapsedHeldByOthers: jest.fn().mockResolvedValue(rows),
         leaseTtlMs: 60_000,
@@ -135,10 +137,33 @@ describe('SessionTakeoverService', () => {
     const { svc } = build([lapsed({ name: 'raced' }), lapsed({ name: 'ours' })], { startImpl: start });
 
     const sweep = svc.sweep();
-    await jest.advanceTimersByTimeAsync(2100); // the inter-launch stagger
+    // The second launch waits out the inter-launch stagger, to the millisecond.
+    await jest.advanceTimersByTimeAsync(1999);
+    expect(start).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(start).toHaveBeenCalledTimes(2);
     await sweep;
 
     expect(start.mock.calls).toEqual([['id-raced'], ['id-ours']]);
+  });
+
+  // A start the cap refuses still claims the lapsed lease first, and the refusal then releases it to
+  // nobody: no peer adopts a row without a holder, so the session would stay down. A node at its cap
+  // leaves the lease alone for a peer with room.
+  it('adopts nothing while this node is at MAX_CONCURRENT_SESSIONS', async () => {
+    const { svc, start } = build([lapsed({ name: 'a' })], { maxConcurrent: 1, slotHolders: 1 });
+
+    await svc.sweep();
+
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('adopts while this node is still below MAX_CONCURRENT_SESSIONS', async () => {
+    const { svc, start } = build([lapsed({ name: 'a' })], { maxConcurrent: 2, slotHolders: 1 });
+
+    await svc.sweep();
+
+    expect(start).toHaveBeenCalledWith('id-a');
   });
 
   it('a session stopped after the sweep read it is logged as skipped, not as a lost claim race', async () => {
@@ -153,16 +178,41 @@ describe('SessionTakeoverService', () => {
     ]);
   });
 
+  it('a start refused by shutdown ends the sweep quietly instead of logging a failed takeover', async () => {
+    const start = jest.fn().mockRejectedValueOnce(new ServerShuttingDownException()).mockResolvedValue({});
+    const { svc } = build([lapsed({ name: 'late' }), lapsed({ name: 'next' })], { startImpl: start });
+    const logger = (svc as unknown as { logger: { warn: jest.Mock; debug: jest.Mock } }).logger;
+    const warn = jest.spyOn(logger, 'warn');
+    const debug = jest.spyOn(logger, 'debug');
+
+    await svc.sweep();
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(warn).not.toHaveBeenCalled();
+    expect(debug.mock.calls.map(([message]) => message as string)).toEqual([
+      'Takeover of session late abandoned: shutting down',
+    ]);
+  });
+
   it('a non-conflict start failure is logged and does not abort the rest of the sweep', async () => {
     jest.useFakeTimers();
     const start = jest.fn().mockRejectedValueOnce(new Error('chromium died')).mockResolvedValueOnce({});
     const { svc } = build([lapsed({ name: 'boom' }), lapsed({ name: 'fine' })], { startImpl: start });
+    const logger = (svc as unknown as { logger: { warn: jest.Mock; debug: jest.Mock } }).logger;
+    const warn = jest.spyOn(logger, 'warn');
+    const debug = jest.spyOn(logger, 'debug');
 
     const sweep = svc.sweep();
-    await jest.advanceTimersByTimeAsync(2100);
+    await jest.advanceTimersByTimeAsync(2000); // the inter-launch stagger
     await expect(sweep).resolves.toBeUndefined();
 
     expect(start).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      'Takeover start failed for session boom',
+      expect.objectContaining({ sessionId: 'id-boom', error: 'chromium died' }),
+    );
+    expect(debug).not.toHaveBeenCalled();
   });
 
   it('the AUTO_START_SESSIONS opt-out arms the sweep but starts nothing', async () => {

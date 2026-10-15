@@ -40,6 +40,7 @@
     "hoursAgo_other": "לפני {{count}} שעות",
     "hoursAgo_two": "לפני שעתיים",
     "optional": "אופציונלי",
+    "fieldTooLong": "מוגבל ל-{{max}} תווים (כרגע {{count}}).",
     "language": "שפה",
     "back": "חזרה",
     "next": "הבא",
@@ -100,6 +101,7 @@
     "loadingMessages": "טוען הודעות...",
     "loadingOlderMessages": "טוען הודעות ישנות יותר...",
     "loadOlderMessagesError": "טעינת ההודעות הישנות נכשלה. גלול למעלה כדי לנסות שוב.",
+    "loadOlderMessagesRetryHint": "גלול למעלה כדי לנסות שוב.",
     "noMessagesInChat": "אין הודעות עדיין. שלח את ההודעה הראשונה כדי להתחיל!",
     "downloadDocument": "הורדת מסמך",
     "actions": {
@@ -128,7 +130,6 @@
       "unknownType": "סוג לא ידוע"
     },
     "you": "אתה",
-    "youPrefix": "אתה: ",
     "yesterday": "אתמול",
     "attachTitle": "שליחת קובץ / תמונה",
     "emojiTitle": "בחירת אימוג'י",
@@ -359,7 +360,7 @@
       "configured": "{{host}} ({{type}})",
       "noProxy": "לא הוגדר proxy",
       "hasCredentials": "פרטי הגישה שמורים אך אינם מוצגים. כדי לשנות אותם יש להזין כתובת URL מלאה.",
-      "hint": "השינויים חלים בהפעלה הבאה של הסשן, ולא על חיבור פעיל. ה-proxy חייב להיות אמיתי ונגיש: ערך שאינו נגיש חוסם את קבלת ה-QR, וההפעלה מחזירה 504.",
+      "hint": "השינויים חלים בהפעלה הבאה של הסשן, ולא על חיבור פעיל. ה-proxy חייב להיות אמיתי ונגיש: ערך שאינו נגיש חוסם את קבלת ה-QR. ב-whatsapp-web.js ההפעלה מחזירה 504, וב-Baileys ההפעלה מצליחה והסשן ממשיך לנסות שוב.",
       "createHint": "נדרש רק כשהרשת שלכם לא מצליחה להגיע ישירות ל-WhatsApp. חייב להיות proxy אמיתי ונגיש.",
       "invalidUrl": "יש להזין כתובת URL תקינה של proxy מסוג http, https, socks4 או socks5.",
       "saveSuccessTitle": "ה-proxy נשמר",
@@ -500,11 +501,9 @@
       "valueLabel": "ערך סינון"
     },
     "columns": {
-      "url": "כתובת URL",
       "events": "אירועים",
       "session": "Session",
-      "status": "סטטוס",
-      "actions": "פעולות"
+      "status": "סטטוס"
     },
     "empty": {
       "title": "לא הוגדרו Webhooks",
@@ -544,6 +543,7 @@
       "session.reconnect_loop": "כאשר Session נכשל שוב ושוב בהתחברות מחדש",
       "session.restriction": "כאשר WhatsApp מגביל את החשבון או מסיר הגבלה",
       "presence.update": "כאשר צ'אט במעקב מתחבר, מקליד או מתנתק",
+      "event.response": "כאשר אורח עונה להזמנה לאירוע בוואטסאפ (מגיע, לא מגיע, אולי)",
       "group.join": "כאשר משתתפים מצטרפים לקבוצה או מתווספים אליה",
       "group.leave": "כאשר משתתפים עוזבים קבוצה או מוסרים ממנה",
       "group.update": "כאשר השם, התיאור או ההגדרות של קבוצה משתנים",
@@ -684,7 +684,6 @@
       "revoke": "ביטול"
     },
     "actions": {
-      "copy": "העתקה",
       "revoke": "ביטול",
       "delete": "מחיקה",
       "edit": "עריכת גישה"
@@ -717,8 +716,9 @@
     },
     "chats": {
       "label": "גישה לצ'אטים (אופציונלי)",
-      "hint": "צ'אט אחד בכל שורה: מזהה קבוצה שמסתיים ב-@g.us, מזהה איש קשר שמסתיים ב-@c.us או ב-@lid, או מספר טלפון. השאירו ריק לכל הצ'אטים. מפתח שמוגבל לצ'אטים יכול להשתמש רק בנתיבים הפתוחים למפתחות כאלה; ה-WebSocket של האירועים ו-MCP דוחים אותו.",
-      "invalid": "אינו מזהה צ'אט או מספר טלפון: {{value}}"
+      "hint": "צ'אט אחד בכל שורה: מזהה קבוצה שמסתיים ב-@g.us, מזהה איש קשר שמסתיים ב-@c.us או ב-@lid, או מספר טלפון. השאירו ריק לכל הצ'אטים. מפתח שמוגבל לצ'אטים יכול להשתמש רק בנתיבים הפתוחים למפתחות כאלה; הגישה שלו דרך ה-WebSocket של האירועים ו-MCP מוגבלת לצ'אטים האלה.",
+      "invalid": "אינו מזהה צ'אט או מספר טלפון: {{value}}",
+      "tooMany": "יותר מדי צ'אטים ({{count}}): מפתח יכול לכלול לכל היותר {{max}}."
     },
     "expiry": {
       "label": "תפוגה (אופציונלי)",
@@ -903,7 +903,7 @@
       "sslRejectUnauthorized": "אימות תעודת SSL",
       "sslRejectUnauthorizedDesc": "דחיית תעודות בחתימה עצמית או לא תקפות. כבה עבור Postgres מנוהל עם תעודות בחתימה עצמית (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Migrations של מסד הנתונים",
-      "migrationsStatus": "הסכמה מסונכרנת אוטומטית עם TypeORM",
+      "migrationsStatus": "Migrations ממתינים מוחלים אוטומטית בעת ההפעלה",
       "migrationsHint": "ה-Migrations מנוהלים אוטומטית. ניתן להשתמש ב-CLI ל-Migrations ידניים."
     },
     "engine": {
@@ -926,7 +926,7 @@
     "redis": {
       "title": "Redis",
       "enable": "הפעלת Redis",
-      "enableDesc": "נדרש למטמון, אחסון Sessions ותורי BullMQ",
+      "enableDesc": "משמש למטמון, לתורי BullMQ, למוני הגבלת קצב ולהפצת WebSocket בין צמתים מרובים",
       "useBuiltIn": "שימוש בקונטיינר Redis מובנה",
       "builtInDesc": "OpenWA ינהל עבורך קונטיינר Redis",
       "queueTitle": "הפעלת מערכת התורים BullMQ",
@@ -938,7 +938,7 @@
       "failed": "נכשלו",
       "viewBullMq": "פתיחת Bull MQ Dashboard",
       "disabledTitle": "Redis מושבת",
-      "disabledDesc": "יש להפעיל את Redis למטמון, אחסון Sessions ותורי הודעות BullMQ.",
+      "disabledDesc": "יש להפעיל את Redis למטמון, לתורי הודעות BullMQ, למוני הגבלת קצב ולהפצת WebSocket בין צמתים מרובים.",
       "passwordOptional": "(אופציונלי)",
       "bullMqUrlCopied": "כתובת לוח Bull MQ הועתקה",
       "bullMqUrlHint": "פתח אותו עם מפתח API מסוג ADMIN — לשונית דפדפן אינה יכולה לאמת."
@@ -1072,7 +1072,7 @@
       "healthFail": "בדיקת התקינות נכשלה",
       "healthError": "שגיאה בבדיקת תקינות",
       "savedTitle": "התצורה נשמרה",
-      "savedDesc": "נדרש אתחול שרת כדי להחיל את השינויים.",
+      "savedDesc": "השינויים נכנסים לתוקף ללא אתחול השרת.",
       "saveFailed": "השמירה נכשלה",
       "installed": "התוסף הותקן",
       "installFailed": "ההתקנה נכשלה",

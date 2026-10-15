@@ -6,12 +6,15 @@ import {
   NotFoundException,
   Optional,
   OnApplicationBootstrap,
+  OnModuleDestroy,
   OnModuleInit,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { createLogger } from '../../common/services/logger.service';
+import { ShutdownService } from '../../common/services/shutdown.service';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Not, QueryDeepPartialEntity, Repository } from 'typeorm';
+import { In, IsNull, Not, QueryDeepPartialEntity, Repository } from 'typeorm';
 import { createHash, randomUUID } from 'crypto';
 import { setTimeout } from 'node:timers/promises';
 import {
@@ -30,7 +33,9 @@ import {
   SendPacingService,
   isPacingLimitedError,
   countsTowardSendBreaker,
+  sentNothing,
   SEND_PACING_LIMITED,
+  type SettleAdmission,
 } from './send-pacing.service';
 import { SessionOwnershipService } from '../session/session-ownership.service';
 import { HookManager } from '../../core/hooks';
@@ -113,10 +118,12 @@ interface BatchExecutionState {
 const ENDED_ELSEWHERE = new Set<BatchStatus>([BatchStatus.FAILED, BatchStatus.COMPLETED]);
 
 @Injectable()
-export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap {
+export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = createLogger(BulkMessageService.name);
   private readonly processingBatches = new Map<string, boolean>(); // Track active batches for cancellation
   private inFlightBatches = 0; // count of batches currently in processBatch (memory bound, see cap above)
+  /** Set at the top of onModuleDestroy: no batch may start sending once the shutdown fail has run. */
+  private shuttingDown = false;
 
   constructor(
     @InjectRepository(MessageBatch, 'data')
@@ -134,6 +141,10 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
     // below. Absent in direct-construction unit tests, which then fall back to the shared default.
     @Optional()
     private readonly configService?: ConfigService,
+    // The drain signal, set when shutdown begins and SHUTDOWN_DELAY_MS before onModuleDestroy. Only
+    // new batches are refused on it: one accepted before the drain runs until the teardown fails it.
+    @Optional()
+    private readonly shutdownService?: ShutdownService,
   ) {}
 
   /**
@@ -177,16 +188,49 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
   }
 
   /**
+   * Fail the batches this process holds on shutdown. Shutdown releases its sessions, and a node that
+   * starts a released session is not adopting it from a lapsed lease, so it never reaps a batch left
+   * PENDING or PROCESSING here: the row would stay unfinished until that node restarts. Runs before
+   * TypeORM closes the database (onApplicationShutdown). The row is read first so the FAILED write strips
+   * its stored media payloads, as every other terminal path does. The marker is cleared only once the
+   * row is FAILED, so a run stops at its next item and records what it sent under that status.
+   * A batch whose row is still being written here is not found; the flag makes its pickup fail it.
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.shuttingDown = true;
+    for (const id of [...this.processingBatches.keys()]) {
+      try {
+        const row = await this.batchRepository.findOne({ where: { id } });
+        if (await this.failOrphanedBatch(row ?? { id })) this.processingBatches.set(id, false);
+      } catch (error) {
+        this.logger.error(`Could not mark batch ${id} FAILED on shutdown: ${String(error)}`);
+      }
+    }
+  }
+
+  /**
    * Guarded on the unfinished statuses in the UPDATE itself: the row was read before this write, and
    * a batch that finalized in between must keep its real status, progress and results. Returns
-   * whether the row was still unfinished and is now FAILED. Without `messages` (the run failed
-   * before it could read the row) the stored payloads are left as they are.
+   * whether the row was still unfinished and is now FAILED. Without `messages` (the row could not
+   * be read) the stored payloads are left as they are.
+   *
+   * `withRunState` is for the run's own failure path only: that run holds the progress, results and
+   * currentIndex of what it sent, newer than the row. A reap must not write them back, since what it
+   * read can be older than a progress write the batch's still-running node made since.
    */
-  private async failOrphanedBatch(batch: Pick<MessageBatch, 'id'> & Partial<MessageBatch>): Promise<boolean> {
+  private async failOrphanedBatch(
+    batch: Pick<MessageBatch, 'id'> & Partial<MessageBatch>,
+    withRunState = false,
+  ): Promise<boolean> {
     const set: QueryDeepPartialEntity<MessageBatch> = { status: BatchStatus.FAILED, completedAt: new Date() };
     if (batch.messages) {
       this.stripBatchMediaPayloads(batch.messages);
       set.messages = batch.messages as QueryDeepPartialEntity<MessageBatch>['messages'];
+    }
+    if (withRunState) {
+      if (batch.progress) set.progress = batch.progress;
+      if (batch.results) set.results = batch.results;
+      if (batch.currentIndex !== undefined) set.currentIndex = batch.currentIndex;
     }
     const failed = await this.batchRepository.update(
       { id: batch.id, status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) },
@@ -279,6 +323,13 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
       throw new BadRequestException(`Batch ID '${batchId}' already exists`);
     }
 
+    // Refused from the start of the drain: a batch accepted then would be failed part-sent when the
+    // teardown runs. Checked in the same turn as the registration below: a create that passes here is
+    // either seen by the shutdown fail or failed at its pickup in processBatch.
+    if (this.shuttingDown || this.shutdownService?.isShuttingDown() === true) {
+      throw new ServiceUnavailableException('The server is shutting down; retry the batch shortly');
+    }
+
     // Reject before persisting a row when too many batches are already processing, so a burst can't
     // hold an unbounded number of full message sets (base64 media included) in memory at once.
     const maxConcurrentBatches = resolveMaxConcurrentBatches();
@@ -324,7 +375,9 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
     // them, so a burst cannot all observe the same stale count and overshoot the ceiling.
     this.inFlightBatches++;
     try {
-      await this.batchRepository.save(batch);
+      // No transaction of its own: on SQLite's single shared connection the rollback of the unique
+      // violation handled below would also discard what other callers wrote while it was open.
+      await this.batchRepository.save(batch, { transaction: false });
     } catch (error) {
       this.inFlightBatches--;
       this.processingBatches.delete(batch.id);
@@ -343,9 +396,30 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
     );
 
     // Start processing asynchronously
-    this.processBatch(batch.id, true).catch(err => {
+    const pickup = this.processBatch(batch.id, true).catch(err => {
       this.logger.error(`Batch ${batchId} processing error: ${String(err)}`);
     });
+    // Teardown began during the save, so the pickup only fails the row. Awaited here, because the
+    // HTTP server's close waits for this request and the database closes after it; a detached write
+    // could find the connection gone and leave the row PENDING. Nothing was sent, so the row is then
+    // deleted and the answer is a 503: a retry of the same batchId (an SDK replaying the 503) is not
+    // refused as a duplicate of a batch that never ran. Only this process drives the batch, and the
+    // guard on startedAt keeps any row that began sending.
+    if (this.shuttingDown) {
+      await pickup;
+      const freed = await this.batchRepository.delete({ id: batch.id, startedAt: IsNull() }).then(
+        result => Boolean(result.affected),
+        (error: unknown) => {
+          this.logger.error(`Could not delete unsent batch ${batchId} on shutdown: ${String(error)}`);
+          return false;
+        },
+      );
+      throw new ServiceUnavailableException(
+        freed
+          ? 'The server is shutting down; retry the batch shortly'
+          : `The server is shutting down; batch '${batchId}' was not sent. Retry it shortly under a new batch ID`,
+      );
+    }
 
     return batch;
   }
@@ -382,8 +456,10 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
       throw new BadRequestException(`Batch '${batchId}' is already ${batch.status}`);
     }
 
-    // Signal cancellation
-    this.processingBatches.set(batch.id, false);
+    // Signal cancellation to this process's run of the batch. Only that run removes the marker, so a
+    // batch run elsewhere (or already finished here) must not get one: it would leak, and it would
+    // make a later takeover reap skip the batch.
+    if (this.processingBatches.has(batch.id)) this.processingBatches.set(batch.id, false);
 
     // Update status — guarded to the non-terminal statuses IN the UPDATE, so a batch that reached a
     // terminal state between the read above and this write is not relabelled CANCELLED after the
@@ -426,14 +502,22 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
         this.logger.log(`Batch ${batch.batchId} was cancelled before processing started; nothing was sent`);
         return;
       }
+      // Saved while the shutdown fail ran, which could not see the row yet: fail it unsent rather
+      // than start a run after this process began tearing down.
+      if (this.shuttingDown) {
+        await this.failOrphanedBatch(batch);
+        this.logger.warn(`Batch ${batch.batchId} was failed before processing started: shutting down`);
+        return;
+      }
       this.processingBatches.set(batch.id, true);
       await this.executeBatch(batch);
     } catch (error) {
       // A throw here (a DB error on the pickup read, the start transition or a progress write) would
       // leave the row PENDING or PROCESSING, and nothing else moves it on while this process lives:
       // the reapers run only at boot and on a session takeover. Best effort, since the database that
-      // just failed may fail again.
-      await this.failOrphanedBatch(batch ?? { id: batchDbId }).catch((failError: unknown) => {
+      // just failed may fail again. The row gets what this run sent, so delivered items are not
+      // reported as pending.
+      await this.failOrphanedBatch(batch ?? { id: batchDbId }, true).catch((failError: unknown) => {
         this.logger.error(`Could not mark batch ${batchDbId} FAILED after its run threw: ${String(failError)}`);
       });
       throw error;
@@ -518,6 +602,11 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
     // decision (not a delivery failure) and skips message:failed — matching the single-send path,
     // where a block is a 400 with no failure hook.
     let blockedByPlugin = false;
+    // The pacing admission's settle. Bulk writes an item's row only after the engine accepts it, so the
+    // admission is held until the engine answers, and an item that fails first gives it back, or it
+    // would refuse the next item for the hold.
+    let settleAdmission: SettleAdmission | undefined;
+    let engineAsked = false;
     try {
       // Apply template variables
       content = this.applyVariables(msg.content, msg.variables);
@@ -525,7 +614,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
       // Pacing runs BEFORE the moderation gate, matching MessageService: a send policy forbids is not
       // offered to plugins at all. A refusal is a 429 that fails THIS item (honouring stopOnError),
       // not the batch — the allowance may free up, and a batch killed outright could not resume.
-      await this.pacing.assertSendAllowed(batch.sessionId, msg.chatId);
+      settleAdmission = await this.pacing.assertSendAllowed(batch.sessionId, msg.chatId, { untilSettled: true });
 
       // Per-message moderation gate — the SAME message:sending hook single sends use, so a
       // compliance/moderation plugin sees bulk traffic too (bulk previously bypassed it entirely).
@@ -579,6 +668,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
       // pacing/plugin/media-cap throws above — and recordSendSuccess the moment it accepts. Without
       // this the breaker was blind to bulk, the highest-volume path it exists to protect.
       let messageResult;
+      engineAsked = true;
       try {
         messageResult = await this.sendMessage(engine, msg.chatId, msg.type, content);
       } catch (engineError) {
@@ -587,8 +677,12 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
         if (countsTowardSendBreaker(engineError)) {
           this.pacing.recordSendFailure(batch.sessionId);
         }
+        // A failure that may still have sent the message keeps its admission for a window from now, while
+        // the echo row lands.
+        settleAdmission?.(!sentNothing(engineError));
         throw engineError;
       }
+      settleAdmission?.(true);
       this.pacing.recordSendSuccess(batch.sessionId);
 
       result.status = BatchMessageStatus.SENT;
@@ -605,6 +699,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
 
       this.logger.debug(`Batch ${batch.batchId}: Sent message ${i + 1}/${batch.messages.length} to ${msg.chatId}`);
     } catch (error) {
+      if (!engineAsked) settleAdmission?.();
       result.status = BatchMessageStatus.FAILED;
       // Sanitize: an SSRF block names an internal address — never store/return/log it verbatim.
       const sanitized = sanitizeBatchError(error);
@@ -651,20 +746,18 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
     batch.currentIndex = i + 1;
     batch.results = results;
 
-    // Save progress periodically (every 10 messages or last message)
-    if (i % 10 === 0 || i === batch.messages.length - 1) {
-      // Honor a cancellation issued by ANY process (the in-memory Map only sees same-process
-      // cancels), and a reap that failed the batch after another node took the session over. The
-      // guard lives IN the UPDATE (not a read-then-write), so neither can be written over: zero
-      // affected rows stops the loop, and the row says which of the two it was.
-      const progressSaved = await this.batchRepository.update(
-        { id: batch.id, status: BatchStatus.PROCESSING },
-        { progress: batch.progress, results, currentIndex: batch.currentIndex },
-      );
-      if (!progressSaved.affected) {
-        await this.noteRowLeftProcessing(batch, state, `at index ${i}`);
-        return false;
-      }
+    // Save progress after every item: the row is what batch status, a cancel served by another
+    // process and the reapers read. Honor a cancellation issued by ANY process (the in-memory Map
+    // only sees same-process cancels), and a reap that failed the batch after another node took the
+    // session over. The guard lives IN the UPDATE (not a read-then-write), so neither can be written
+    // over: zero affected rows stops the loop, and the row says which of the two it was.
+    const progressSaved = await this.batchRepository.update(
+      { id: batch.id, status: BatchStatus.PROCESSING },
+      { progress: batch.progress, results, currentIndex: batch.currentIndex },
+    );
+    if (!progressSaved.affected) {
+      await this.noteRowLeftProcessing(batch, state, `at index ${i}`);
+      return false;
     }
 
     // Delay before next message (except for last)
@@ -734,8 +827,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap 
     batch.completedAt = new Date();
     batch.results = results;
     // The batch is terminal now (never resumed), so drop the base64 media payloads before persisting —
-    // otherwise the message_batches row retains multi-MB media forever. Intermediate (cadence) saves
-    // above keep the payload so a batch interrupted mid-run can still resume from currentIndex.
+    // otherwise the message_batches row retains multi-MB media forever.
     this.stripBatchMediaPayloads(batch.messages);
     const terminal = {
       status: batch.status,

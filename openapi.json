@@ -85,6 +85,7 @@
                 "webhook_deleted",
                 "webhook_triggered",
                 "webhook_failed",
+                "webhook_deliveries_redriven",
                 "integration_instance_created",
                 "integration_instance_updated",
                 "integration_instance_secret_regenerated",
@@ -766,6 +767,16 @@
               }
             }
           },
+          "400": {
+            "description": "The session id is not a UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -818,6 +829,16 @@
         "responses": {
           "204": {
             "description": "Session deleted"
+          },
+          "400": {
+            "description": "The session id is not a UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
@@ -887,6 +908,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SessionConfigResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The session id is not a UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -1001,6 +1032,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The session config kept changing under concurrent requests; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Update the tunable configuration for a session",
@@ -1030,6 +1071,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SessionProxyResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The session id is not a UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -1178,7 +1229,7 @@
             }
           },
           "400": {
-            "description": "Session already started",
+            "description": "Session already started or already starting, or this node is at its MAX_CONCURRENT_SESSIONS cap (`Maximum concurrent sessions reached (N)`), answered only after the 404 and the 409 for a session running on another node; a start refused at the cap launches nothing and leaves a stop in place.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1218,7 +1269,17 @@
             }
           },
           "409": {
-            "description": "A credential teardown for the same session name is still in flight (e.g. a prior logout that owns destructive cleanup). Retryable — the body carries `code: SESSION_NAME_TEARDOWN_PENDING`; wait for it to settle and retry. No destructive side effect runs before this refusal. Also returned when another node currently holds this session's engine: only the owner may start it, and the claim is refused before any engine is launched, so no second connection to the account is opened. Also returned, with no `code`, when a stop or force-kill of this session finished while the start was waiting: the stop stands, and a new POST /start clears it and starts the session.",
+            "description": "A credential teardown for the same session name is still in flight (e.g. a prior logout that owns destructive cleanup). Retryable — the body carries `code: SESSION_NAME_TEARDOWN_PENDING`; wait for it to settle and retry. No destructive side effect runs before this refusal. Also returned when another node currently holds this session's engine: only the owner may start it, and the claim is refused before any engine is launched, so no second connection to the account is opened. Also returned, with no `code`, when a stop, a force-kill that found a running engine to kill, or a data import (`stopOrphans`) of this session began or finished while the start was waiting, or a delete of it was still running: the start yields and launches nothing. After a stop or force-kill, a new POST /start clears it and starts the session; after a delete, or an import that removed the session, the retry answers 404.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The gateway is shutting down, or the engine's browser or socket connection died during launch and the one automatic retry failed too; no engine is left running, so the start can be retried.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1228,7 +1289,7 @@
             }
           },
           "504": {
-            "description": "The engine did not finish starting within its timeout (WhatsApp Web or the network unreachable, a stalled browser or resource limit, an unreachable proxyUrl, or the whatsapp-web.js auth timeout); the engine is torn down and the start can be retried.",
+            "description": "The engine did not finish starting within its timeout (WhatsApp Web or the network unreachable, a stalled browser or resource limit, or, on whatsapp-web.js, an unreachable proxyUrl or the auth timeout); the engine is torn down and the start can be retried.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1265,6 +1326,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SessionResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The session id is not a UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -1579,6 +1650,7 @@
     },
     "/api/sessions/{sessionId}/pairing-code": {
       "post": {
+        "description": "On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link. A request for a number that already has a linked session has been observed to end with WhatsApp revoking that device: the linked session logs out, its credentials are deleted and it falls back to `qr_ready`. Nothing refuses such a request, because the guards check the session state and never the number. Baileys was not affected in the same tests. Link by QR when a session of that number must stay up.",
         "operationId": "SessionController_requestPairingCode",
         "parameters": [
           {
@@ -1776,7 +1848,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the group-list query. Deliberately not reported as an empty list — the engine returns the same empty value for \"you are in no groups\", and a caller cannot tell those apart from the body.",
+            "description": "WhatsApp did not answer the group-list query. Deliberately not reported as an empty list — the engine returns the same empty value for \"you are in no groups\", and a caller cannot tell those apart from the body. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1826,7 +1898,7 @@
             }
           },
           "400": {
-            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected.",
+            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected. With send pacing on, also answered (without `retryAfterSeconds`) when the request names more new contacts than the whole day's cold-reachout allowance; split it into smaller batches.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1867,6 +1939,16 @@
           },
           "501": {
             "description": "Not supported by the active engine: whatsapp-web.js reaches a WhatsApp Web internal that no longer exists, so group creation is Baileys-only.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "WhatsApp rate-limited the create (code 429); nothing was created, so retrying after a pause is safe. A timed-out create is not answered 503, because the group may have been created.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2192,6 +2274,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Subscribe to a chat's presence",
@@ -2285,6 +2377,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The whatsapp-web.js page connection died, or WhatsApp Web did not answer within the protocol timeout. Nothing was confirmed; setting presence converges when repeated, so a retry is safe.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Set the account's own global presence (appear online or offline)",
@@ -2323,7 +2425,22 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChatPresenceResponseDto"
+                  "nullable": true,
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ChatPresenceResponseDto"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The session id is not a UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3013,6 +3130,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session is not started, or validation failed (an empty chatId, a state other than typing, recording or paused, or a body field the DTO does not declare).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -3564,7 +3691,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Deliveries that exhausted their retries (attempts > 0) and deliveries not sent (attempts 0: shed, refused at shutdown, oversize or a preflight failure; the outbox replays them). A later successful delivery removes the row. Most recent first.",
+            "description": "Deliveries that exhausted their retries (attempts > 0) and deliveries not sent (attempts 0: shed, refused at shutdown, oversize or a preflight failure). A direct delivery that shutdown stops in a retry backoff also records attempts 0, although its earlier attempts were sent. The outbox replays shed deliveries and those stopped by shutdown; oversize and preflight-failed ones on a first dispatch are final. A later successful delivery removes the row. Most recent first.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3598,6 +3725,68 @@
           }
         },
         "summary": "List failed or unsent webhook deliveries, most recent first",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/delivery-failures/redrive": {
+      "post": {
+        "operationId": "WebhooksListController_redriveDeliveryFailures",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedriveWebhookDeliveriesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One bounded batch of replayable failure rows (terminal rows recorded while WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS > 0), least-retried first, then oldest. Each replay reuses the stored idempotency key, so a receiver that already handled the event can dedup it, and runs the webhook:before hooks again. Each row gets one direct POST attempt even when ordinary delivery uses the queue; enqueued stays zero. Rows outside the key allowedSessions are never touched.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookRedriveResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is malformed, fails validation, or carries a field the DTO does not declare",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The API key is missing, unknown, revoked, or expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Replay recorded webhook deliveries that still hold their event data",
         "tags": [
           "webhooks"
         ]
@@ -3703,7 +3892,7 @@
             }
           },
           "400": {
-            "description": "Invalid rule (bad conditions, over-limit text).",
+            "description": "Invalid rule (bad conditions, over-limit text, out-of-range cooldown), or the per-session rule limit is reached.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3915,6 +4104,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid rule (bad conditions, over-limit text, out-of-range cooldown).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -4080,6 +4279,67 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "since",
+            "required": false,
+            "in": "query",
+            "description": "Inclusive message-time lower bound, Unix epoch milliseconds (not ingestion time).",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "until",
+            "required": false,
+            "in": "query",
+            "description": "Exclusive message-time upper bound, Unix epoch milliseconds.",
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "direction",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "enum": [
+                "incoming",
+                "outgoing"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderBy",
+            "required": false,
+            "in": "query",
+            "description": "Newest first. Default createdAt preserves existing ordering; timestamp uses message time and excludes rows without a known timestamp.",
+            "schema": {
+              "enum": [
+                "createdAt",
+                "timestamp"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "required": false,
+            "in": "query",
+            "description": "Exact stored message type token, e.g. text, image, voice.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "messageId",
+            "required": false,
+            "in": "query",
+            "description": "Exact WhatsApp message reference; remains scoped to the session and chat.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4094,7 +4354,7 @@
             }
           },
           "400": {
-            "description": "`after` names no message in this session. The keyset comparison would otherwise return an empty page, which reads exactly like the end of the history, so a walk resumed from a stale or foreign cursor would stop silently instead of reporting the cursor.",
+            "description": "Invalid message filters or an unknown cursor. With time, direction, type or message-reference filters, the cursor must belong to the same selection.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4139,6 +4399,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4214,6 +4483,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4224,8 +4503,28 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "A caller-supplied `customLinkPreview` is not supported by the whatsapp-web.js engine — only Baileys can attach one. The send itself is supported on both; omit the field, or use `linkPreview`. whatsapp-web.js also refuses a send with `quotedMessageId` to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4250,6 +4549,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4325,6 +4633,26 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Render a stored text template and send it as a text message",
@@ -4342,6 +4670,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4408,6 +4745,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4428,6 +4775,16 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "Sending media to a channel (`<id>@newsletter`) is not supported by the whatsapp-web.js engine — the page method it needs was removed by a WhatsApp Web update. Text to a channel still works. whatsapp-web.js also refuses a send with `quotedMessageId` to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
             "content": {
@@ -4439,7 +4796,7 @@
             }
           },
           "503": {
-            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`. Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4464,6 +4821,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4529,6 +4895,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4549,6 +4925,16 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "Sending media to a channel (`<id>@newsletter`) is not supported by the whatsapp-web.js engine — the page method it needs was removed by a WhatsApp Web update. Text to a channel still works. whatsapp-web.js also refuses a send with `quotedMessageId` to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
             "content": {
@@ -4560,7 +4946,7 @@
             }
           },
           "503": {
-            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`. Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4585,6 +4971,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4651,6 +5046,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4671,6 +5076,16 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "Sending media to a channel (`<id>@newsletter`) is not supported by the whatsapp-web.js engine — the page method it needs was removed by a WhatsApp Web update. Text to a channel still works. whatsapp-web.js also refuses a send with `quotedMessageId` to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
             "content": {
@@ -4682,7 +5097,7 @@
             }
           },
           "503": {
-            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`. Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4707,6 +5122,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4773,6 +5197,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4793,6 +5227,16 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "Sending media to a channel (`<id>@newsletter`) is not supported by the whatsapp-web.js engine — the page method it needs was removed by a WhatsApp Web update. Text to a channel still works. whatsapp-web.js also refuses a send with `quotedMessageId` to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
             "content": {
@@ -4804,7 +5248,7 @@
             }
           },
           "503": {
-            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`. Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4829,6 +5273,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4867,7 +5320,7 @@
             }
           },
           "400": {
-            "description": "The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
+            "description": "Baileys rejects a phone number reported as unregistered. The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4896,6 +5349,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4906,8 +5369,28 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "whatsapp-web.js cannot send a location to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4932,6 +5415,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -4969,7 +5461,7 @@
             }
           },
           "400": {
-            "description": "The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
+            "description": "Baileys rejects a phone number reported as unregistered. The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4998,6 +5490,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -5008,8 +5510,28 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "whatsapp-web.js cannot send a contact card to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5034,6 +5556,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -5070,7 +5601,7 @@
             }
           },
           "400": {
-            "description": "The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
+            "description": "Baileys rejects a phone number reported as unregistered. The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5099,6 +5630,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -5119,6 +5660,16 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "Sending media to a channel (`<id>@newsletter`) is not supported by the whatsapp-web.js engine — the page method it needs was removed by a WhatsApp Web update. Text to a channel still works. whatsapp-web.js cannot send a sticker to a status or broadcast list (`@broadcast`) either; nothing is sent.",
             "content": {
@@ -5130,7 +5681,7 @@
             }
           },
           "503": {
-            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`. Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5155,6 +5706,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -5195,7 +5755,7 @@
             }
           },
           "400": {
-            "description": "The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
+            "description": "Baileys rejects a phone number reported as unregistered. The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5224,6 +5784,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -5234,8 +5804,28 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "whatsapp-web.js cannot send a poll to a status or broadcast list (`@broadcast`), nor one with `quotedMessageId` to a channel (`<id>@newsletter`); nothing is sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5263,6 +5853,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -5287,7 +5886,7 @@
             }
           },
           "400": {
-            "description": "The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
+            "description": "Baileys rejects a phone number reported as unregistered. The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5336,8 +5935,28 @@
               }
             }
           },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "501": {
             "description": "whatsapp-web.js cannot send a reply to a channel (`<id>@newsletter`) or a status or broadcast list (`@broadcast`); nothing is sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5448,6 +6067,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Click a button on a WhatsApp Business prompt (Baileys only)",
@@ -5465,6 +6094,15 @@
             "required": true,
             "in": "path",
             "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Optional. Makes the send safe to retry: within 24 hours, a retry with the same key and body replays the first response (marked `Idempotent-Replayed: true`) instead of sending again. 1-255 visible ASCII characters, unique per session. While the first request runs a retry gets 409 `IDEMPOTENCY_KEY_IN_PROGRESS`; after a failure that may have sent the message it gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN`. A 4xx or 501 refusal before the engine call frees the key. Errors from an engine send keep it taken regardless of HTTP status, including 409.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -5492,7 +6130,7 @@
             }
           },
           "400": {
-            "description": "The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
+            "description": "Baileys rejects a phone number reported as unregistered. The request was rejected before anything was sent. Among the causes: the recipient could not be addressed — WhatsApp reports no deliverable id for that `chatId`, which is how it says the number is not on WhatsApp — as well as body validation and a session that is not active.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5533,6 +6171,26 @@
           },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`IDEMPOTENCY_KEY_REUSED`: the Idempotency-Key was already used with a different route or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5634,7 +6292,7 @@
             }
           },
           "503": {
-            "description": "The whatsapp-web.js page connection died mid-request. The change may or may not have been applied; repeating the request is safe, since it converges on the same state.",
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure. The whatsapp-web.js page connection died mid-request. The change may or may not have been applied; repeating the request is safe, since it converges on the same state.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5867,6 +6525,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session not active",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -5966,6 +6634,16 @@
                   "items": {
                     "$ref": "#/components/schemas/MessageReactionDto"
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session not active",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -6102,7 +6780,7 @@
             }
           },
           "404": {
-            "description": "No stored media for this message — it carries no media, media download was disabled or the payload was over the cap when it was stored (size-only marker), it was a URL-based API send (those bytes are never stored), or the message is not in this gateway’s history.",
+            "description": "No stored media for this message — it carries no media, media download was disabled or the payload was over the cap when it was stored (size-only marker), it was a URL-based API send (the gateway stores none of those bytes, though on whatsapp-web.js the own-send echo may), or the message is not in this gateway’s history.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6204,7 +6882,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure. WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6256,7 +6934,7 @@
             }
           },
           "400": {
-            "description": "Session not active, or the target message is not a poll",
+            "description": "Session not active, the target message is not a poll, or `POLL_OPTION_NOT_FOUND`: none of the option texts match the poll (the body lists `validOptions`). Nothing is sent, so the current vote stays.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6418,7 +7096,7 @@
             }
           },
           "503": {
-            "description": "The whatsapp-web.js page connection died mid-request. The pin may or may not have been applied; a retry is safe, but it restarts the pin duration from the moment it succeeds.",
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure. The whatsapp-web.js page connection died mid-request. The pin may or may not have been applied; a retry is safe, but it restarts the pin duration from the moment it succeeds.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6520,7 +7198,7 @@
             }
           },
           "503": {
-            "description": "The whatsapp-web.js page connection died mid-request. The change may or may not have been applied; repeating the request is safe, since it converges on the same state.",
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure. The whatsapp-web.js page connection died mid-request. The change may or may not have been applied; repeating the request is safe, since it converges on the same state.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6724,7 +7402,7 @@
             }
           },
           "503": {
-            "description": "The whatsapp-web.js page connection died mid-request. The change may or may not have been applied; repeating the request is safe, since it converges on the same state.",
+            "description": "Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure. The whatsapp-web.js page connection died mid-request. The change may or may not have been applied; repeating the request is safe, since it converges on the same state.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6824,6 +7502,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The server is shutting down; retry the batch shortly",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Send messages to multiple recipients (async batch processing)",
@@ -6863,6 +7551,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TemplateResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed, or the body carries a field the DTO does not declare.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -7080,6 +7778,16 @@
               }
             }
           },
+          "400": {
+            "description": "Validation failed, or the body carries a field the DTO does not declare.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -7251,7 +7959,14 @@
             }
           },
           "503": {
-            "description": "A required dependency is down"
+            "description": "A required dependency is down, or the node is draining for shutdown (details.shutdown.status = draining)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessResponseDto"
+                }
+              }
+            }
           }
         },
         "summary": "Readiness probe — verifies the auth/audit + data databases respond",
@@ -7489,6 +8204,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Shutdown teardown has begun: every route except /api/health and /api/health/* answers 503 then. Probe /api/health/live for a check that survives teardown."
           }
         },
         "summary": "Health check endpoint",
@@ -7555,11 +8273,21 @@
         },
         "responses": {
           "200": {
-            "description": "Save outcome. A failed write also answers 200 with `saved: false` — read the flag, not the status.",
+            "description": "Save outcome. A failed disk write answers 200 with `saved: false`, so read the flag, not the status.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/InfraConfigSaveResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Rejected before anything was written: an invalid or unknown field, an unknown engine type, a value with a line break or one that cannot be stored, a configuration that would not boot in production, or a media storage path the app cannot write to.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -7612,6 +8340,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/InfraRestartResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is malformed, fails validation, or carries a field the DTO does not declare",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -7752,7 +8490,7 @@
             }
           },
           "409": {
-            "description": "Refused, with the reason in `code`. IMPORT_ALREADY_RUNNING: another import is running — wait for it. EXPORT_IN_PROGRESS: a data export is running; wait for it. IMPORT_NESTED_TRANSACTION: another database transaction holds this connection, so a restore could not be made durable — retry with nothing else in flight. IMPORT_WOULD_ORPHAN_ENGINES: live engines exist for sessions the backup would remove — retry with stopOrphans=true to stop them in-request, or force=true to proceed and restart after. Only the last of these is retryable with stopOrphans; the others leave nothing to decide",
+            "description": "Refused, with the reason in `code`. IMPORT_ALREADY_RUNNING: another import is running — wait for it. EXPORT_IN_PROGRESS: a data export is running; wait for it. IMPORT_NESTED_TRANSACTION: another database transaction holds this connection, so a restore could not be made durable — retry with nothing else in flight. IMPORT_WOULD_ORPHAN_ENGINES: sessions the backup would remove are running, starting or waiting to relaunch here — retry with stopOrphans=true to stop them in-request, or force=true to proceed and restart after. Only the last of these is retryable with stopOrphans; the others leave nothing to decide",
             "content": {
               "application/json": {
                 "schema": {
@@ -7992,7 +8730,7 @@
             }
           },
           "400": {
-            "description": "Session not ready",
+            "description": "Session is not started",
             "content": {
               "application/json": {
                 "schema": {
@@ -8083,6 +8821,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session is not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -8145,6 +8893,16 @@
                   "items": {
                     "type": "string"
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -8226,6 +8984,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ContactDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -8330,7 +9098,7 @@
             }
           },
           "400": {
-            "description": "Session not active or invalid request",
+            "description": "Session is not started, an invalid body, or a contact id that is not a phone-based individual id",
             "content": {
               "application/json": {
                 "schema": {
@@ -8419,7 +9187,7 @@
             }
           },
           "400": {
-            "description": "Session not active",
+            "description": "Session is not started, or a contact id that is not a phone-based individual id",
             "content": {
               "application/json": {
                 "schema": {
@@ -8477,7 +9245,7 @@
     },
     "/api/sessions/{sessionId}/contacts/check/{number}": {
       "get": {
-        "description": "Returns whether the number is a registered WhatsApp account and its canonical id. Use this to pre-validate a recipient before sending: the send endpoints return 201 on accepting a message even for numbers that are not on WhatsApp, so this is the only way to confirm a new number is reachable before you send to it. Requires an OPERATOR key.",
+        "description": "Returns whether the number is a registered WhatsApp account and its canonical id. Use this to pre-validate a recipient before sending. Baileys also checks unmapped phone destinations before sending: a number reported as unregistered is rejected with 400. A successful check does not confirm message delivery. Requires an OPERATOR key.",
         "operationId": "ContactController_checkNumber",
         "parameters": [
           {
@@ -8506,6 +9274,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/NumberCheckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -8591,6 +9369,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session is not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -8622,7 +9410,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the lookup. Deliberately not reported as `url: null` — that is the same answer a contact with no picture gives, and a caller cannot tell them apart.",
+            "description": "WhatsApp did not answer the lookup. Deliberately not reported as `url: null` — that is the same answer a contact with no picture gives, and a caller cannot tell them apart. On Baileys, also answered when WhatsApp rate-limits, times out or fails on its side (code 429, 408 or 5xx); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8668,6 +9456,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ResolvedPhoneResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -8739,6 +9537,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ContactAckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started, or the id does not name an individual. On Baileys also an id the session cannot map between phone and privacy-id form (a `@lid` with no known phone to block, a phone-based id with no known `@lid`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -8818,6 +9626,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ContactAckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started, or the id does not name an individual. On Baileys also a phone-based id the session cannot map to its privacy id (`@lid`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -8955,7 +9773,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. Deliberately not folded into the 404 above — a query that never came back is not the same claim as a group that does not exist.",
+            "description": "WhatsApp did not answer within the request budget. Deliberately not folded into the 404 above — a query that never came back is not the same claim as a group that does not exist. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9005,6 +9823,16 @@
               }
             }
           },
+          "400": {
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -9016,7 +9844,7 @@
             }
           },
           "403": {
-            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "description": "The API key is restricted to selected chats and this group is outside its allowlist. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9046,7 +9874,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. Deliberately not folded into the 404 above — a query that never came back is not the same claim as a group that does not exist.",
+            "description": "WhatsApp did not answer within the request budget. Deliberately not folded into the 404 above — a query that never came back is not the same claim as a group that does not exist. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9138,7 +9966,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
+            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9188,6 +10016,16 @@
               }
             }
           },
+          "400": {
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -9199,7 +10037,7 @@
             }
           },
           "403": {
-            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "description": "The API key is restricted to selected chats and this group is outside its allowlist. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9229,7 +10067,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — nothing could be read.",
+            "description": "WhatsApp did not answer within the request budget — nothing could be read. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9348,7 +10186,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
+            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9409,7 +10247,7 @@
             }
           },
           "400": {
-            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected.",
+            "description": "A participant does not name an individual. Pass a phone number, `<phone>@c.us` or `<lid>@lid`; a group id or free text is rejected. With send pacing on, also answered (without `retryAfterSeconds`) when the request names more new contacts than the whole day's cold-reachout allowance; split it into smaller batches.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9459,7 +10297,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not.",
+            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9568,7 +10406,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not.",
+            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9679,7 +10517,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not.",
+            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9790,7 +10628,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not.",
+            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9844,6 +10682,16 @@
               }
             }
           },
+          "400": {
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -9885,7 +10733,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — retry shortly",
+            "description": "WhatsApp did not answer within the request budget — retry shortly. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9946,6 +10794,16 @@
               }
             }
           },
+          "400": {
+            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -9987,7 +10845,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not.",
+            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10048,6 +10906,16 @@
               }
             }
           },
+          "400": {
+            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -10089,7 +10957,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not.",
+            "description": "WhatsApp did not answer within the request budget, so no per-participant outcome was read at all. Deliberately not folded into the 200 above — a participant WhatsApp turned down is reported inside `results` and is an answer; an update that never came back is not. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10149,6 +11017,16 @@
               }
             }
           },
+          "400": {
+            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -10190,7 +11068,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
+            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10250,6 +11128,16 @@
               }
             }
           },
+          "400": {
+            "description": "The body failed validation, or the session is not started (no engine is running for it).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -10291,7 +11179,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
+            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10341,6 +11229,16 @@
               }
             }
           },
+          "400": {
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -10382,7 +11280,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
+            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10473,7 +11371,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — nothing could be read.",
+            "description": "WhatsApp did not answer within the request budget — nothing could be read. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause. On Baileys, a WhatsApp server error (5xx) on the lookup also answers 503.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10532,7 +11430,7 @@
             }
           },
           "400": {
-            "description": "The id does not name a group, the session is not active, neither url nor base64 was supplied, or the url answers non-2xx, times out or cannot be reached",
+            "description": "The id does not name a group, the session is not active, neither url nor base64 was supplied, the url answers non-2xx, times out or cannot be reached, or the image cannot be read (Baileys refuses an SVG)",
             "content": {
               "application/json": {
                 "schema": {
@@ -10592,7 +11490,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause. The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10691,7 +11589,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came.",
+            "description": "WhatsApp did not answer within the request budget. The change may or may not have been applied — the gateway stopped waiting for a confirmation that never came. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10741,6 +11639,16 @@
               }
             }
           },
+          "400": {
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -10782,7 +11690,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the invite-code query — retry shortly",
+            "description": "WhatsApp did not answer the invite-code query — retry shortly. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -10832,6 +11740,16 @@
               }
             }
           },
+          "400": {
+            "description": "The session is not started: no engine is running for it (never started, stopped, or logged out). Start the session and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -10873,7 +11791,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the invite-code query — retry shortly",
+            "description": "WhatsApp did not answer the invite-code query — retry shortly. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11109,7 +12027,7 @@
             }
           },
           "400": {
-            "description": "Neither url nor base64 provided, base64 without mimetype, session is not started, or the url answers non-2xx, times out or cannot be reached",
+            "description": "Neither url nor base64 provided, base64 without mimetype, session is not started, the url answers non-2xx, times out or cannot be reached, or the image cannot be read (Baileys refuses an SVG)",
             "content": {
               "application/json": {
                 "schema": {
@@ -11577,6 +12495,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -12006,6 +12934,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -12110,6 +13048,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/LabelAckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session not started, or validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -12224,6 +13172,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -12320,7 +13278,7 @@
             }
           },
           "400": {
-            "description": "Session not ready",
+            "description": "Session not started",
             "content": {
               "application/json": {
                 "schema": {
@@ -12449,6 +13407,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "WhatsApp rate-limited the create (code 429, Baileys); nothing was created, so retrying after a pause is safe. A timed-out create is not answered 503, because the channel may have been created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Create a channel",
@@ -12487,6 +13455,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ChannelDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -12532,7 +13510,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied.",
+            "description": "WhatsApp did not answer within the request budget — nothing could be read. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12580,6 +13558,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -12600,6 +13588,16 @@
               }
             }
           },
+          "404": {
+            "description": "The id is not a channel id (it does not end in `@newsletter`). Retrying the same id cannot succeed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -12611,7 +13609,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied.",
+            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12669,6 +13667,16 @@
                   "items": {
                     "$ref": "#/components/schemas/ChannelMessageDto"
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session not started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -12795,6 +13803,16 @@
               }
             }
           },
+          "404": {
+            "description": "The id is not a channel id (it does not end in `@newsletter`). Retrying the same id cannot succeed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -12806,7 +13824,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied.",
+            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12898,7 +13916,7 @@
             }
           },
           "404": {
-            "description": "No such channel — the id is not among the session's subscribed channels, either because it is wrong or because the channel has not synced into the local collection yet.",
+            "description": "The id is not a channel id (it does not end in `@newsletter`). Retrying the same id cannot succeed. On whatsapp-web.js, also answered for a channel id that is not among the session's subscribed channels or has not synced into the local collection yet.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12918,7 +13936,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied.",
+            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -13030,7 +14048,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied.",
+            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -13142,7 +14160,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — the transfer may or may not have applied.",
+            "description": "WhatsApp did not answer within the request budget — the transfer may or may not have applied. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -13203,6 +14221,16 @@
               }
             }
           },
+          "400": {
+            "description": "Session not started, or validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -13254,7 +14282,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied.",
+            "description": "WhatsApp did not answer within the request budget — the operation may or may not have applied. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
             "content": {
               "application/json": {
                 "schema": {
@@ -13339,6 +14367,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MessageStatsResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A query value is invalid, or the query carries a field the DTO does not declare.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -14330,7 +15368,7 @@
         },
         "responses": {
           "200": {
-            "description": "Converted bytes: baseline H.264 with AAC audio, long edge bounded at 1280, index moved to the front so the recipient can start playing before the whole file arrives.",
+            "description": "Converted bytes: baseline H.264 with AAC audio, fitted inside 1280x720 (720x1280 portrait), index moved to the front so the recipient can start playing before the whole file arrives.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14431,7 +15469,7 @@
             }
           },
           "403": {
-            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "description": "WhatsApp refused the catalog query. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14471,7 +15509,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the catalog query within the request budget — retry shortly.",
+            "description": "WhatsApp did not answer the catalog query within the request budget, or rate-limited it. For some business accounts WhatsApp never answers it, so a retry may not help.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14507,7 +15545,7 @@
             "schema": {
               "minimum": 1,
               "example": 1,
-              "type": "number"
+              "type": "integer"
             }
           },
           {
@@ -14518,7 +15556,7 @@
             "schema": {
               "minimum": 1,
               "example": 20,
-              "type": "number"
+              "type": "integer"
             }
           }
         ],
@@ -14529,6 +15567,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/PaginatedProductsDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A query value is invalid, or the query carries a field the DTO does not declare.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -14544,7 +15592,7 @@
             }
           },
           "403": {
-            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "description": "WhatsApp refused the catalog query. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14584,7 +15632,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the catalog query within the request budget — retry shortly.",
+            "description": "WhatsApp did not answer the catalog query within the request budget, or rate-limited it. For some business accounts WhatsApp never answers it, so a retry may not help.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14643,7 +15691,7 @@
             }
           },
           "403": {
-            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "description": "WhatsApp refused the catalog query. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14683,7 +15731,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the catalog query within the request budget — retry shortly.",
+            "description": "WhatsApp did not answer the catalog query within the request budget, or rate-limited it. For some business accounts WhatsApp never answers it, so a retry may not help.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14734,7 +15782,7 @@
             }
           },
           "400": {
-            "description": "Product has no image (a product card requires one), a plugin blocked the send, or a plugin returned an invalid productId or body.",
+            "description": "Recipient reported as unregistered, product has no image, a plugin blocked the send, or a plugin returned an invalid productId or body.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14754,7 +15802,7 @@
             }
           },
           "403": {
-            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "description": "WhatsApp refused the catalog query. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14764,7 +15812,7 @@
             }
           },
           "404": {
-            "description": "Product id not found in the session catalog.",
+            "description": "Product id not found in the session catalog. No session is running under that id — it was never started, was stopped, or does not exist. These routes report an unstarted session as `404`, where the message and group routes report it as `400`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14794,7 +15842,7 @@
             }
           },
           "503": {
-            "description": "WhatsApp did not answer the catalog query within the request budget — retry shortly.",
+            "description": "WhatsApp did not answer the catalog query within the request budget, or rate-limited it. For some business accounts WhatsApp never answers it, so a retry may not help. Baileys could not complete the recipient lookup within the request budget. On send routes, no message was handed to WhatsApp for this lookup failure.",
             "content": {
               "application/json": {
                 "schema": {
@@ -14922,6 +15970,16 @@
           },
           "409": {
             "description": "Plugin already installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Package exceeds the 5 MB upload limit",
             "content": {
               "application/json": {
                 "schema": {
@@ -15350,6 +16408,16 @@
               }
             }
           },
+          "400": {
+            "description": "Validation failed, or the body carries a field the DTO does not declare.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "The API key is missing, unknown, revoked, or expired",
             "content": {
@@ -15491,7 +16559,7 @@
             }
           },
           "400": {
-            "description": "Plugin is global (not session-scoped)",
+            "description": "Plugin is global (not session-scoped), or the body failed validation",
             "content": {
               "application/json": {
                 "schema": {
@@ -15572,7 +16640,7 @@
             }
           },
           "400": {
-            "description": "Plugin is global (not session-scoped)",
+            "description": "Plugin is global (not session-scoped), or the body failed validation",
             "content": {
               "application/json": {
                 "schema": {
@@ -15691,6 +16759,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Gateway shutting down; the previous version was kept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Update an installed plugin in place from a URL (preserves config + enabled state)",
@@ -15798,6 +16876,9 @@
           "202": {
             "description": "Webhook accepted and queued for async plugin processing (the primary success path)."
           },
+          "400": {
+            "description": "The path or query contains an encoded NUL (`%00`), or a JSON body does not parse."
+          },
           "401": {
             "description": "Signature verification failed (missing, stale, or wrong secret)."
           },
@@ -15817,7 +16898,7 @@
             "description": "Rate limit exceeded: the per-instance bucket (INGRESS_INSTANCE_LIMIT) or the per-client-IP bucket (INGRESS_IP_LIMIT). The `Retry-After-instance` / `Retry-After-ingress-ip` header names which one shed the request, and a plain `Retry-After` carries the same delay for a client that reads only the standard name."
           },
           "503": {
-            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
+            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session has no running engine or its engine has failed (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
           }
         },
         "tags": [
@@ -15862,6 +16943,9 @@
           "202": {
             "description": "Webhook accepted and queued for async plugin processing (the primary success path)."
           },
+          "400": {
+            "description": "The path or query contains an encoded NUL (`%00`), or a JSON body does not parse."
+          },
           "401": {
             "description": "Signature verification failed (missing, stale, or wrong secret)."
           },
@@ -15881,7 +16965,7 @@
             "description": "Rate limit exceeded: the per-instance bucket (INGRESS_INSTANCE_LIMIT) or the per-client-IP bucket (INGRESS_IP_LIMIT). The `Retry-After-instance` / `Retry-After-ingress-ip` header names which one shed the request, and a plain `Retry-After` carries the same delay for a client that reads only the standard name."
           },
           "503": {
-            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
+            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session has no running engine or its engine has failed (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
           }
         },
         "tags": [
@@ -15926,6 +17010,9 @@
           "202": {
             "description": "Webhook accepted and queued for async plugin processing (the primary success path)."
           },
+          "400": {
+            "description": "The path or query contains an encoded NUL (`%00`), or a JSON body does not parse."
+          },
           "401": {
             "description": "Signature verification failed (missing, stale, or wrong secret)."
           },
@@ -15945,7 +17032,7 @@
             "description": "Rate limit exceeded: the per-instance bucket (INGRESS_INSTANCE_LIMIT) or the per-client-IP bucket (INGRESS_IP_LIMIT). The `Retry-After-instance` / `Retry-After-ingress-ip` header names which one shed the request, and a plain `Retry-After` carries the same delay for a client that reads only the standard name."
           },
           "503": {
-            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
+            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session has no running engine or its engine has failed (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
           }
         },
         "tags": [
@@ -15990,6 +17077,9 @@
           "202": {
             "description": "Webhook accepted and queued for async plugin processing (the primary success path)."
           },
+          "400": {
+            "description": "The path or query contains an encoded NUL (`%00`), or a JSON body does not parse."
+          },
           "401": {
             "description": "Signature verification failed (missing, stale, or wrong secret)."
           },
@@ -16009,7 +17099,7 @@
             "description": "Rate limit exceeded: the per-instance bucket (INGRESS_INSTANCE_LIMIT) or the per-client-IP bucket (INGRESS_IP_LIMIT). The `Retry-After-instance` / `Retry-After-ingress-ip` header names which one shed the request, and a plain `Retry-After` carries the same delay for a client that reads only the standard name."
           },
           "503": {
-            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
+            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session has no running engine or its engine has failed (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
           }
         },
         "tags": [
@@ -16054,6 +17144,9 @@
           "202": {
             "description": "Webhook accepted and queued for async plugin processing (the primary success path)."
           },
+          "400": {
+            "description": "The path or query contains an encoded NUL (`%00`), or a JSON body does not parse."
+          },
           "401": {
             "description": "Signature verification failed (missing, stale, or wrong secret)."
           },
@@ -16073,7 +17166,7 @@
             "description": "Rate limit exceeded: the per-instance bucket (INGRESS_INSTANCE_LIMIT) or the per-client-IP bucket (INGRESS_IP_LIMIT). The `Retry-After-instance` / `Retry-After-ingress-ip` header names which one shed the request, and a plain `Retry-After` carries the same delay for a client that reads only the standard name."
           },
           "503": {
-            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
+            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session has no running engine or its engine has failed (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
           }
         },
         "tags": [
@@ -16118,6 +17211,9 @@
           "202": {
             "description": "Webhook accepted and queued for async plugin processing (the primary success path)."
           },
+          "400": {
+            "description": "The path or query contains an encoded NUL (`%00`), or a JSON body does not parse."
+          },
           "401": {
             "description": "Signature verification failed (missing, stale, or wrong secret)."
           },
@@ -16137,7 +17233,7 @@
             "description": "Rate limit exceeded: the per-instance bucket (INGRESS_INSTANCE_LIMIT) or the per-client-IP bucket (INGRESS_IP_LIMIT). The `Retry-After-instance` / `Retry-After-ingress-ip` header names which one shed the request, and a plain `Retry-After` carries the same delay for a client that reads only the standard name."
           },
           "503": {
-            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
+            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session has no running engine or its engine has failed (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
           }
         },
         "tags": [
@@ -16182,6 +17278,9 @@
           "202": {
             "description": "Webhook accepted and queued for async plugin processing (the primary success path)."
           },
+          "400": {
+            "description": "The path or query contains an encoded NUL (`%00`), or a JSON body does not parse."
+          },
           "401": {
             "description": "Signature verification failed (missing, stale, or wrong secret)."
           },
@@ -16201,7 +17300,7 @@
             "description": "Rate limit exceeded: the per-instance bucket (INGRESS_INSTANCE_LIMIT) or the per-client-IP bucket (INGRESS_IP_LIMIT). The `Retry-After-instance` / `Retry-After-ingress-ip` header names which one shed the request, and a plain `Retry-After` carries the same delay for a client that reads only the standard name."
           },
           "503": {
-            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
+            "description": "A route whose response contract declares a `session-alive` preflight, when the bound session has no running engine or its engine has failed (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay."
           }
         },
         "tags": [
@@ -16718,8 +17817,9 @@
             "name": "q",
             "required": true,
             "in": "query",
-            "description": "Search term (required, non-empty)",
+            "description": "Search term (required, non-empty, at most 1000 characters and 32 words)",
             "schema": {
+              "maxLength": 1000,
               "type": "string"
             }
           },
@@ -16796,7 +17896,8 @@
             "in": "query",
             "description": "Max hits to return",
             "schema": {
-              "type": "number"
+              "minimum": 1,
+              "type": "integer"
             }
           },
           {
@@ -16805,7 +17906,9 @@
             "in": "query",
             "description": "Pagination offset, at most 100000",
             "schema": {
-              "type": "number"
+              "minimum": 0,
+              "maximum": 100000,
+              "type": "integer"
             }
           }
         ],
@@ -16821,7 +17924,7 @@
             }
           },
           "400": {
-            "description": "Empty or whitespace-only \"q\"",
+            "description": "Empty or whitespace-only \"q\", or one over 1000 characters or 32 words",
             "content": {
               "application/json": {
                 "schema": {
@@ -16841,7 +17944,7 @@
             }
           },
           "403": {
-            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "description": "Chat scope denied or chat-restricted search uses a plugin provider. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -16890,8 +17993,8 @@
   },
   "info": {
     "title": "OpenWA API",
-    "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Three statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `413 Payload Too Large`: the declared `Content-Length` is more than the gateway could hold in flight for this caller even when idle. The body is not read; retrying it unchanged cannot succeed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight. The body is not read; retry after the given delay.\n\nEvery operation that takes an API key can also answer `429 Too Many Requests` (the per-IP rate-limit windows; with send pacing on, a send can also be refused with `code: SEND_PACING_LIMITED` and `retryAfterSeconds`) and `500 Internal Server Error` (an unexpected failure, or `code: ENGINE_PAGE_ERROR` when WhatsApp Web threw inside the page during a whatsapp-web.js send or status post). Error bodies follow the `ErrorResponse` schema.",
-    "version": "0.24.0",
+    "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Three statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `413 Payload Too Large`: the declared `Content-Length` is more than the gateway could hold in flight for this caller even when idle. The body is not read; retrying it unchanged cannot succeed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight (the body is not read; retry after the given delay), or, without `Retry-After`, shutdown teardown has begun: every route except `/api/health` and `/api/health/*` then answers it with `Connection: close`.\n\nEvery operation that takes an API key can also answer `429 Too Many Requests` (the per-IP rate-limit windows; with send pacing on, a send can also be refused with `code: SEND_PACING_LIMITED` and `retryAfterSeconds`) and `500 Internal Server Error` (an unexpected failure, or `code: ENGINE_PAGE_ERROR` when WhatsApp Web threw inside the page during a whatsapp-web.js send or status post). Error bodies follow the `ErrorResponse` schema.",
+    "version": "0.25.0",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -17145,7 +18248,9 @@
           "name": {
             "type": "string",
             "description": "Friendly name for the API key",
-            "example": "Production Bot"
+            "example": "Production Bot",
+            "minLength": 3,
+            "maxLength": 100
           },
           "role": {
             "type": "string",
@@ -17185,6 +18290,7 @@
               "120363000000000000@g.us",
               "919999999999@c.us"
             ],
+            "maxItems": 2000,
             "type": "array",
             "items": {
               "type": "string"
@@ -17346,7 +18452,9 @@
         "type": "object",
         "properties": {
           "name": {
-            "type": "string"
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 100
           },
           "role": {
             "type": "string",
@@ -17369,6 +18477,7 @@
             }
           },
           "allowedChats": {
+            "maxItems": 2000,
             "type": "array",
             "items": {
               "type": "string"
@@ -17402,6 +18511,11 @@
             "type": "string",
             "description": "Engine the process resolved at boot; present only when valid.",
             "example": "baileys"
+          },
+          "scoped": {
+            "type": "boolean",
+            "description": "Whether the key is restricted to selected sessions; present only when valid.",
+            "example": false
           }
         },
         "required": [
@@ -17429,7 +18543,8 @@
           },
           "proxyUrl": {
             "type": "string",
-            "description": "Optional per-session egress proxy URL (http/https/socks4/socks5; credentialed form \"http://user:pass@host\" allowed). Must be a REAL, REACHABLE proxy — an unreachable value silently blocks the WhatsApp WebSocket (no QR is ever delivered) and the session start times out (~30s → 504 Gateway Timeout). Leave unset unless your network cannot reach WhatsApp directly. Setting it requires an ADMIN key (403 otherwise)."
+            "description": "Optional per-session egress proxy URL (http/https/socks4/socks5; credentialed form \"http://user:pass@host\" allowed). Must be a REAL, REACHABLE proxy — an unreachable value silently blocks the WhatsApp WebSocket (no QR is ever delivered). On whatsapp-web.js the session start then times out (~30s → 504 Gateway Timeout); on Baileys the start succeeds and the session keeps retrying the connection. Leave unset unless your network cannot reach WhatsApp directly. Setting it requires an ADMIN key (403 otherwise).",
+            "maxLength": 255
           },
           "proxyType": {
             "type": "string",
@@ -17664,8 +18779,9 @@
         "properties": {
           "proxyUrl": {
             "type": "string",
-            "description": "Per-session egress proxy URL (http/https/socks4/socks5; credentialed form allowed). Send `null` to clear the proxy. Must be a real, reachable proxy — an unreachable value blocks the WhatsApp WebSocket and session start times out (~30s).",
+            "description": "Per-session egress proxy URL (http/https/socks4/socks5; credentialed form allowed). Send `null` to clear the proxy. Must be a real, reachable proxy — an unreachable value blocks the WhatsApp WebSocket (no QR is delivered). On whatsapp-web.js the session start then times out (~30s); on Baileys the start succeeds and the session keeps retrying the connection.",
             "nullable": true,
+            "maxLength": 255,
             "example": "http://user:pass@proxy.example.com:8080"
           }
         }
@@ -17704,7 +18820,8 @@
           "phoneNumber": {
             "type": "string",
             "description": "Phone number to link, digits only in international format (country code + number).",
-            "example": "628123456789"
+            "example": "628123456789",
+            "pattern": "^[0-9]{6,15}$"
           }
         },
         "required": [
@@ -17797,6 +18914,29 @@
             "type": "string",
             "example": "hi"
           },
+          "lastMessageType": {
+            "type": "string",
+            "enum": [
+              "text",
+              "image",
+              "video",
+              "audio",
+              "voice",
+              "document",
+              "sticker",
+              "location",
+              "contact",
+              "poll",
+              "call",
+              "revoked",
+              "order",
+              "product",
+              "masked",
+              "unknown"
+            ],
+            "description": "Engine-neutral type of the last message, when available.",
+            "example": "image"
+          },
           "archived": {
             "type": "boolean",
             "description": "Archived state, as set via POST /sessions/{sessionId}/chats/archive.",
@@ -17835,6 +18975,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
             "example": "1234567890@c.us"
           },
@@ -17874,6 +19015,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
             "example": "1234567890@c.us"
           }
@@ -17962,6 +19104,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
             "example": "1234567890@c.us"
           }
@@ -17975,6 +19118,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           },
@@ -17993,14 +19137,16 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           },
           "muteUntil": {
-            "type": "number",
+            "type": "integer",
             "description": "Absolute epoch-MILLISECONDS timestamp at which the mute expires, or `null` to unmute now. Required — omitting it is rejected rather than guessed, because the two plausible readings (unmute vs mute forever) are opposites. To mute indefinitely, send a far-future timestamp. Milliseconds, not seconds: a seconds-scale value is an instant in 1970, so the mute expires immediately while the request still answers 200.",
             "example": 1800000000000,
-            "nullable": true
+            "nullable": true,
+            "minimum": 1
           }
         },
         "required": [
@@ -18013,6 +19159,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           },
@@ -18031,6 +19178,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           }
@@ -18044,6 +19192,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID, in the active engine's native format (e.g. 1234567890@c.us)",
             "example": "1234567890@c.us"
           },
@@ -18239,6 +19388,7 @@
                 "session.reconnect_loop",
                 "session.restriction",
                 "presence.update",
+                "event.response",
                 "group.join",
                 "group.leave",
                 "group.update",
@@ -18335,6 +19485,7 @@
                 "session.reconnect_loop",
                 "session.restriction",
                 "presence.update",
+                "event.response",
                 "group.join",
                 "group.leave",
                 "group.update",
@@ -18434,6 +19585,7 @@
                 "session.reconnect_loop",
                 "session.restriction",
                 "presence.update",
+                "event.response",
                 "group.join",
                 "group.leave",
                 "group.update",
@@ -18554,7 +19706,7 @@
           },
           "attempts": {
             "type": "number",
-            "description": "Attempts recorded for the delivery; 0 when it was shed, refused or failed before sending.",
+            "description": "Attempts recorded for the delivery; 0 when it was shed, refused or failed before sending. With the queue disabled, a delivery that shutdown caught in a retry backoff also records 0, although earlier attempts were sent.",
             "example": 5
           },
           "lastStatusCode": {
@@ -18565,12 +19717,17 @@
           },
           "lastError": {
             "type": "string",
-            "example": "connect ECONNREFUSED 10.0.0.1:443"
+            "example": "fetch failed"
           },
           "createdAt": {
             "type": "string",
             "format": "date-time",
             "description": "When the failure was first recorded."
+          },
+          "replayable": {
+            "type": "boolean",
+            "description": "True when the row still holds the event data and can be replayed with `POST /webhooks/delivery-failures/redrive`. Only terminal rows (attempts > 0) recorded while `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` > 0 are, until that window passes.",
+            "example": false
           }
         },
         "required": [
@@ -18581,7 +19738,85 @@
           "url",
           "attempts",
           "lastError",
-          "createdAt"
+          "createdAt",
+          "replayable"
+        ]
+      },
+      "RedriveWebhookDeliveriesDto": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "Only rows of this session. Narrows within the calling key's allowedSessions, never past it.",
+            "example": "my-session"
+          },
+          "webhookId": {
+            "type": "string",
+            "description": "Only rows of this webhook.",
+            "example": "0a941dac-a965-45e7-b318-74ae8be134f0"
+          },
+          "ids": {
+            "description": "Only these failure rows (ids from `GET /webhooks/delivery-failures`).",
+            "example": [
+              "0a941dac-a965-45e7-b318-74ae8be134f0"
+            ],
+            "maxItems": 500,
+            "items": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "type": "array"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max rows replayed by this call (1-500, default 100).",
+            "example": 100,
+            "minimum": 1,
+            "maximum": 500
+          }
+        }
+      },
+      "WebhookRedriveResultDto": {
+        "type": "object",
+        "properties": {
+          "redriven": {
+            "type": "number",
+            "description": "Rows replayed by this call; equals delivered.",
+            "example": 2
+          },
+          "delivered": {
+            "type": "number",
+            "description": "Delivered by a direct POST; their failure rows were removed.",
+            "example": 2
+          },
+          "enqueued": {
+            "type": "number",
+            "description": "Reserved for response compatibility; operator redrive uses direct POST and returns zero.",
+            "example": 0
+          },
+          "failed": {
+            "type": "number",
+            "description": "Replays that failed again; their rows stay, with attempts raised by one.",
+            "example": 0
+          },
+          "skipped": {
+            "type": "number",
+            "description": "Rows not replayed: the webhook was removed, disabled or unsubscribed, or a plugin cancelled it.",
+            "example": 0
+          },
+          "remaining": {
+            "type": "number",
+            "description": "Replayable rows still in scope after this call.",
+            "example": 0
+          }
+        },
+        "required": [
+          "redriven",
+          "delivered",
+          "enqueued",
+          "failed",
+          "skipped",
+          "remaining"
         ]
       },
       "CreateAutomationRuleDto": {
@@ -18720,7 +19955,7 @@
           "chatName": {
             "type": "string",
             "nullable": true,
-            "description": "Push name of the message sender as the engine reported it; in a group this is the member who posted, not the group subject. Null when no contact name was known.",
+            "description": "Sender's push name, or their saved contact name when the engine reported no push name; in a group this is the member who posted, not the group subject. Null when neither was known.",
             "example": "Alice"
           },
           "author": {
@@ -18810,6 +20045,10 @@
       "MessageListResponseDto": {
         "type": "object",
         "properties": {
+          "unknownTimestampTotal": {
+            "type": "number",
+            "description": "Rows matching the non-time filters with unknown message time, before time bounds. Present only for time selections; excluded from their messages and total. Stored history is not proof of complete remote history."
+          },
           "messages": {
             "description": "Newest first.",
             "type": "array",
@@ -18834,7 +20073,8 @@
           "url": {
             "type": "string",
             "description": "The URL as it appears in the message text — WhatsApp anchors the preview to it.",
-            "example": "https://example.com/launch"
+            "example": "https://example.com/launch",
+            "maxLength": 2048
           },
           "title": {
             "type": "string",
@@ -18860,7 +20100,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID (phone@c.us for individual, groupId@g.us for groups)",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "text": {
             "type": "string",
@@ -18873,10 +20114,12 @@
             "example": [
               "628123456789@c.us"
             ],
-            "type": "array",
+            "maxItems": 1024,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": "array"
           },
           "linkPreview": {
             "type": "boolean",
@@ -18907,7 +20150,7 @@
         "properties": {
           "messageId": {
             "type": "string",
-            "description": "The message id, assigned when the gateway accepts the message for sending. A 201 here means the message was handed to the WhatsApp client — it does NOT confirm delivery. WhatsApp does not reject an unregistered recipient synchronously, so a message to a number that is not on WhatsApp still returns 201 with a valid messageId; whether it later delivers, stalls, or is reported as an error reaches you asynchronously, if at all. To confirm a number is on WhatsApp before sending, use GET /api/sessions/{sessionId}/contacts/check/{number}; track real delivery via the message `status` field (sent → delivered → read, or failed if WhatsApp reports an error for it). A message resting at `sent` is not diagnostic on its own: a registered recipient whose device has not come online since the send stays at `sent` too.",
+            "description": "The message id, assigned when the gateway accepts the message for sending. A 201 here means the message was handed to the WhatsApp session; it does not confirm delivery. Baileys checks phone destinations without a LID mapping and rejects a number reported as unregistered with 400. An unanswered lookup returns 503 before sending. Known LIDs skip the number check. Track delivery through the message status (sent, delivered, read, or failed). A message resting at sent can also belong to a registered recipient whose device is offline.",
             "example": "true_628123456789@c.us_3EB0123456789"
           },
           "timestamp": {
@@ -18927,7 +20170,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID (phone@c.us for individual, groupId@g.us for groups)",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "templateId": {
             "type": "string",
@@ -18952,10 +20196,12 @@
             "example": [
               "628123456789@c.us"
             ],
-            "type": "array",
+            "maxItems": 1024,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": "array"
           },
           "linkPreview": {
             "type": "boolean",
@@ -18973,7 +20219,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "url": {
             "type": "string",
@@ -18992,7 +20239,8 @@
           "filename": {
             "type": "string",
             "description": "Filename for the media. Only rendered on document sends — defaults to 'file' when omitted (a URL-based document send on whatsapp-web.js first derives the URL basename)",
-            "example": "image.jpg"
+            "example": "image.jpg",
+            "maxLength": 255
           },
           "caption": {
             "type": "string",
@@ -19005,10 +20253,12 @@
             "example": [
               "628123456789@c.us"
             ],
-            "type": "array",
+            "maxItems": 1024,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": "array"
           },
           "quotedMessageId": {
             "type": "string",
@@ -19026,7 +20276,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "url": {
             "type": "string",
@@ -19045,7 +20296,8 @@
           "filename": {
             "type": "string",
             "description": "Filename for the media. Only rendered on document sends — defaults to 'file' when omitted (a URL-based document send on whatsapp-web.js first derives the URL basename)",
-            "example": "image.jpg"
+            "example": "image.jpg",
+            "maxLength": 255
           },
           "caption": {
             "type": "string",
@@ -19058,10 +20310,12 @@
             "example": [
               "628123456789@c.us"
             ],
-            "type": "array",
+            "maxItems": 1024,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": "array"
           },
           "quotedMessageId": {
             "type": "string",
@@ -19082,7 +20336,8 @@
         "properties": {
           "chatId": {
             "type": "string",
-            "description": "Chat ID (e.g. 628123456789@c.us)"
+            "description": "Chat ID (e.g. 628123456789@c.us)",
+            "maxLength": 255
           },
           "latitude": {
             "type": "number",
@@ -19116,7 +20371,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "contactName": {
             "type": "string",
@@ -19143,7 +20399,8 @@
         "properties": {
           "chatId": {
             "type": "string",
-            "description": "Chat ID (e.g. 628123456789@c.us or 1203630000@g.us)"
+            "description": "Chat ID (e.g. 628123456789@c.us or 1203630000@g.us)",
+            "maxLength": 255
           },
           "name": {
             "type": "string",
@@ -19153,15 +20410,18 @@
           },
           "options": {
             "description": "Options to vote on (WhatsApp allows between 2 and 12)",
+            "minItems": 2,
+            "maxItems": 12,
+            "items": {
+              "type": "string",
+              "maxLength": 100
+            },
             "example": [
               "Park",
               "Beach",
               "Downtown"
             ],
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
+            "type": "array"
           },
           "allowMultipleAnswers": {
             "type": "boolean",
@@ -19183,7 +20443,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "quotedMessageId": {
             "type": "string"
@@ -19197,10 +20458,12 @@
             "example": [
               "628123456789@c.us"
             ],
-            "type": "array",
+            "maxItems": 1024,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -19213,7 +20476,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string",
@@ -19240,10 +20504,12 @@
         "type": "object",
         "properties": {
           "fromChatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "toChatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -19259,7 +20525,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -19591,6 +20858,34 @@
           "body"
         ]
       },
+      "ChatHistoryPollDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "Where?"
+          },
+          "options": {
+            "example": [
+              "Park",
+              "Beach"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowMultipleAnswers": {
+            "type": "boolean",
+            "example": false
+          }
+        },
+        "required": [
+          "name",
+          "options",
+          "allowMultipleAnswers"
+        ]
+      },
       "ChatHistoryLocationDto": {
         "type": "object",
         "properties": {
@@ -19799,6 +21094,14 @@
           "quotedMessage": {
             "$ref": "#/components/schemas/ChatHistoryQuotedMessageDto"
           },
+          "poll": {
+            "description": "Poll choices and selection mode, when available.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatHistoryPollDto"
+              }
+            ]
+          },
           "location": {
             "$ref": "#/components/schemas/ChatHistoryLocationDto"
           },
@@ -19880,7 +21183,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -19899,7 +21203,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "pollMessageId": {
             "type": "string",
@@ -19924,7 +21229,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -19949,7 +21255,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -19964,7 +21271,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -19984,7 +21292,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -19999,10 +21308,12 @@
             "example": [
               "628123456789@c.us"
             ],
-            "type": "array",
+            "maxItems": 1024,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -20086,10 +21397,12 @@
             "example": [
               "628123456789@c.us"
             ],
-            "type": "array",
+            "maxItems": 1024,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": "array"
           }
         }
       },
@@ -20099,7 +21412,8 @@
           "chatId": {
             "type": "string",
             "description": "Recipient chat ID",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "type": {
             "type": "string",
@@ -20158,10 +21472,12 @@
         "properties": {
           "batchId": {
             "type": "string",
-            "description": "Custom batch ID (auto-generated if not provided)"
+            "description": "Custom batch ID (auto-generated if not provided)",
+            "maxLength": 255
           },
           "messages": {
             "description": "Array of messages (max 100 per request; exact duplicate entries are collapsed — first occurrence wins)",
+            "maxItems": 100,
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BulkMessageItemDto"
@@ -20381,7 +21697,7 @@
           },
           "autoReconnect": {
             "type": "boolean",
-            "description": "Always true: the engine auto-reconnects on a transient disconnect and there is no global off switch. Attempts are unlimited by default; cap them per session with config.maxReconnectAttempts (0-20, PATCH /api/sessions/{sessionId}/config).",
+            "description": "Always true: the engine auto-reconnects on a transient disconnect and there is no global off switch. Attempts are unlimited by default; cap them per session with config.maxReconnectAttempts (0-20, PATCH /api/sessions/{sessionId}/config). The cap bounds every reconnect on whatsapp-web.js; on Baileys it bounds only the reconnect after a logged-out close, and the engine retries a transient drop itself with no cap.",
             "example": true
           },
           "debugMode": {
@@ -20426,15 +21742,18 @@
         "properties": {
           "emailEnabled": {
             "type": "boolean",
+            "description": "Always false. Fixed placeholder: no notification feature exists, and the value is not configurable.",
             "example": false
           },
           "notificationEmail": {
             "type": "string",
+            "description": "Always empty. Fixed placeholder: no notification feature exists, and the value is not configurable.",
             "example": ""
           },
           "webhookAlerts": {
             "type": "boolean",
-            "example": true
+            "description": "Always false. Fixed placeholder: no notification feature exists, and the value is not configurable.",
+            "example": false
           }
         },
         "required": [
@@ -20630,8 +21949,8 @@
           },
           "browserArgs": {
             "type": "string",
-            "description": "Extra Chromium arguments, as configured.",
-            "example": ""
+            "description": "Effective Chromium launch arguments: PUPPETEER_ARGS or the defaults, with --lang=en-US appended unless a --lang flag is already present.",
+            "example": "--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --lang=en-US"
           },
           "webVersion": {
             "type": "string",
@@ -21681,7 +23000,7 @@
             ]
           },
           "warnings": {
-            "description": "Why the restore was rolled back (per-row failures, or a backup with no rows). Non-empty only when `imported` is false; non-fatal messages are in `notices`.",
+            "description": "Why the restore was rolled back (per-row failures, a failed session ownership restore, chat-state re-key or restored-row cleanup, a failed trim of the send idempotency claims, or a backup with no rows). Non-empty only when `imported` is false; non-fatal messages are in `notices`.",
             "example": [],
             "type": "array",
             "items": {
@@ -21698,7 +23017,7 @@
           },
           "restartRequired": {
             "type": "boolean",
-            "description": "True when an engine may still be writing into the restored tables (orphans left running by `force`, a failed `stopOrphans` teardown, sessions held by another node, or plugin bindings not re-applied). Restart to reconcile. Can be true even when `imported` is false.",
+            "description": "True when an engine may still be writing into the restored tables (orphans left running by `force`, a failed `stopOrphans` teardown, sessions held by another node; restart to reconcile), or when plugin instance bindings could not be re-synced after the commit (a restart does not repair this; follow the manual check named in `notices`). Can be true even when `imported` is false.",
             "example": false
           },
           "orphanedEngines": {
@@ -21869,8 +23188,8 @@
           },
           "profilePicUrl": {
             "type": "string",
-            "description": "Profile picture URL. Absent when the contact has none or their privacy settings hide it.",
-            "example": "https://pps.whatsapp.net/v/t61.24694-24/12345_678_910_n.jpg"
+            "description": "A cached profile picture URL. Only Baileys can fill it (whatsapp-web.js never sets it), and it is often absent there too, so its absence does not say whether the contact has a picture; fetch the URL from GET /contacts/{contactId}/profile-picture.",
+            "example": "https://pps.whatsapp.net/v/..."
           }
         },
         "required": [
@@ -21965,6 +23284,7 @@
           "firstName": {
             "type": "string",
             "description": "The contact's first name.",
+            "minLength": 1,
             "maxLength": 100
           },
           "lastName": {
@@ -22614,9 +23934,11 @@
             "example": "video"
           },
           "startTime": {
-            "type": "number",
+            "type": "integer",
             "description": "Absolute epoch-MILLISECONDS timestamp the call is scheduled to start at. Required: whatsapp-web.js generates an event-linked call and has no notion of \"no start time\", so a link for right now is `Date.now()` rather than an omitted field.",
-            "example": 1800000000000
+            "example": 1800000000000,
+            "minimum": 1,
+            "maximum": 8640000000000000
           }
         },
         "required": [
@@ -22779,7 +24101,7 @@
           },
           "mediaUrl": {
             "type": "string",
-            "description": "Media URL, when the engine resolved one."
+            "description": "Media URL. Neither engine populates it today; use hasMedia."
           }
         },
         "required": [
@@ -22801,7 +24123,8 @@
           "description": {
             "type": "string",
             "description": "Channel description",
-            "example": "Release notes and downtime notices"
+            "example": "Release notes and downtime notices",
+            "maxLength": 2048
           }
         },
         "required": [
@@ -23576,7 +24899,7 @@
           },
           "productCount": {
             "type": "number",
-            "description": "How many products the first collection holds.",
+            "description": "How many products the first collection holds, counting at most the first 51 on Baileys.",
             "example": 12
           },
           "url": {
@@ -23622,7 +24945,7 @@
           "priceFormatted": {
             "type": "string",
             "description": "Price rendered for display. Synthesized by the gateway from price + currency, so an unrecognised currency code falls back to a plain \"CODE amount\" pair, and a product with no currency shows the bare amount. Present only when price is.",
-            "example": "IDR 85,000.00"
+            "example": "IDR 85,000"
           },
           "imageUrl": {
             "type": "string",
@@ -23707,6 +25030,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat to send the product card to (@c.us or @g.us).",
             "example": "628123456789@c.us"
           },
@@ -24062,22 +25386,28 @@
           "instanceId": {
             "type": "string",
             "description": "Operator-chosen instance id (unique within the plugin). Namespaces the ingress URL and the instance secret.",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
             "example": "chatwoot-prod-1"
           },
           "sessionScope": {
             "type": "string",
             "description": "Session id the instance is scoped to. Omit for all sessions.",
+            "minLength": 1,
+            "maxLength": 256,
             "example": "8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a"
           },
           "verifyToken": {
             "type": "string",
             "description": "Token echoed back for the provider webhook verification handshake. Auto-generated when omitted.",
+            "maxLength": 512,
             "example": "a1b2c3d4e5f6"
           },
           "secret": {
             "type": "string",
-            "description": "Ingress HMAC secret shared with the provider. Omit to auto-generate a random 64-hex secret. Masked (****) on every read.",
+            "description": "Ingress HMAC secret shared with the provider. Omit to auto-generate a random 64-hex secret. Masked ('***') on every later read; plaintext returned only once on create/regenerate-secret.",
             "writeOnly": true,
+            "minLength": 16,
+            "maxLength": 512,
             "example": "super-secret-provider-webhook-key"
           },
           "config": {
@@ -24188,7 +25518,9 @@
           "sessionScope": {
             "type": "string",
             "description": "Session id to bind the instance to, or null for all sessions. Omit to leave the scope unchanged.",
-            "nullable": true
+            "nullable": true,
+            "minLength": 1,
+            "maxLength": 256
           },
           "config": {
             "type": "object",
@@ -24331,11 +25663,18 @@
           },
           "code": {
             "type": "string",
-            "description": "A stable machine-readable reason, on some errors only: SESSION_NAME_TEARDOWN_PENDING (409), SESSION_STOP_INCOMPLETE, SESSION_LOGOUT_INCOMPLETE and SESSION_FORCE_KILL_INCOMPLETE (502), SEND_PACING_LIMITED (429), ENGINE_PAGE_ERROR (500, whatsapp-web.js: WhatsApp Web threw inside the page during a send or status post), IMPORT_ALREADY_RUNNING, EXPORT_IN_PROGRESS, IMPORT_WOULD_ORPHAN_ENGINES and IMPORT_NESTED_TRANSACTION (409)."
+            "description": "A stable machine-readable reason, on some errors only: SESSION_NAME_TEARDOWN_PENDING (409), SESSION_STOP_INCOMPLETE, SESSION_LOGOUT_INCOMPLETE and SESSION_FORCE_KILL_INCOMPLETE (502), SEND_PACING_LIMITED (429), ENGINE_PAGE_ERROR (500, whatsapp-web.js: WhatsApp Web threw inside the page during a send or status post), IMPORT_ALREADY_RUNNING, EXPORT_IN_PROGRESS, IMPORT_WOULD_ORPHAN_ENGINES and IMPORT_NESTED_TRANSACTION (409), IDEMPOTENCY_KEY_INVALID (400), IDEMPOTENCY_KEY_REUSED (422), IDEMPOTENCY_KEY_IN_PROGRESS and IDEMPOTENCY_OUTCOME_UNKNOWN (409), POLL_OPTION_NOT_FOUND (400, whatsapp-web.js vote-poll)."
           },
           "retryAfterSeconds": {
             "type": "integer",
             "description": "With SEND_PACING_LIMITED: seconds until the session accepts sends again."
+          },
+          "validOptions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "With POLL_OPTION_NOT_FOUND: the option texts the poll offers."
           },
           "pageError": {
             "type": "object",

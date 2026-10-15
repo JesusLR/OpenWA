@@ -19,7 +19,7 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 export interface RequestOptions {
   method: HttpMethod;
-  /** Full path beginning with `/`, e.g. `/api/sessions`. */
+  /** Full path beginning with `/`, e.g. `/api/sessions`; any other path is refused and nothing is sent. */
   path: string;
   /** Query parameters, serialized into the URL. */
   query?: object;
@@ -75,7 +75,8 @@ export function buildUrl(baseUrl: string, path: string, query?: object): string 
     params.append(key, String(value));
   }
   const qs = params.toString();
-  return qs ? `${url}?${qs}` : url;
+  // A raw path may already carry a query string; extend it rather than start a second one.
+  return qs ? `${url}${path.includes('?') ? '&' : '?'}${qs}` : url;
 }
 
 /**
@@ -125,6 +126,15 @@ export async function requestBytes(
 }
 
 /**
+ * Whether a header value holds a character fetch cannot send: a control character other than a tab, or one
+ * above U+00FF. Checked at construction so that the refusal names the header and never repeats the value,
+ * which the transport's own TypeError does, and a credential would reach the application's log with it.
+ */
+export function hasUnsendableChar(value: string): boolean {
+  return /[\u0000-\u0008\u000a-\u001f\u007f\u0100-\uffff]/.test(value);
+}
+
+/**
  * A timeout in milliseconds, coerced once: untyped JS config can pass a numeric string (process.env).
  * `0` or `Infinity` turns the timeout off, so any other value that is not a non-negative number (an
  * empty variable, `30s`) is refused rather than read as "off", which would let a request hang forever.
@@ -150,6 +160,11 @@ async function send<T>(
   options: RequestOptions,
   consume: (res: Response) => Promise<T>,
 ): Promise<T> {
+  // The path is appended to the base URL, so one without a leading `/` could move the host
+  // (`.example.net/x`, `@example.net/x`) and send the API key there.
+  if (!options.path.startsWith('/')) {
+    throw new TypeError(`OpenWA: path must begin with "/": ${JSON.stringify(options.path)}`);
+  }
   if (options.path.includes(BLANK_SEGMENT)) {
     throw new TypeError(`OpenWA: empty or dot path segment in ${JSON.stringify(options.path)}`);
   }
@@ -182,12 +197,14 @@ async function send<T>(
   // Auth and JSON content-type WIN over caller-supplied defaults/per-request headers — the SDK only
   // ever sends a JSON body, and this matches the Python and PHP SDKs (which force JSON) and the
   // documented "JSON headers win" contract. Header names are case-insensitive and fetch joins duplicates,
-  // so drop a caller's copy in any case before adding ours; putting ours last is not enough.
-  const headers: Record<string, string> = {};
-  for (const [name, value] of Object.entries({ ...config.defaultHeaders, ...options.headers })) {
+  // so merge by lowercased name (a per-request header replaces a default in any case) and drop a
+  // caller's copy of ours before adding them; putting ours last is not enough.
+  const merged = new Map<string, [string, string]>();
+  for (const [name, value] of [...Object.entries(config.defaultHeaders), ...Object.entries(options.headers ?? {})]) {
     const lower = name.toLowerCase();
-    if (lower !== 'content-type' && lower !== 'x-api-key') headers[name] = value;
+    if (lower !== 'content-type' && lower !== 'x-api-key') merged.set(lower, [name, value]);
   }
+  const headers: Record<string, string> = Object.fromEntries(merged.values());
   headers['Content-Type'] = 'application/json';
   headers['X-API-Key'] = config.apiKey;
 

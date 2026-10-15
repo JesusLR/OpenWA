@@ -145,7 +145,10 @@
 > connected to node A receives an event raised on node B. Scope honestly: this distributes event
 > **fan-out only**. The per-key WS rate-limit buckets (counted per replica) and the engine registry
 > are still process-local. Without `REDIS_ENABLED` the adapter is inert and delivery is single-node,
-> exactly as before.
+> exactly as before. With it, every event of a one-to-one chat also costs the emitting node one or two
+> `lid_mappings` lookups (one for a `@lid` chat, none for a group), even when no chat-restricted key
+> exists: it cannot know whether another replica holds a restricted socket, so it names the chat in
+> every form for the rooms to match.
 >
 > **Mid-connection key eviction converges on a timer, not a broadcast, and only on one node.** The
 > node that processes a revoke, delete, or narrowing tears down that key's sockets synchronously, in
@@ -261,6 +264,9 @@ version: '3.8'
 services:
   openwa:
     image: ghcr.io/rmyndharis/openwa:latest
+    # Teardown takes up to 63 s with every datastore on; raise this by the amount SHUTDOWN_DELAY_MS or
+    # WEBHOOK_SHUTDOWN_DRAIN_MS exceeds its default, or the 10 s default kills the task mid-teardown.
+    stop_grace_period: 75s
     deploy:
       replicas: 1 # MUST stay 1 until multi-replica is supported — multiple replicas on one session volume corrupt WhatsApp auth
       update_config:
@@ -288,7 +294,9 @@ services:
       # node, which has to wait out its own previous lease). Defaults to the container hostname.
       - NODE_ID={{.Node.Hostname}}-{{.Task.Slot}}
     volumes:
-      - sessions:/app/data/sessions
+      # The whole data tree, not only sessions/: main.sqlite (API keys, audit log), baileys/,
+      # media and the generated secrets live there too, and a replaced task would lose them.
+      - openwa-data:/app/data
     networks:
       - openwa-net
     depends_on:
@@ -329,7 +337,7 @@ services:
 volumes:
   postgres-data:
   redis-data:
-  sessions:
+  openwa-data:
 
 networks:
   openwa-net:
@@ -350,7 +358,7 @@ docker service ls
 docker service ps openwa_openwa
 ```
 
-> **Do not scale the `openwa` service** (`docker service scale openwa_openwa=N`). The `sessions`
+> **Do not scale the `openwa` service** (`docker service scale openwa_openwa=N`). The `openwa-data`
 > volume above is declared with the default local driver (not `external`), so Swarm creates one per
 > node: replicas co-located on a single node share that directory and corrupt the WhatsApp auth
 > state, while replicas placed on other nodes each get a fresh empty volume and start an
@@ -421,6 +429,9 @@ spec:
       labels:
         app: openwa
     spec:
+      # The teardown can take up to 63 s on a clustered replica (src/common/services/shutdown-budget.ts), so
+      # Kubernetes' default grace of 30 s would SIGKILL a slow stop half way. Match the shipped chart.
+      terminationGracePeriodSeconds: 75
       # OS-level containment is defence in depth for the plugin sandbox (see docs/30-plugin-sandboxing.md):
       # it limits the privileges the API process holds, not what a plugin inside that process can reach.
       # Without it the API process, and every plugin loaded into it, keeps whatever the container runtime
@@ -465,8 +476,8 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ['ALL']
-              # Only for the root entrypoint's chown and the gosu privilege drop.
-              add: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETGID', 'SETUID']
+              # The root entrypoint's chown, the gosu privilege drop, and init forwarding signals after it.
+              add: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'KILL', 'SETGID', 'SETUID']
           resources:
             requests:
               memory: '512Mi'
@@ -560,6 +571,9 @@ metadata:
     nginx.ingress.kubernetes.io/affinity: 'cookie'
     nginx.ingress.kubernetes.io/session-cookie-name: 'openwa-session'
     nginx.ingress.kubernetes.io/session-cookie-max-age: '172800'
+    # ingress-nginx refuses a request body over 1m by default, which base64 media sends exceed.
+    # Keep this at or above BODY_SIZE_LIMIT (25mb by default).
+    nginx.ingress.kubernetes.io/proxy-body-size: '25m'
 spec:
   ingressClassName: nginx
   rules:
@@ -586,6 +600,9 @@ already encodes the `replicaCount: 1` constraint below; prefer it over hand-appl
 raw manifests here stay for operators who do not use Helm.
 
 ```bash
+# Apply the namespace first: a directory is applied in file-name order, and the other files name it
+kubectl apply -f k8s/namespace.yaml
+
 # Apply all manifests
 kubectl apply -f k8s/
 
@@ -653,6 +670,10 @@ upstream openwa {
 server {
     listen 80;
     server_name openwa.example.com;
+
+    # nginx refuses a request body over 1m by default, below the 25mb OpenWA itself accepts
+    # (BODY_SIZE_LIMIT), so base64 media sends would answer 413 before reaching a node.
+    client_max_body_size 25m;
 
     location / {
         proxy_pass http://openwa;

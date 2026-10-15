@@ -36,6 +36,7 @@
     "hoursAgo": "vor {{count}} Std.",
     "hoursAgo_other": "vor {{count}} Std.",
     "optional": "optional",
+    "fieldTooLong": "Auf {{max}} Zeichen begrenzt (aktuell {{count}}).",
     "language": "Sprache",
     "back": "Zurück",
     "next": "Weiter",
@@ -94,6 +95,7 @@
     "loadingMessages": "Nachrichten werden geladen...",
     "loadingOlderMessages": "Ältere Nachrichten werden geladen...",
     "loadOlderMessagesError": "Ältere Nachrichten konnten nicht geladen werden. Zum erneuten Versuch nach oben scrollen.",
+    "loadOlderMessagesRetryHint": "Zum erneuten Versuch nach oben scrollen.",
     "noMessagesInChat": "Noch keine Nachrichten. Sende die erste Nachricht, um zu beginnen!",
     "downloadDocument": "Dokument herunterladen",
     "actions": {
@@ -122,7 +124,6 @@
       "unknownType": "Unbekannter Typ"
     },
     "you": "Du",
-    "youPrefix": "Du: ",
     "yesterday": "Gestern",
     "attachTitle": "Datei/Bild senden",
     "emojiTitle": "Emoji auswählen",
@@ -348,7 +349,7 @@
       "configured": "{{host}} ({{type}})",
       "noProxy": "Kein Proxy konfiguriert",
       "hasCredentials": "Zugangsdaten sind gespeichert, werden aber nicht angezeigt. Gib eine vollständige URL ein, um sie zu ändern.",
-      "hint": "Änderungen gelten ab dem nächsten Sitzungsstart, nicht für eine laufende Verbindung. Der Proxy muss echt und erreichbar sein: Ein nicht erreichbarer Wert blockiert die QR-Zustellung, und der Start gibt 504 zurück.",
+      "hint": "Änderungen gelten ab dem nächsten Sitzungsstart, nicht für eine laufende Verbindung. Der Proxy muss echt und erreichbar sein: Ein nicht erreichbarer Wert blockiert die QR-Zustellung. Unter whatsapp-web.js gibt der Start 504 zurück, unter Baileys gelingt der Start und die Sitzung versucht es weiter.",
       "createHint": "Nur nötig, wenn dein Netzwerk WhatsApp nicht direkt erreichen kann. Muss ein echter, erreichbarer Proxy sein.",
       "invalidUrl": "Gib eine gültige http-, https-, socks4- oder socks5-Proxy-URL ein.",
       "saveSuccessTitle": "Proxy gespeichert",
@@ -487,11 +488,9 @@
       "valueLabel": "Filterwert"
     },
     "columns": {
-      "url": "URL",
       "events": "Ereignisse",
       "session": "Sitzung",
-      "status": "Status",
-      "actions": "Aktionen"
+      "status": "Status"
     },
     "empty": {
       "title": "Keine Webhooks konfiguriert",
@@ -531,6 +530,7 @@
       "session.reconnect_loop": "Wenn eine Sitzung wiederholt nicht neu verbinden kann",
       "session.restriction": "Wenn WhatsApp das Konto einschränkt oder eine Einschränkung aufhebt",
       "presence.update": "Wenn ein abonnierter Chat online geht, tippt oder offline geht",
+      "event.response": "Wenn ein Gast auf eine WhatsApp-Veranstaltung antwortet (Zusage, Absage, Vielleicht)",
       "group.join": "Wenn Teilnehmer einer Gruppe beitreten oder hinzugefügt werden",
       "group.leave": "Wenn Teilnehmer eine Gruppe verlassen oder entfernt werden",
       "group.update": "Wenn sich Name, Beschreibung oder Einstellungen einer Gruppe ändern",
@@ -671,7 +671,6 @@
       "revoke": "Widerrufen"
     },
     "actions": {
-      "copy": "Kopieren",
       "revoke": "Widerrufen",
       "delete": "Löschen",
       "edit": "Zugriff bearbeiten"
@@ -704,8 +703,9 @@
     },
     "chats": {
       "label": "Chat-Zugriff (optional)",
-      "hint": "Ein Chat pro Zeile: eine Gruppen-ID mit @g.us, eine Kontakt-ID mit @c.us oder @lid oder eine Telefonnummer. Leer lassen für alle Chats. Ein auf Chats beschränkter Schlüssel kann nur die für solche Schlüssel freigegebenen Routen nutzen; der Events-WebSocket und MCP lehnen ihn ab.",
-      "invalid": "Keine Chat-ID und keine Telefonnummer: {{value}}"
+      "hint": "Ein Chat pro Zeile: eine Gruppen-ID mit @g.us, eine Kontakt-ID mit @c.us oder @lid oder eine Telefonnummer. Leer lassen für alle Chats. Ein auf Chats beschränkter Schlüssel kann nur die für solche Schlüssel freigegebenen Routen nutzen; sein Zugriff über den Events-WebSocket und MCP bleibt auf diese Chats beschränkt.",
+      "invalid": "Keine Chat-ID und keine Telefonnummer: {{value}}",
+      "tooMany": "Zu viele Chats ({{count}}): Ein Schlüssel darf höchstens {{max}} auflisten."
     },
     "expiry": {
       "label": "Läuft ab am (optional)",
@@ -886,7 +886,7 @@
       "sslRejectUnauthorized": "SSL-Zertifikat überprüfen",
       "sslRejectUnauthorizedDesc": "Selbstsignierte oder ungültige Zertifikate ablehnen. Bei verwaltetem PostgreSQL mit selbstsignierten Zertifikaten deaktivieren (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Datenbankmigrationen",
-      "migrationsStatus": "Das Schema wird automatisch mit TypeORM synchronisiert",
+      "migrationsStatus": "Ausstehende Migrationen werden beim Start automatisch angewendet",
       "migrationsHint": "Migrationen werden automatisch verwaltet. Verwende die CLI für manuelle Migrationen."
     },
     "engine": {
@@ -909,7 +909,7 @@
     "redis": {
       "title": "Redis",
       "enable": "Redis aktivieren",
-      "enableDesc": "Erforderlich für Caching, Sitzungsspeicherung und BullMQ-Warteschlangen",
+      "enableDesc": "Wird für Caching, BullMQ-Warteschlangen, Rate-Limit-Zähler und die WebSocket-Verteilung über mehrere Knoten verwendet",
       "useBuiltIn": "Integrierten Redis-Container verwenden",
       "builtInDesc": "OpenWA verwaltet einen Redis-Container für dich",
       "queueTitle": "BullMQ-Warteschlangensystem aktivieren",
@@ -921,7 +921,7 @@
       "failed": "Fehlgeschlagen",
       "viewBullMq": "BullMQ-Dashboard ansehen",
       "disabledTitle": "Redis ist deaktiviert",
-      "disabledDesc": "Aktiviere Redis für Caching, Sitzungsspeicherung und BullMQ-Nachrichtenwarteschlangen.",
+      "disabledDesc": "Aktiviere Redis für Caching, BullMQ-Nachrichtenwarteschlangen, Rate-Limit-Zähler und die WebSocket-Verteilung über mehrere Knoten.",
       "passwordOptional": "(optional)",
       "bullMqUrlCopied": "URL des BullMQ-Dashboards kopiert",
       "bullMqUrlHint": "Öffne es mit einem ADMIN-API-Schlüssel — ein Browser-Tab kann sich nicht authentifizieren."
@@ -1055,7 +1055,7 @@
       "healthFail": "Funktionsprüfung fehlgeschlagen",
       "healthError": "Fehler bei der Funktionsprüfung",
       "savedTitle": "Konfiguration gespeichert",
-      "savedDesc": "Ein Serverneustart ist erforderlich, um die Änderungen anzuwenden.",
+      "savedDesc": "Änderungen werden ohne Serverneustart wirksam.",
       "saveFailed": "Speichern fehlgeschlagen",
       "installed": "Plugin installiert",
       "installFailed": "Installation fehlgeschlagen",

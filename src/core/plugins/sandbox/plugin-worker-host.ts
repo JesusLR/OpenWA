@@ -24,6 +24,9 @@ const SEND_CAP_VERBS: ReadonlySet<string> = new Set(['messages.sendText', 'messa
 /** Send-verb budget as a multiple of capTimeoutMs (default 30s → 120s: the 30s media download + upload headroom). */
 const SEND_CAP_TIMEOUT_FACTOR = 4;
 
+/** Longest worker-reported error kept for an exit message and the plugin's status. */
+const MAX_WORKER_ERROR_CHARS = 500;
+
 /** Worker replies that finish a host request; one arriving during a liveness probe restarts its window. */
 const PROGRESS_KINDS: ReadonlySet<WorkerToHostMessage['kind']> = new Set([
   'lifecycle-result',
@@ -95,6 +98,9 @@ export class PluginWorkerHost {
   // True once terminate() is called, so onExit can tell a deliberate kill (disable/enable-failure) from an
   // unexpected worker crash — only the latter is logged as a warning.
   private terminated = false;
+  // The last error the worker reported (an uncaught exception arrives as one just before the exit), kept for
+  // the exit: once the worker is ready no load() waits for it. Plugin-chosen text, so one bounded line.
+  private lastWorkerError?: string;
   // The liveness probe in flight, if any, and whether onUnresponsive has already fired (it fires once).
   private probe?: { id: number; timer: ReturnType<typeof setTimeout> };
   private unresponsiveReported = false;
@@ -127,7 +133,8 @@ export class PluginWorkerHost {
     private readonly onSearchProviderRegister?: () => void,
     // Called once after the worker exits (crash or terminate), after in-flight calls are drained, so the
     // loader can release plugin-owned host resources (e.g. unregister a search provider the worker declared).
-    private readonly onExit?: (code: number, intentional: boolean) => void,
+    // `reason` is the last error the worker reported before it exited, when it reported one.
+    private readonly onExit?: (code: number, intentional: boolean, reason?: string) => void,
     // Host-side budget for ONE capability call. A worker whose calls hang would otherwise hold its
     // in-flight slots forever (self-DoS once maxInFlightCaps are all wedged). On timeout the worker gets
     // an error cap-result and the slot frees; the underlying host-side work is NOT cancelled (see
@@ -372,14 +379,22 @@ export class PluginWorkerHost {
   // (Re)start the probe window. The port is FIFO, so a worker working through a burst of dispatches
   // reads the ping only after that backlog; every result it sends meanwhile proves its loop is turning
   // and restarts the window (handleMessage). Only a full window with no answer at all is reported.
+  // The verdict waits one loop turn: after a host-side stall the timers phase runs before the poll
+  // phase that delivers port messages, so a pong already queued must be read before judging. A pong
+  // or a re-arm handled in between replaces this.probe, which the timer comparison detects.
   private armProbe(id: number): void {
     if (this.probe) clearTimeout(this.probe.timer);
-    const timer = setTimeout(() => {
-      this.probe = undefined;
-      if (this.dead || this.terminated || this.unresponsiveReported) return;
-      this.unresponsiveReported = true;
-      this.onUnresponsive?.();
-    }, this.livenessTimeoutMs);
+    const timer = setTimeout(
+      () =>
+        setImmediate(() => {
+          if (this.probe?.timer !== timer) return;
+          this.probe = undefined;
+          if (this.dead || this.terminated || this.unresponsiveReported) return;
+          this.unresponsiveReported = true;
+          this.onUnresponsive?.();
+        }),
+      this.livenessTimeoutMs,
+    );
     this.probe = { id, timer };
   }
 
@@ -416,6 +431,7 @@ export class PluginWorkerHost {
         });
         break;
       case 'error': {
+        this.lastWorkerError = String(message.error).replace(/\s+/g, ' ').slice(0, MAX_WORKER_ERROR_CHARS);
         const error = new Error(message.error);
         this.drain(this.readyWaiters, w => {
           if (w.timer) clearTimeout(w.timer);
@@ -597,7 +613,9 @@ export class PluginWorkerHost {
       clearTimeout(this.probe.timer);
       this.probe = undefined;
     }
-    const error = new Error(`plugin worker exited unexpectedly (code ${code})`);
+    const error = new Error(
+      `plugin worker exited unexpectedly (code ${code})${this.lastWorkerError ? `: ${this.lastWorkerError}` : ''}`,
+    );
     this.drain(this.readyWaiters, w => {
       if (w.timer) clearTimeout(w.timer);
       w.reject(error);
@@ -635,7 +653,7 @@ export class PluginWorkerHost {
       resolve({ ok: false, error: 'plugin worker exited' });
     });
     this.searchPending.clear();
-    this.onExit?.(code, this.terminated);
+    this.onExit?.(code, this.terminated, this.lastWorkerError);
   }
 
   private drain<T>(waiters: T[], fn: (w: T) => void): void {

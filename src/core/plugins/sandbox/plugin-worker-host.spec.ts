@@ -1,3 +1,4 @@
+import { MessageChannel } from 'worker_threads';
 import { PluginWorkerHost } from './plugin-worker-host';
 import { PluginWorkerChannel, HostToWorkerMessage, WorkerToHostMessage } from './protocol';
 import { HookManager } from '../../hooks/hook-manager.service';
@@ -134,6 +135,55 @@ describe('PluginWorkerHost', () => {
     ch.crash(1);
 
     await expect(p).rejects.toThrow(/exit/i);
+  });
+
+  // A worker that dies from an exception after it enabled reports the real reason as an error message
+  // just before it exits: with no load() waiting, the exit used to be all the host kept.
+  describe('the error a worker reports before it exits', () => {
+    const hostWithExit = (ch: FakeChannel, onExit: jest.Mock): PluginWorkerHost =>
+      new PluginWorkerHost(ch, undefined, undefined, undefined, undefined, undefined, undefined, undefined, onExit);
+
+    it('is named by the rejection of a call the exit drains and by the exit callback', async () => {
+      const ch = new FakeChannel();
+      const onExit = jest.fn();
+      const host = hostWithExit(ch, onExit);
+      void host.load('/p/index.js');
+      ch.reply({ kind: 'ready' });
+      const p = host.runLifecycle('onEnable');
+
+      ch.reply({ kind: 'error', error: 'boom: relay answered 500' });
+      ch.crash(1);
+
+      await expect(p).rejects.toThrow('plugin worker exited unexpectedly (code 1): boom: relay answered 500');
+      expect(onExit).toHaveBeenCalledWith(1, false, 'boom: relay answered 500');
+    });
+
+    it('is cut to one bounded line, since the plugin chose it', () => {
+      const ch = new FakeChannel();
+      const onExit = jest.fn();
+      hostWithExit(ch, onExit);
+
+      ch.reply({ kind: 'error', error: `first\nsecond ${'x'.repeat(2000)}` });
+      ch.crash(1);
+
+      const reason = (onExit.mock.calls[0] as [number, boolean, string])[2];
+      expect(reason.startsWith('first second x')).toBe(true);
+      expect(reason.length).toBeLessThanOrEqual(500);
+    });
+
+    it('leaves the message and the callback as they were when the worker reported nothing', async () => {
+      const ch = new FakeChannel();
+      const onExit = jest.fn();
+      const host = hostWithExit(ch, onExit);
+      void host.load('/p/index.js');
+      ch.reply({ kind: 'ready' });
+      const p = host.runLifecycle('onEnable');
+
+      ch.crash(1);
+
+      await expect(p).rejects.toThrow(/^plugin worker exited unexpectedly \(code 1\)$/);
+      expect(onExit).toHaveBeenCalledWith(1, false, undefined);
+    });
   });
 
   it('terminate() terminates the underlying channel', async () => {
@@ -917,6 +967,10 @@ describe('PluginWorkerHost', () => {
         timeoutMs: 500,
       });
 
+    // The verdict is given one loop turn after the window closes (see armProbe); a fake setImmediate
+    // queued while timers are advancing runs on the next timer step.
+    const verdict = () => jest.advanceTimersToNextTimer();
+
     beforeEach(() => jest.useFakeTimers());
     afterEach(() => jest.useRealTimers());
 
@@ -956,6 +1010,7 @@ describe('PluginWorkerHost', () => {
       jest.advanceTimersByTime(500);
       await pending;
       jest.advanceTimersByTime(PROBE_MS);
+      verdict();
       expect(onUnresponsive).toHaveBeenCalledTimes(1);
 
       const again = hook(host);
@@ -982,6 +1037,7 @@ describe('PluginWorkerHost', () => {
 
       // A full window with no answer at all is still reported.
       jest.advanceTimersByTime(PROBE_MS);
+      verdict();
       expect(onUnresponsive).toHaveBeenCalledTimes(1);
     });
 
@@ -995,6 +1051,7 @@ describe('PluginWorkerHost', () => {
       jest.advanceTimersByTime(PROBE_MS - 100);
       ch.reply({ kind: 'log', level: 'log', message: 'still spinning' });
       jest.advanceTimersByTime(100);
+      verdict();
       expect(onUnresponsive).toHaveBeenCalledTimes(1);
     });
 
@@ -1011,6 +1068,7 @@ describe('PluginWorkerHost', () => {
         await pending;
         expect(pings(ch)).toHaveLength(1);
         jest.advanceTimersByTime(PROBE_MS);
+        verdict();
         expect(onUnresponsive).toHaveBeenCalledTimes(1);
       }
     });
@@ -1022,6 +1080,50 @@ describe('PluginWorkerHost', () => {
       jest.advanceTimersByTime(500);
       await pending;
       expect(pings(ch)).toHaveLength(0);
+    });
+
+    // Real timers and a real MessagePort: the race lives in the event loop's phase order. After a host
+    // stall the timers phase runs before the poll phase that delivers the port message, so a pong the
+    // worker sent in time was read only after the probe timer had already fired.
+    it('reads a pong that was queued while the host was stalled before giving its verdict', async () => {
+      jest.useRealTimers();
+      const SHORT_PROBE_MS = 50;
+      const { port1, port2 } = new MessageChannel();
+      const ch = new FakeChannel();
+      ch.postMessage = (message: HostToWorkerMessage): void => {
+        ch.sent.push(message);
+        if (message.kind !== 'ping') return;
+        setImmediate(() => {
+          port2.postMessage({ kind: 'pong', id: message.id });
+          const until = Date.now() + SHORT_PROBE_MS * 2;
+          while (Date.now() < until); // the host's own loop is blocked past the probe window
+        });
+      };
+      port1.on('message', (message: WorkerToHostMessage) => ch.reply(message));
+      const onUnresponsive = jest.fn();
+      const host = new PluginWorkerHost(
+        ch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        SHORT_PROBE_MS,
+        onUnresponsive,
+      );
+      try {
+        await host.dispatchHook({ event: 'message:received', data: {}, source: 'Engine', timeoutMs: 10 });
+        await new Promise(resolve => setTimeout(resolve, SHORT_PROBE_MS * 4));
+
+        expect(pings(ch)).toHaveLength(1);
+        expect(onUnresponsive).not.toHaveBeenCalled();
+      } finally {
+        port1.close();
+      }
     });
 
     it('a worker exit cancels a probe in flight', async () => {

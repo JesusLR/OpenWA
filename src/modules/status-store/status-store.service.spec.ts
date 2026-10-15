@@ -45,6 +45,44 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     fs.rmSync(baseDir, { recursive: true, force: true });
   });
 
+  // SQLite serves every repository from one connection, so a transaction a save opens is shared with the
+  // writes made while it is open, and the rollback of a duplicate's unique violation would undo them too,
+  // after ingest had reported them created and the status.received webhook had gone out.
+  it('keeps a row written while a duplicate that lost the unique-key race is refused', async () => {
+    const status = (waStatusId: string) => ({
+      waStatusId,
+      contactJid: '628111@c.us',
+      type: 'text' as const,
+      caption: waStatusId,
+      postedAt: Date.now(),
+    });
+    await service.ingest('sess-race', status('dup'));
+    // The racing ingest read before the winner wrote, so it goes on to the insert that must be refused.
+    jest.spyOn(repository, 'findOne').mockResolvedValueOnce(null);
+    let concurrent: Promise<unknown> | undefined;
+    ds.subscribers.push({
+      listenTo: () => StatusUpdate,
+      beforeInsert: event => {
+        if ((event.entity as StatusUpdate).waStatusId === 'dup' && !concurrent) {
+          const other = status('other');
+          concurrent = repository.insert({
+            ...other,
+            sessionId: 'sess-race',
+            expiresAt: other.postedAt + 24 * 60 * 60 * 1000,
+            mediaOmitted: false,
+          });
+        }
+      },
+    });
+
+    const { created } = await service.ingest('sess-race', status('dup'));
+    await concurrent;
+
+    expect(created).toBe(false);
+    const stored = (await repository.find({ where: { sessionId: 'sess-race' } })).map(row => row.waStatusId).sort();
+    expect(stored).toEqual(['dup', 'other']);
+  });
+
   it('ingest writes a text row with expiresAt = postedAt + 24h, flagged as created', async () => {
     const postedAt = Date.now();
     const { row, created } = await service.ingest('sess', {
@@ -76,6 +114,25 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     const styled = (await service.list('sess')).find(s => s.id === 'styled')!;
     expect(styled.backgroundColor).toBe('#25d366');
     expect(styled.font).toBe(2);
+  });
+
+  it('serves a status with no name, push name, caption or styling without those keys', async () => {
+    const postedAt = Date.now();
+    await service.ingest('sess', { waStatusId: 'bare', contactJid: '628333@c.us', type: 'text', postedAt });
+
+    // The columns read back as null, but StatusDto and the openapi schema declare these fields optional,
+    // not nullable: a client typed from the contract must see them absent.
+    const listed = (await service.list('sess')).find(s => s.id === 'bare')!;
+    const [byContact] = await service.listByContact('sess', '628333@c.us');
+    const wire = {
+      id: 'bare',
+      contact: { id: '628333@c.us' },
+      type: 'text',
+      timestamp: new Date(postedAt).toISOString(),
+      expiresAt: new Date(postedAt + 24 * 60 * 60 * 1000).toISOString(),
+    };
+    expect(JSON.parse(JSON.stringify(listed))).toEqual(wire);
+    expect(JSON.parse(JSON.stringify(byContact))).toEqual(wire);
   });
 
   it('ingest persists media to a file under the cap and records mediaPath', async () => {
@@ -197,6 +254,21 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
   it('getMedia returns the path/mimetype for a status with kept media', async () => {
     const media = await service.getMedia('sess', 'w2');
     expect(media?.mimetype).toBe('image/jpeg');
+    expect(media?.path).toContain('statuses/sess/');
+  });
+
+  // A status whose media arrived without a type still has its bytes stored and its mediaUrl
+  // advertised, so the URL has to resolve; the media endpoint serves an unknown type as inert bytes.
+  it('getMedia serves stored media that arrived without a mimetype as octet-stream', async () => {
+    await service.ingest('sess', {
+      waStatusId: 'untyped',
+      contactJid: '628111@c.us',
+      type: 'image',
+      media: { mimetype: '', data: Buffer.from('raw').toString('base64') },
+      postedAt: Date.now(),
+    });
+    const media = await service.getMedia('sess', 'untyped');
+    expect(media?.mimetype).toBe('application/octet-stream');
     expect(media?.path).toContain('statuses/sess/');
   });
 

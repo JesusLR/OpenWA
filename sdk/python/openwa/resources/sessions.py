@@ -120,7 +120,13 @@ class SessionsResource:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/logout")
 
     def force_kill(self, session_id: str) -> SessionResponse:
-        """Terminate a stuck session immediately."""
+        """Terminate a stuck session immediately.
+
+        Raises with HTTP 502 and ``code`` ``SESSION_FORCE_KILL_INCOMPLETE`` when the session was
+        stopped locally but the force-destroy threw or timed out, so the engine process may still be
+        running; the status is settled to disconnected and a retry answers 400 because no engine is
+        left to kill. Restart the node to reap a leaked process.
+        """
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/force-kill")
 
     def get_qr_code(self, session_id: str) -> QrCodeResponse:
@@ -128,7 +134,11 @@ class SessionsResource:
         return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/qr")
 
     def request_pairing_code(self, session_id: str, body: RequestPairingCodeRequest) -> PairingCodeResponse:
-        """Request a phone-pairing code."""
+        """Request a phone-pairing code.
+
+        On whatsapp-web.js, never request one for a number that already has a linked session: WhatsApp can
+        revoke that device. Link it by QR instead.
+        """
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/pairing-code", body=body)
 
     def stats(self) -> SessionStatsOverview:

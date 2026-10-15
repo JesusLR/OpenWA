@@ -340,7 +340,7 @@ export class PluginCapabilityContext {
     return {
       fetch: async (url, init) => {
         // Two gates: the declared permission, then the effective host allowlist = manifest net.allow
-        // UNION the hosts of net.allowConfigHosts keys across the base config AND every per-session
+        // UNION the https origins of net.allowConfigHosts keys across the base config AND every per-session
         // override. The host gate has no firing-session context for a sandboxed plugin's cap round-trip,
         // so admit every operator-configured tenant host (all public + still SSRF-guarded at connect)
         // rather than resolving a single, possibly wrong (base-only), one. The SSRF guard inside
@@ -419,11 +419,12 @@ export class PluginCapabilityContext {
         }
         return mapping.chatId;
       },
-      // Re-establish the in-flight hook context around the downstream send so an adapter that calls
-      // conversation.send from within its own ingress handling can't echo-loop back into itself via
-      // its own outbound message:sending hook. Gate on an ALREADY-in-flight event (mirrors the
-      // worker-cap wrap's `inFlight.length > 0` check): a plain top-level send must NOT suppress
-      // message:sending for unrelated observers (audit/moderation) — only genuine re-entrancy does.
+      // Re-establish the in-flight hook context around the downstream send, so a conversation.send made
+      // from a hook handler cannot re-fire that handler's own event (an echo loop through
+      // message:sending). Gate on an ALREADY-in-flight event (mirrors the worker-cap wrap's
+      // `inFlight.length > 0` check): a send from an ingress handler or any other top-level context
+      // carries none, and must NOT suppress message:sending for observers (audit/moderation, or the
+      // adapter's own mirror hook), which then see the reply.
       runGuarded: (events, run) =>
         (events as HookEvent[]).some(e => this.hookManager.isInFlight(e))
           ? this.hookManager.runInFlight(events as HookEvent[], run)

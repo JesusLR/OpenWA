@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -359,7 +360,7 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
   // A compose `environment:` entry overrides the image ENV even when it renders BLANK, and the blank
   // is then cleared by load-env, so a `- PUPPETEER_EXECUTABLE_PATH=${PUPPETEER_EXECUTABLE_PATH:-}`
   // forward deletes the Dockerfile's path inside the container and puppeteer falls back to a
-  // bundled Chromium the image deliberately does not ship (PUPPETEER_SKIP_CHROMIUM_DOWNLOAD). The
+  // bundled Chromium the image deliberately does not ship (PUPPETEER_SKIP_DOWNLOAD). The
   // forward must therefore carry the image's own value as its default, kept in sync by this test.
   it('forwards PUPPETEER_EXECUTABLE_PATH with the Dockerfile default, not blank', () => {
     const imageValue = /^ENV PUPPETEER_EXECUTABLE_PATH=(\S+)$/m.exec(
@@ -374,6 +375,21 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
     }
   });
 
+  // puppeteer ignores an env var it does not know, so a misspelled or retired name in the image is
+  // dead config whose comment still claims the effect.
+  it('sets only PUPPETEER_* image ENV names the installed puppeteer reads', () => {
+    const names = [
+      ...readFileSync(join(__dirname, '../../../Dockerfile'), 'utf8').matchAll(/^ENV (PUPPETEER_\w+)=/gm),
+    ].map(match => match[1]);
+    expect(names.length).toBeGreaterThan(0);
+    // A file path, not require.resolve: jest maps `puppeteer` to a mock.
+    const config = readFileSync(
+      join(__dirname, '../../../node_modules/puppeteer/lib/cjs/puppeteer/getConfiguration.js'),
+      'utf8',
+    );
+    expect(names.filter(name => !config.includes(`'${name}'`))).toEqual([]);
+  });
+
   // .env.example documents API_PORT as the host port Docker Compose publishes, and the README quick
   // start runs the dev file, so a hardcoded 2785 there ignores the knob when that port is taken.
   it.each(['docker-compose.yml', 'docker-compose.dev.yml'])('%s publishes the API on the API_PORT host port', file => {
@@ -382,7 +398,7 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
     expect(api?.ports).toEqual([expect.stringMatching(/:\$\{API_PORT:-2785\}:2785$/)]);
   });
 
-  it('openwa-api uses the same readiness healthcheck in both compose files and the image', () => {
+  it('openwa-api uses the same readiness healthcheck in both compose files', () => {
     const root = join(__dirname, '../../..');
     const apiHealthcheck = (file: string): string[] | undefined => {
       const parsed = yaml.load(readFileSync(join(root, file), 'utf8')) as ComposeFile;
@@ -391,8 +407,25 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
     const url = 'http://localhost:2785/api/health/ready';
     expect(apiHealthcheck('docker-compose.yml')).toEqual(['CMD', 'curl', '-f', url]);
     expect(apiHealthcheck('docker-compose.dev.yml')).toEqual(apiHealthcheck('docker-compose.yml'));
-    const dockerfile = readFileSync(join(root, 'Dockerfile'), 'utf8');
-    expect(dockerfile).toContain(`CMD curl -f ${url} || exit 1`);
+  });
+
+  // Both compose files pin PORT=2785, but the image also runs on its own (`docker run -e PORT=8080`),
+  // where a probe fixed at 2785 marks a healthy app unhealthy. Run the probe against a stub curl.
+  it.each([
+    [undefined, 'http://localhost:2785/api/health/ready'],
+    ['8080', 'http://localhost:8080/api/health/ready'],
+  ])('the image healthcheck probes PORT=%s at %s', (port, url) => {
+    const dockerfile = readFileSync(join(__dirname, '../../../Dockerfile'), 'utf8');
+    const probe = /^HEALTHCHECK .*\\\n\s*CMD (.+)$/m.exec(dockerfile)?.[1];
+    expect(probe).toContain('curl -f');
+    const bin = mkdtempSync(join(tmpdir(), 'openwa-healthcheck-'));
+    try {
+      writeFileSync(join(bin, 'curl'), '#!/bin/sh\necho "$@"\n', { mode: 0o755 });
+      const env = { PATH: `${bin}:${process.env.PATH}`, ...(port && { PORT: port }) };
+      expect(execFileSync('sh', ['-c', probe!], { env, encoding: 'utf8' }).trim()).toBe(`-f ${url}`);
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it('redis: sets the noeviction maxmemory policy BullMQ requires, on both launch paths', async () => {

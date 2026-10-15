@@ -149,6 +149,17 @@ describe('IngressService.handle', () => {
     expect(res.status).toBe(202);
   });
 
+  it('persists the request method so a replay keeps it', async () => {
+    const d = deps();
+    await new IngressService(d).handle({ ...req, method: 'PUT' });
+    const [recorded] = d.events.recordOrSkip.mock.calls[0] as [{ payload: { method?: string } }];
+    expect(recorded.payload.method).toBe('PUT');
+    // The job carries the method at its top level; its payload stays the plain request shape.
+    const [job] = d.enqueue.mock.calls[0] as [{ method: string; payload: { method?: string } }];
+    expect(job.method).toBe('PUT');
+    expect(job.payload.method).toBeUndefined();
+  });
+
   // A body no parser read would be handled as the empty body: it passes a header-only scheme, and every
   // such delivery hashes to the same dedup key, so all but the first are acked and dropped.
   it('refuses a body in a content type no parser read (415), before anything is persisted', async () => {
@@ -581,6 +592,17 @@ describe('dedupOn: body (a provider that rotates its delivery id on retry)', () 
     expect((d.enqueue.mock.calls[0] as [unknown, string])[1]).toBe('d-1');
   });
 
+  it('falls back to the body hash when the dedup header is longer than 255 characters', async () => {
+    const d = deps();
+    await new IngressService(d).handle({ ...req, headers: { 'x-delivery': 'x'.repeat(256) }, rawBody: '{"n":1}' });
+    const id = (d.enqueue.mock.calls[0] as [unknown, string])[1];
+    expect(id).toMatch(/^[0-9a-f]{64}$/);
+    // The bound is inclusive: an id of exactly 255 characters is still the provider's.
+    const edge = deps();
+    await new IngressService(edge).handle({ ...req, headers: { 'x-delivery': 'y'.repeat(255) }, rawBody: '{"n":1}' });
+    expect((edge.enqueue.mock.calls[0] as [unknown, string])[1]).toBe('y'.repeat(255));
+  });
+
   // A header that is present but blank is no id at all. Taking it as one gave every delivery the
   // same empty key, so the dedup row admitted the first and dropped the rest while still answering
   // each provider with the route's success ack.
@@ -880,7 +902,7 @@ describe('IngressService per-instance rate bucket', () => {
           route: 'chatwoot',
           maxBodyBytes: 1024,
           signature: { scheme: 'none' },
-          response: { preflight: ['session-alive'], ack: { status: 200 } },
+          response: { preflight: [{ type: 'session-alive' }], ack: { status: 200 } },
         }),
       }),
     );

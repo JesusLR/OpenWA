@@ -76,8 +76,10 @@ export interface Session {
   lastActive?: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Human-readable reason carried while the status is 'failed' (terminal failure) or
-   * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal). */
+  /** Human-readable reason carried while the status is 'failed' (terminal failure),
+   * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal), or
+   * 'initializing' during an engine-internal reconnect (from the fifth consecutive attempt, or while a
+   * retry waits after a failed relaunch). */
   lastError?: string | null;
   /**
    * A limit WhatsApp itself has placed on the account, or null when there is none. Distinct from
@@ -253,6 +255,7 @@ export interface Chat {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  lastMessageType?: MessageType;
   archived: boolean;
   pinned: boolean;
   muted: boolean;
@@ -314,7 +317,16 @@ export interface ChatMessage {
   timestamp?: number;
   createdAt: string;
   metadata?: {
-    media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
+    poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+    media?: {
+      mimetype: string;
+      filename?: string;
+      data?: string;
+      omitted?: boolean;
+      sizeBytes?: number;
+      /** With `omitted`: the inline copy was dropped because the chat-media archive holds the bytes. */
+      archived?: boolean;
+    };
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
     call?: { video: boolean; missed: boolean };
@@ -376,7 +388,9 @@ export interface EngineHistoryMessage {
     data?: string;
     omitted?: boolean;
     sizeBytes?: number;
+    archived?: boolean;
   };
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
   /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
@@ -536,7 +550,7 @@ export interface BatchMessageResult {
   sentAt?: string;
 }
 
-/** GET batch/:batchId shape; the cancel endpoint returns the same minus results/timestamps. */
+/** GET batch/:batchId shape. */
 export interface BatchStatusResponse {
   batchId: string;
   status: BatchStatus;
@@ -545,6 +559,13 @@ export interface BatchStatusResponse {
   results: BatchMessageResult[];
   startedAt?: string | null;
   completedAt?: string | null;
+}
+
+/** POST batch/:batchId/cancel shape: the batch state without per-recipient results or timestamps. */
+export interface BatchCancelResponse {
+  batchId: string;
+  status: BatchStatus;
+  progress: BatchProgress;
 }
 
 export interface HealthStatus {
@@ -719,16 +740,25 @@ export interface SearchResults {
 // fails; the never-settling promise halts this request's chain so callers neither flash a generic
 // error toast nor receive an undefined payload while the page navigates away. Otherwise throw an
 // Error carrying the HTTP status and, when the gateway supplied one, its machine code.
-async function handleErrorResponse<T>(response: Response): Promise<T> {
+// `sentKey` is the key the request carried (null when none). Logout aborts nothing in flight, so an
+// answer can arrive after the stored key changed. With a key sent but none stored, a sign-out is
+// already under way (an earlier failure of the same burst, or the user on the login form): stay
+// silent and do not navigate again. A request sent without a key comes only from a chain that
+// outlived a logout (the dashboard shows the login form whenever no key is stored), so with none
+// stored it stays silent too rather than reloading the login form under the user. With another key
+// stored, the answer speaks for a key no longer in use and must not sign out the current one, so it
+// fails like any other error.
+async function handleErrorResponse<T>(response: Response, sentKey: string | null): Promise<T> {
   // On a non-JSON body (e.g. a reverse-proxy 502/503/504 HTML page) fall through to `HTTP <status>`
   // rather than statusText: the toast folds an exact `HTTP 502`/`HTTP 503` into its connection-lost
   // toast (a 504 keeps its own), and statusText is empty over HTTP/2 anyway.
   const error = await response.json().catch(() => ({}));
-  if (isKeyUnusable(response.status, error.message)) {
+  const storedKey = sessionStorage.getItem('openwa_api_key');
+  if (isKeyUnusable(response.status, error.message) && (storedKey === sentKey || storedKey === null)) {
     sessionStorage.removeItem('openwa_api_key');
     if (typeof window !== 'undefined') {
-      window.location.assign('/');
-      return new Promise<T>(() => { });
+      if (sentKey !== null && storedKey === sentKey) window.location.assign('/');
+      return new Promise<T>(() => {});
     }
   }
   // Carry the HTTP status on the Error (message unchanged, so the toast de-dup still matches) so
@@ -763,7 +793,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   const response = await fetch(url, { ...options, headers });
 
   if (!response.ok) {
-    return handleErrorResponse<T>(response);
+    return handleErrorResponse<T>(response, apiKey);
   }
 
   if (response.status === 204) {
@@ -781,14 +811,14 @@ async function requestText(endpoint: string): Promise<string> {
   });
 
   if (!response.ok) {
-    return handleErrorResponse<string>(response);
+    return handleErrorResponse<string>(response, apiKey);
   }
 
   return response.text();
 }
 
 /** Like {@link request} but returns a Blob — e.g. for status media downloads. */
-async function requestBlob(endpoint: string): Promise<Blob> {
+async function requestBlob(endpoint: string, signal?: AbortSignal): Promise<Blob> {
   const url = `${API_BASE_URL}${endpoint}`;
 
   // Get API key from sessionStorage for authentication
@@ -798,10 +828,10 @@ async function requestBlob(endpoint: string): Promise<Blob> {
     ...(apiKey ? { 'X-API-Key': apiKey } : {}),
   };
 
-  const response = await fetch(url, { headers });
+  const response = await fetch(url, { headers, signal });
 
   if (!response.ok) {
-    return handleErrorResponse<Blob>(response);
+    return handleErrorResponse<Blob>(response, apiKey);
   }
 
   return response.blob();
@@ -876,14 +906,17 @@ export const sessionApi = {
   // MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES; past that budget the payload arrives as the
   // `{ omitted: true, sizeBytes }` marker and the bytes are only reachable here. Served as an
   // attachment (Content-Disposition), so callers download it rather than rendering it inline.
-  getMessageMediaBlob: (id: string, chatId: string, messageId: string) =>
-    requestBlob(`/sessions/${id}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`),
+  getMessageMediaBlob: (id: string, chatId: string, messageId: string, signal?: AbortSignal) =>
+    requestBlob(
+      `/sessions/${id}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`,
+      signal,
+    ),
   getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${id}/channels`),
   getChannelMessages: (id: string, channelId: string, limit = 50) =>
     request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),
   getContactStatuses: (id: string) => request<{ statuses: StatusUpdate[] }>(`/sessions/${id}/status`),
-  getStatusMediaBlob: (id: string, statusId: string) =>
-    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`),
+  getStatusMediaBlob: (id: string, statusId: string, signal?: AbortSignal) =>
+    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`, signal),
   postTextStatus: (
     id: string,
     text: string,
@@ -969,17 +1002,27 @@ export interface ProfilePictureResponse {
 
 export const contactApi = {
   // The route caps a response at 1000 contacts; walk the pages so an address book past that is complete.
-  list: async (sessionId: string) =>
-    (
-      await fetchAllPages(
-        async (limit, offset) => {
+  // No item cap: the status recipient picker needs every contact, and the server's short page ends the walk.
+  list: async (sessionId: string) => {
+    let lastError: unknown;
+    const { items, throttled } = await fetchAllPages(
+      async (limit, offset) => {
+        try {
           const data = await request<Contact[]>(`/sessions/${sessionId}/contacts?limit=${limit}&offset=${offset}`);
           // The route answers a bare array with no total: a short page is the last one.
           return { data, total: data.length < limit ? offset + data.length : Infinity };
-        },
-        { pageSize: 1000 },
-      )
-    ).items,
+        } catch (err) {
+          lastError = err;
+          throw err;
+        }
+      },
+      { pageSize: 1000, maxItems: Infinity },
+    );
+    // A page still throttled after the retries would leave the picker silently short; fail the whole
+    // load with that page's 429, as a throttled first page already does.
+    if (throttled) throw lastError;
+    return items;
+  },
   checkNumber: (sessionId: string, number: string) =>
     request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
   // Returns the contact/group profile picture URL. Both engines return null when the user hid their
@@ -1114,7 +1157,7 @@ export const messageApi = {
   getBatchStatus: (sessionId: string, batchId: string) =>
     request<BatchStatusResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}`),
   cancelBatch: (sessionId: string, batchId: string) =>
-    request<BatchStatusResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}/cancel`, {
+    request<BatchCancelResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}/cancel`, {
       method: 'POST',
     }),
   reply: (sessionId: string, data: { chatId: string; quotedMessageId: string; text: string }) =>
@@ -1189,7 +1232,7 @@ export const infraApi = {
       body: JSON.stringify({ profiles: profiles || [], profilesToRemove: profilesToRemove || [] }),
     }),
   // Readiness, not the plain /infra/health ping. The restart poll must not be able to latch onto the
-  // process it just asked to shut down: /infra/health answers 200 for the whole drain and teardown,
+  // process it just asked to shut down: /infra/health answers 200 for the whole drain,
   // while /health/ready reports 503 as soon as draining starts and stays 503 until both databases
   // answer. Public (no API key), like /infra/health.
   healthCheck: () => request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready'),

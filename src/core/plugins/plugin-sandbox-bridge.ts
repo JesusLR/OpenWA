@@ -65,7 +65,7 @@ type CreateSandboxHostFn = (
   onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
   runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
   onSearchProviderRegister?: () => void,
-  onWorkerExit?: (code: number, intentional: boolean) => void,
+  onWorkerExit?: (code: number, intentional: boolean, reason?: string) => void,
   onUnresponsive?: () => void,
 ) => PluginWorkerHost;
 
@@ -576,15 +576,30 @@ export class PluginSandboxBridge {
         state.dropped++;
         return;
       }
-      const bounded =
-        typeof message === 'string' && message.length > SANDBOX_LOG_MAX_MESSAGE_LENGTH
-          ? `${message.slice(0, SANDBOX_LOG_MAX_MESSAGE_LENGTH)}…[truncated]`
-          : message;
+      // Like the level below, the message and meta come off the wire unchecked: a non-string message is coerced
+      // before the length check, and a meta whose JSON form exceeds the same cap is replaced by a size
+      // marker (not a truncated string, which would hide its keys from the logger's secret redaction).
+      // logger.error's reason travels as a string meta.error, so that one key survives the replacement.
+      const truncate = (value: string): string =>
+        value.length > SANDBOX_LOG_MAX_MESSAGE_LENGTH
+          ? `${value.slice(0, SANDBOX_LOG_MAX_MESSAGE_LENGTH)}…[truncated]`
+          : value;
+      const bounded = truncate(typeof message === 'string' ? message : String(message));
+      let boundedMeta = meta;
+      if (meta !== undefined) {
+        const reason = typeof meta?.error === 'string' ? { error: truncate(meta.error) } : undefined;
+        try {
+          const metaLength = JSON.stringify(meta).length;
+          if (metaLength > SANDBOX_LOG_MAX_MESSAGE_LENGTH) boundedMeta = { ...reason, metaTruncated: true, metaLength };
+        } catch {
+          boundedMeta = reason; // not serializable (circular or BigInt), so it cannot be logged as JSON anyway
+        }
+      }
       // The level comes off the wire unchecked (plugin code can post to parentPort directly), and the
       // plugin logger has no method for anything outside PluginLogLevel.
-      if (level === 'error') context.logger.error(bounded, undefined, meta);
-      else if (level === 'debug' || level === 'warn') context.logger[level](bounded, meta);
-      else context.logger.log(bounded, meta);
+      if (level === 'error') context.logger.error(bounded, undefined, boundedMeta);
+      else if (level === 'debug' || level === 'warn') context.logger[level](bounded, boundedMeta);
+      else context.logger.log(bounded, boundedMeta);
     };
   }
 
@@ -631,8 +646,8 @@ export class PluginSandboxBridge {
   private buildWorkerExitHandler(
     pluginId: string,
     logRelayState: SandboxLogRelayState,
-  ): (code: number, intentional: boolean) => void {
-    return (code: number, intentional: boolean): void => {
+  ): (code: number, intentional: boolean, reason?: string) => void {
+    return (code: number, intentional: boolean, reason?: string): void => {
       // Final log-relay flush: the per-window drop warn above only fires when a new line arrives in a
       // later window, so without this a plugin that goes quiet (or is disabled) before the rollover
       // silently discards its pending count. The worker is gone, so no further lines can arrive.
@@ -652,8 +667,9 @@ export class PluginSandboxBridge {
       // unregister the hook shims (so they don't keep dispatching into the dead worker) + mark the
       // plugin ERROR so the dashboard reflects reality. The dispatchHook/dispatchWebhook dead-checks
       // fail-fast; this cleanup is the root-cause fix (it also makes the shim's !liveHost guard fire).
-      this.markWorkerFailed(pluginId, `worker exited unexpectedly (code ${code})`);
-      this.logger.warn(`Sandboxed plugin ${pluginId} worker exited unexpectedly (code ${code})`, {
+      const why = reason ? `: ${reason}` : '';
+      this.markWorkerFailed(pluginId, `worker exited unexpectedly (code ${code})${why}`);
+      this.logger.warn(`Sandboxed plugin ${pluginId} worker exited unexpectedly (code ${code})${why}`, {
         pluginId,
         code,
         action: 'sandbox_worker_exit',

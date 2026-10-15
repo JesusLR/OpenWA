@@ -1,14 +1,14 @@
 #!/bin/sh
 # Smoke test: verify openwa-api can list containers via docker-socket-proxy.
 # Run this after `docker compose up -d` with the stack fully started.
-# Usage: ./scripts/smoke-test-docker-proxy.sh <admin-api-key>
+# Usage: ./scripts/smoke-test-docker-proxy.sh <unscoped-admin-api-key>
 set -e
 
 API_KEY="${1:-}"
 BASE_URL="${BASE_URL:-http://localhost:2785}"
 
 if [ -z "$API_KEY" ]; then
-  echo "Usage: $0 <admin-api-key>" >&2
+  echo "Usage: $0 <unscoped-admin-api-key>" >&2
   exit 1
 fi
 
@@ -28,7 +28,13 @@ RESPONSE=$(curl -s -w '\n%{http_code}' \
   "$BASE_URL/api/infra/status" || true)
 CODE=$(printf '%s\n' "$RESPONSE" | tail -n 1)
 if [ "$CODE" != "200" ]; then
-  echo "FAIL: /api/infra/status returned HTTP $CODE (expected 200; the key must be an ADMIN key)" >&2
+  # Only an auth failure is about the key. The route also refuses a session-scoped ADMIN key and one
+  # used from outside its IP allow-list.
+  HINT=''
+  case "$CODE" in
+    401 | 403) HINT='; the key must be an unscoped ADMIN key allowed from this IP' ;;
+  esac
+  echo "FAIL: /api/infra/status returned HTTP $CODE (expected 200$HINT)" >&2
   exit 1
 fi
 echo "Response: $(printf '%s\n' "$RESPONSE" | sed '$d')"
@@ -66,7 +72,7 @@ if [ "$CODE" != "403" ]; then
 fi
 echo "PASS: GET /networks via proxy -> 403 (denied)"
 # NOTE: there is intentionally no "DELETE is rejected" check. With POST=1 the pinned proxy
-# (tecnativa/docker-socket-proxy v0.4.2) admits EVERY method to the enabled paths — its
+# (tecnativa/docker-socket-proxy v0.5.0) admits EVERY method to the enabled paths — its
 # DELETE env flag is dead config — so such a check would fail against the working
 # configuration. OpenWA itself never issues deletes (profile teardown is stop-only);
 # see SECURITY.md "Docker socket proxy — scope and residual risk".
