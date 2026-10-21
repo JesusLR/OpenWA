@@ -65,7 +65,7 @@ export function Login({ onLogin }: LoginProps) {
       <div className="login-card">
         <div className="login-logo login-hero">
           <img src="/logo_pds.png" alt="OpenWA" className="logo-icon" />
-          <p className="logo-tagline">Servicio de mensajeria OpenWA.</p>
+          <p className="logo-tagline">Servicio de mensajeria OpenWA. By. Jesus Lira</p>
           <span className="version-info">
             {t('login.version', {
               version: __APP_VERSION__,
