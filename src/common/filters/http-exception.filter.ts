@@ -1,6 +1,5 @@
 import { ExceptionFilter, Catch, ArgumentsHost, HttpException, HttpStatus } from '@nestjs/common';
 import { Response, Request } from 'express';
-import { ApiResponse } from '../interfaces/response.interface';
 
 @Catch()
 export class HttpExceptionFilter implements ExceptionFilter {
@@ -43,9 +42,12 @@ export class HttpExceptionFilter implements ExceptionFilter {
       }
     } else if (exception instanceof Error) {
       message = exception.message;
+      console.error('[HttpExceptionFilter] Uncaught Error:', exception.stack || exception.message);
+    } else {
+      console.error('[HttpExceptionFilter] Uncaught Exception:', exception);
     }
 
-    const errorResponse: ApiResponse = {
+    const errorResponse = {
       success: false,
       error: {
         code,

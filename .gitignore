@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+node_modules
 .pnp
 .pnp.js
 
@@ -46,9 +47,13 @@ Thumbs.db
 # Data and storage
 data/
 media/
+!src/**/media/
 uploads/
 .wwebjs_auth/
 .wwebjs_cache/
+# scripts/backup.sh archives and restore.sh safety snapshots: copies of the same state
+/backups/
+*.pre-restore-*
 
 # Database
 *.db
@@ -67,8 +72,16 @@ uploads/
 .worktrees/
 
 # AI Agents
+.playwright-mcp/
+.remember/
 .agent/
 .claude/
+.zcode/
+.zcode-worktrees/
 docs/plans/
+docs/superpowers/
 CLAUDE.md
 _docs/
+.superpowers/
+# TypeScript incremental build cache (tsc writes this at repo root under the TS6 build config)
+*.tsbuildinfo
