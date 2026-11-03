@@ -64,6 +64,7 @@ uploads/
 .docker/
 
 # Misc
+.env.server
 *.bak
 *.tmp
 *.temp
