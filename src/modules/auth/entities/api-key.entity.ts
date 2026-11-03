@@ -9,46 +9,55 @@ export enum ApiKeyRole {
 @Entity('api_keys')
 export class ApiKey {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column({ type: 'varchar', length: 100 })
-  name: string;
+  name!: string;
 
   @Index({ unique: true })
   @Column({ type: 'varchar', length: 64 })
-  keyHash: string;
+  keyHash!: string;
 
-  @Column({ type: 'varchar', length: 8 })
-  keyPrefix: string;
+  // 12 to fit the 12-char prefix that auth.service writes (was varchar(8); harmless on the
+  // hardcoded-SQLite `main` connection, but kept consistent with the code).
+  @Column({ type: 'varchar', length: 12 })
+  keyPrefix!: string;
 
   @Column({
     type: 'varchar',
     length: 20,
     default: ApiKeyRole.OPERATOR,
   })
-  role: ApiKeyRole;
+  role!: ApiKeyRole;
 
   @Column({ type: 'simple-array', nullable: true })
-  allowedIps: string[] | null;
+  allowedIps!: string[] | null;
 
   @Column({ type: 'simple-array', nullable: true })
-  allowedSessions: string[] | null;
+  allowedSessions!: string[] | null;
+
+  // Chat-level allowlist, independent of allowedSessions and the same fail-open semantic: NULL or
+  // empty means "every chat". Entries are WhatsApp chat ids (a group `<id>@g.us`, a contact
+  // `<phone>@c.us` / `<lid>@lid`, or a bare phone number). Enforced on the read surface and on
+  // sends; see src/common/security/chat-scope.ts.
+  @Column({ type: 'simple-array', nullable: true })
+  allowedChats!: string[] | null;
 
   @Column({ type: 'boolean', default: true })
-  isActive: boolean;
+  isActive!: boolean;
 
   @Column({ type: 'datetime', nullable: true })
-  expiresAt: Date | null;
+  expiresAt!: Date | null;
 
   @Column({ type: 'datetime', nullable: true })
-  lastUsedAt: Date | null;
+  lastUsedAt!: Date | null;
 
   @Column({ type: 'int', default: 0 })
-  usageCount: number;
+  usageCount!: number;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 
   @UpdateDateColumn()
-  updatedAt: Date;
+  updatedAt!: Date;
 }
