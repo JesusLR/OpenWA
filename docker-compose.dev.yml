@@ -46,6 +46,7 @@ services:
     # must match the image/entrypoint. Same convention as the production docker-compose.yml.
     environment:
       - NODE_ENV=${NODE_ENV:-development}
+      - INTEGRATION_SYSTEMS=${INTEGRATION_SYSTEMS:-}
       # Explicit for the same reason as the production compose file: the data is UTC either way, this
       # only sets the zone the logs and the "today" stats window read in.
       - TZ=${TZ:-UTC}

@@ -23,6 +23,10 @@ export class Session {
   @Column({ type: 'varchar', length: 100, unique: true })
   name!: string;
 
+  // Assigned by the authenticated integration, never by client-supplied body fields.
+  @Column({ type: 'varchar', length: 40, nullable: true })
+  sourceSystem!: string | null;
+
   @Column({
     type: 'varchar',
     length: 50,

@@ -401,7 +401,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
   }
 
-  async create(dto: CreateSessionDto): Promise<Session> {
+  async create(dto: CreateSessionDto, sourceSystem: string | null = null): Promise<Session> {
     // Check if session with same name exists
     const existing = await this.sessionRepository.findOne({
       where: { name: dto.name },
@@ -413,6 +413,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     const session = this.sessionRepository.create({
       name: dto.name,
+      sourceSystem,
       config: dto.config || {},
       proxyUrl: dto.proxyUrl || null,
       proxyType: dto.proxyType || null,

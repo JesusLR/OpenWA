@@ -50,6 +50,7 @@ export interface CreateSessionOptions {
 }
 
 export interface Session {
+  sourceSystem?: string;
   id: string;
   name: string;
   status:

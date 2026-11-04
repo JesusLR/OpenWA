@@ -15,6 +15,8 @@ import { SessionErrorStore } from './session-error-store.service';
 import { SessionRestrictionStore } from './session-restriction-store.service';
 import { PresenceStore } from './presence-store.service';
 import { SessionController } from './session.controller';
+import { IntegrationSessionController } from './integration-session.controller';
+import { IntegrationSessionGuard } from './integration-session.guard';
 import { WebhookModule } from '../webhook/webhook.module';
 import { StatusStoreModule } from '../status-store/status-store.module';
 import { ChatMediaModule } from '../chat-media/chat-media.module';
@@ -31,11 +33,12 @@ import { PLUGIN_SESSION_PORT } from '../../core/plugins/plugin-host-ports';
     ChatMediaModule,
     AutomationModule,
   ],
-  controllers: [SessionController],
+  controllers: [SessionController, IntegrationSessionController],
   providers: [
     // Global on purpose: any controller may carry a session dimension. Inert unless NODE_URL is set.
     { provide: APP_INTERCEPTOR, useClass: SessionProxyInterceptor },
     SessionService,
+    IntegrationSessionGuard,
     // onModuleInit only, and every module's runs before the first onApplicationBootstrap, so the
     // legacy name-keyed auth directories are moved onto their session ids before auto-start or the
     // HTTP listener can open one.
@@ -54,6 +57,6 @@ import { PLUGIN_SESSION_PORT } from '../../core/plugins/plugin-host-ports';
     // same instance ran SessionService's onModuleInit/onApplicationBootstrap/onModuleDestroy twice.
     { provide: PLUGIN_SESSION_PORT, useExisting: SessionService },
   ],
-  exports: [SessionService, MessageProjector, SessionOwnershipService],
+  exports: [SessionService, MessageProjector, SessionOwnershipService, IntegrationSessionGuard],
 })
 export class SessionModule {}

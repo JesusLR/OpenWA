@@ -41,6 +41,12 @@ export class SessionResponseDto {
   @ApiProperty({ example: 'my-bot' })
   name!: string;
 
+  @ApiPropertyOptional({
+    description: 'System that created the session; absent for native sessions.',
+    example: 'de_viaje_en_viaje',
+  })
+  sourceSystem?: string;
+
   @ApiProperty({ enum: SessionStatus, example: SessionStatus.READY })
   status!: SessionStatus;
 
@@ -116,6 +122,7 @@ export class SessionResponseDto {
     return {
       id: session.id,
       name: session.name,
+      ...(session.sourceSystem ? { sourceSystem: session.sourceSystem } : {}),
       status: session.status,
       phone: session.phone,
       pushName: session.pushName,

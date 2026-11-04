@@ -1234,7 +1234,10 @@ export function Sessions() {
           filteredSessions.map(session => (
             <div key={session.id} className="session-card">
               <div className="card-header">
-                <h3 title={session.name}>{session.name}</h3>
+                <div>
+                  <h3 title={session.name}>{session.name}</h3>
+                  {session.sourceSystem && <small className="text-muted">Origen: {session.sourceSystem}</small>}
+                </div>
                 <span className={`status-pill ${session.status}`}>{formatStatus(session.status)}</span>
               </div>
 
