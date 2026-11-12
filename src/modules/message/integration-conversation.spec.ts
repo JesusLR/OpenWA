@@ -67,6 +67,7 @@ describe('Isolated PDF document sends', () => {
         {
           provide: SessionService,
           useValue: {
+            sendSeen: () => Promise.resolve(true),
             listChats: () =>
               Promise.resolve([
                 { id: payload.chatId, name: 'Cliente', isGroup: false },
@@ -78,11 +79,35 @@ describe('Isolated PDF document sends', () => {
         {
           provide: MessageService,
           useValue: {
+            getChatMedia: () => Promise.resolve({buffer:Buffer.from('image bytes'),mimetype:'image/png'}),
             sendText: send,
+            sendImage: send,
+            sendDocument: send,
+            getChatHistory: () =>
+              Promise.resolve([
+                {
+                  id: 'history-only',
+                  body: 'Mensaje anterior de WhatsApp',
+                  type: 'text',
+                  fromMe: false,
+                  timestamp: 99,
+                },
+              ]),
             getMessages: () =>
               Promise.resolve({
                 total: 1,
-                messages: [{ id: '1', body: 'Hola', direction: 'incoming', type: 'document', metadata: { secret: 'private', media: { filename: 'Comprobante.pdf', mimetype: 'application/pdf' } } }],
+                messages: [
+                  {
+                    id: '1',
+                    body: 'Hola',
+                    direction: 'incoming',
+                    type: 'document',
+                    metadata: {
+                      secret: 'private',
+                      media: { filename: 'Comprobante.pdf', mimetype: 'application/pdf' },
+                    },
+                  },
+                ],
               }),
           },
         },
@@ -117,6 +142,7 @@ describe('Isolated PDF document sends', () => {
       .expect(200);
     expect(JSON.stringify(history.body)).not.toContain('secret');
     expect(JSON.stringify(history.body)).toContain('Comprobante.pdf');
+    expect(JSON.stringify(history.body)).toContain('Mensaje anterior de WhatsApp');
     await request(app.getHttpServer())
       .get(endpoint(own) + '/messages')
       .query({ chatId: '123@g.us' })
@@ -139,4 +165,14 @@ describe('Isolated PDF document sends', () => {
       .send({ ...payload, text: '' })
       .expect(400);
   });
-});
+  it('accepts images and other files through the isolated attachment endpoint', async () => {
+    for (const [filename,mimetype] of [['foto.png','image/png'],['lista.txt','text/plain']]) {
+      await request(app.getHttpServer()).post(endpoint(own)+'/files').auth(key,{type:'bearer'}).send({chatId:payload.chatId,filename,mimetype,base64:Buffer.from('test bytes').toString('base64')}).expect(201);
+    }
+    expect(send).toHaveBeenCalledTimes(2);
+    await request(app.getHttpServer()).post(endpoint(foreign)+'/files').auth(key,{type:'bearer'}).send({chatId:payload.chatId,filename:'x.txt',mimetype:'text/plain',base64:'YQ=='}).expect(404);
+  });  it('fences image reads and read receipts to the integration session', async () => {
+    await request(app.getHttpServer()).get(endpoint(own)+'/media').query({chatId:payload.chatId,messageId:'wa-image'}).auth(key,{type:'bearer'}).expect(200);
+    await request(app.getHttpServer()).get(endpoint(foreign)+'/media').query({chatId:payload.chatId,messageId:'wa-image'}).auth(key,{type:'bearer'}).expect(404);
+    await request(app.getHttpServer()).post(endpoint(own)+'/read').auth(key,{type:'bearer'}).send({chatId:payload.chatId}).expect(201);
+  });});

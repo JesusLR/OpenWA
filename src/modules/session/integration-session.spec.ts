@@ -10,6 +10,7 @@ import { IntegrationSessionController } from './integration-session.controller';
 import { IntegrationSessionGuard, integrationSystemForToken } from './integration-session.guard';
 import { Session, SessionStatus } from './entities/session.entity';
 import { SessionService } from './session.service';
+import { WebhookService } from '../webhook/webhook.service';
 import { AuditService } from '../audit/audit.service';
 import { applyGlobalValidation } from '../../config/app-validation';
 import { AddSessionSourceSystem1786900000000 } from '../../database/migrations/1786900000000-AddSessionSourceSystem';
@@ -84,6 +85,18 @@ describe('Isolated system session integrations', () => {
         { provide: ConfigService, useValue: { get: () => credentials } },
         { provide: getRepositoryToken(Session, 'data'), useValue: repo },
         { provide: SessionService, useValue: service },
+        {
+          provide: WebhookService,
+          useValue: {
+            findBySession: jest.fn().mockResolvedValue([]),
+            create: jest
+              .fn()
+              .mockImplementation((_id: string, dto: Record<string, unknown>) =>
+                Promise.resolve({ ...dto, id: 'webhook-id' }),
+              ),
+            update: jest.fn(),
+          },
+        },
         { provide: AuditService, useValue: { logInfo: jest.fn().mockResolvedValue(undefined) } },
       ],
     }).compile();
@@ -94,6 +107,33 @@ describe('Isolated system session integrations', () => {
 
   afterEach(async () => {
     await app?.close();
+  });
+
+  it('registers signed webhooks only for an owned session without exposing the secret', async () => {
+    const url = '/api/integrations/sessions/' + a.id + '/webhook';
+    const payload = { url: 'https://receiver.example.com/webhooks/openwa', secret: 'c'.repeat(64) };
+    const response = await request(app.getHttpServer())
+      .post(url)
+      .auth(KEY_A, { type: 'bearer' })
+      .send(payload)
+      .expect(201);
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        active: true,
+        events: expect.arrayContaining(['message.received', 'message.ack', 'session.status']) as unknown,
+      }),
+    );
+    expect(JSON.stringify(response.body)).not.toContain(payload.secret);
+    await request(app.getHttpServer())
+      .post('/api/integrations/sessions/' + b.id + '/webhook')
+      .auth(KEY_A, { type: 'bearer' })
+      .send(payload)
+      .expect(404);
+    await request(app.getHttpServer())
+      .post(url)
+      .auth(KEY_A, { type: 'bearer' })
+      .send({ ...payload, secret: 'short' })
+      .expect(400);
   });
 
   it('authenticates every endpoint and fails closed on missing/malformed configuration', async () => {

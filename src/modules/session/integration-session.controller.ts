@@ -1,7 +1,22 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Optional,
+  ServiceUnavailableException,
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { ApiProperty, ApiTags } from '@nestjs/swagger';
 import { IsString, Matches, MaxLength, MinLength } from 'class-validator';
+import { WebhookService } from '../webhook/webhook.service';
+import { CreateWebhookDto } from '../webhook/dto/webhook.dto';
 import { Repository } from 'typeorm';
 import { Public } from '../auth/decorators/auth.decorators';
 import { AuditService } from '../audit/audit.service';
@@ -31,10 +46,43 @@ export class IntegrationSessionController {
     private readonly service: SessionService,
     @InjectRepository(Session, 'data') private readonly sessions: Repository<Session>,
     private readonly audit: AuditService,
+    @Optional() private readonly webhooks?: WebhookService,
   ) {}
 
   private response(session: Session) {
     return SessionResponseDto.fromEntity(session, this.service.engineLoaded(session));
+  }
+
+  // URL validation remains in WebhookService; local loopback receivers require an explicit allowed host.
+  @Post(':sessionId/webhook')
+  async webhook(@Param('sessionId') id: string, @Body() dto: CreateWebhookDto) {
+    if (!this.webhooks) throw new ServiceUnavailableException();
+    if (!dto.secret || dto.secret.length < 32) throw new BadRequestException('Signing secret must have 32 characters');
+    const events = [
+      'message.received',
+      'message.sent',
+      'message.ack',
+      'message.failed',
+      'message.edited',
+      'message.revoked',
+      'session.status',
+      'session.disconnected',
+      'session.authenticated',
+    ];
+    const existing = (await this.webhooks.findBySession(id)).find(w => w.url === dto.url);
+    const config = { url: dto.url, secret: dto.secret, events, active: true, retryCount: 5 };
+    const hook = existing
+      ? await this.webhooks.update(id, existing.id, config)
+      : await this.webhooks.create(id, config);
+    return { id: hook.id, active: hook.active, events: hook.events };
+  }
+
+  @Post(':sessionId/webhook/test')
+  async testWebhook(@Param('sessionId') id: string, @Body() dto: CreateWebhookDto) {
+    if (!this.webhooks) throw new ServiceUnavailableException();
+    const hook = (await this.webhooks.findBySession(id)).find(w => w.url === dto.url);
+    if (!hook) throw new BadRequestException('Register the webhook URL first');
+    return this.webhooks.test(id, hook.id);
   }
 
   @Get()
