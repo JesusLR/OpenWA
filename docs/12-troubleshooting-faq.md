@@ -389,6 +389,23 @@ from saved credentials is marked `failed` with the credentials kept (action
 `ready_reconcile_timeout_restored`): restart it; to pair again, delete it (which clears the saved
 credentials) and create it anew; or pin `WWEBJS_WEB_VERSION`.
 
+### Issue: `Cannot read properties of null (reading 'Socket')` when starting a session
+
+If the trace points to `Client.inject` in `whatsapp-web.js` 1.34.7, WhatsApp Web may
+have exposed its build number before its socket module is registered. The auth-ready
+backport waits for a settled socket state before accessing `Socket` or exposing
+AuthStore, bounded by `WWEBJS_AUTH_TIMEOUT_MS` (30 seconds by default). A socket that
+never initializes now reports `WhatsApp Web socket initialization timed out before authentication`.
+
+The fix ships through postinstall and the production Docker build. Source installs
+can apply it with `node scripts/patch-wwebjs-auth-ready.js`; Docker deployments must
+rebuild and recreate the API container from this revision. Rebuilding an older
+revision does not add the fix. No authentication files need to be deleted.
+
+Changing `WWEBJS_WEB_VERSION` alone does not add this readiness check. A timeout
+after applying it still needs investigation of WhatsApp Web connectivity and build
+compatibility; this patch does not guarantee that every upstream build can connect.
+
 ### Issue: QR generation times out on slow first boot (WSL2 / low-resource)
 
 > **Engine:** This issue applies to the `whatsapp-web.js` engine only. If you are using `ENGINE_TYPE=baileys`, skip this section.

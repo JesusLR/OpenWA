@@ -1,7 +1,7 @@
 /**
  * Post-install hook (npm `postinstall`).
  *
- * Thirteen conditional steps, each skipped when its target is absent so the hook is a no-op where the
+ * Conditional steps, each skipped when its target is absent so the hook is a no-op where the
  * piece is missing (the Docker builder stage copies package*.json long before any source):
  *
  *   1. `npm ci` inside dashboard/ when dashboard/ exists — the dashboard carries its own lockfile and
@@ -41,6 +41,7 @@
  *  13. `node scripts/patch-baileys-pairing.js --best-effort` when present, preserving pre-login
  *      notification ACKs and refreshing pairing credentials. A partial patch remains fatal.
  *
+ * An additional auth-ready patch waits for the socket module before reading it to create a QR.
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
  * (scripts/postinstall.spec.js, node:test) exercises every branch without a real npm run.
  */
@@ -163,6 +164,15 @@ function planSteps(root, env = process.env) {
       name: 'whatsapp-web.js send error capture (scripts/patch-wwebjs-send-error.js --best-effort)',
       command: process.execPath,
       args: [sendErrorPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const authReadyPatcher = path.join(root, 'scripts', 'patch-wwebjs-auth-ready.js');
+  if (fs.existsSync(authReadyPatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js pre-auth socket readiness (scripts/patch-wwebjs-auth-ready.js --best-effort)',
+      command: process.execPath,
+      args: [authReadyPatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }
