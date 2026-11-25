@@ -49,7 +49,7 @@ export class GroupsResource {
   }
 
   /**
-   * Create a new group.
+   * Create a new group. **Baileys only**: whatsapp-web.js answers 501.
    *
    * Answers the group SUMMARY, not the detail shape `get()` returns — there is no participant list,
    * description, owner or creation time on a create response.
@@ -140,7 +140,19 @@ export class GroupsResource {
     });
   }
 
-  /** Get the group settings (announce / locked / ephemeral timer). */
+  /**
+   * Set this account's member label in the group (empty string clears it). Baileys only; whatsapp-web.js
+   * answers 501. A 200 means the label message was handed to WhatsApp; it cannot be read back.
+   */
+  setMemberLabel(sessionId: string, groupId: string, label: string): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'PUT',
+      path: `/api/sessions/${encodeSegment(sessionId)}/groups/${encodeSegment(groupId)}/member-label`,
+      body: { label },
+    });
+  }
+
+  /** Get the group settings (announce / locked / ephemeral timer / member-add mode). */
   getGroupSettings(sessionId: string, groupId: string): Promise<GroupSettingsResponse> {
     return this.client.request<GroupSettingsResponse>({
       method: 'GET',
@@ -176,7 +188,7 @@ export class GroupsResource {
     });
   }
 
-  /** Set the group's picture. Requires admin rights on the group. */
+  /** Set the group's picture. Requires the right to edit the group info: an admin, or any member of a group whose info is not restricted to admins. */
   setPicture(sessionId: string, groupId: string, body: SetGroupPictureRequest): Promise<SuccessResult> {
     return this.client.request<SuccessResult>({
       method: 'PUT',
@@ -185,7 +197,7 @@ export class GroupsResource {
     });
   }
 
-  /** Remove the group's picture. Requires admin rights on the group. */
+  /** Remove the group's picture. Requires the right to edit the group info: an admin, or any member of a group whose info is not restricted to admins. */
   deletePicture(sessionId: string, groupId: string): Promise<SuccessResult> {
     return this.client.request<SuccessResult>({
       method: 'DELETE',

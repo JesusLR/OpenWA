@@ -3,6 +3,9 @@ package com.rmyndharis.openwa.errors;
 import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -23,10 +26,12 @@ import java.util.stream.StreamSupport;
  * subclass.
  */
 public class OpenWAApiError extends OpenWAError {
+    private static final long serialVersionUID = 1L;
     private static final Gson GSON = new Gson();
 
     private final int status;
-    private final Object body;
+    // A Gson element is not Serializable: writeObject writes a JSON body as its text, readObject parses it back.
+    private transient Object body;
     private final String errorKind;
     private final Map<String, List<String>> headers;
     private final String code;
@@ -83,7 +88,9 @@ public class OpenWAApiError extends OpenWAError {
 
     /**
      * Seconds to wait before retrying: the body's {@code retryAfterSeconds} when present, else the
-     * {@code Retry-After} header (seconds or an HTTP date), else {@code null}.
+     * {@code Retry-After} header (seconds or an HTTP date), else {@code null}. A body value beyond the
+     * range of a {@code long} reads as {@code Long.MAX_VALUE}; a header of more than 18 digits, or a
+     * date too far ahead to convert, reads as {@code null}, the same as an unreadable one: no hint.
      */
     public Long retryAfterSeconds() {
         return retryAfterSeconds;
@@ -113,7 +120,7 @@ public class OpenWAApiError extends OpenWAError {
         try {
             Instant at = ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
             return Math.max(0L, (long) Math.ceil((at.toEpochMilli() - System.currentTimeMillis()) / 1000.0));
-        } catch (DateTimeParseException e) {
+        } catch (DateTimeParseException | ArithmeticException e) {
             return null;
         }
     }
@@ -197,5 +204,19 @@ public class OpenWAApiError extends OpenWAError {
             case 503 -> new OpenWAServiceUnavailableError(message, status, body, errorKind, headers);
             default -> new OpenWAApiError(message, status, body, errorKind, headers);
         };
+    }
+
+    private void writeObject(ObjectOutputStream out) throws IOException {
+        out.defaultWriteObject();
+        boolean json = body instanceof JsonElement;
+        out.writeBoolean(json);
+        out.writeObject(json ? body.toString() : body);
+    }
+
+    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+        in.defaultReadObject();
+        boolean json = in.readBoolean();
+        Object value = in.readObject();
+        body = json ? GSON.fromJson((String) value, JsonElement.class) : value;
     }
 }

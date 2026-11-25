@@ -1,8 +1,10 @@
 import 'reflect-metadata';
 import { NotImplementedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { LoggerService } from '../../../common/services/logger.service';
 import { DataSource } from 'typeorm';
-import { BuiltInFtsProvider } from './builtin-fts.provider';
+import { ContainsTermsRefusedError } from '../search-terms';
+import { BuiltInFtsProvider, TRIGRAM_BUILD_LOCK_KEY } from './builtin-fts.provider';
 
 /**
  * Postgres-side probe coverage. A real PG instance isn't available to the unit suite, so the
@@ -93,6 +95,21 @@ describe('BuiltInFtsProvider (postgres probe)', () => {
     expect(calls[1][1]).toEqual(['hello', ...chatIds]);
   });
 
+  it('binds inclusive millisecond bounds in seconds for both rows and count', async () => {
+    const { ds, query } = makePostgresDataSource({ bodyTsPresent: true });
+    await new BuiltInFtsProvider(ds).search({ q: 'hello', dateFrom: 1000.5, dateTo: 2999.5, limit: 1, offset: 1 });
+    const calls = query.mock.calls
+      .map(call => call as unknown[])
+      .filter(call => /websearch_to_tsquery/.test(String(call[0])));
+    expect(calls).toHaveLength(2);
+    for (const [sql] of calls) {
+      expect(String(sql)).toContain('m."timestamp" >= $2');
+      expect(String(sql)).toContain('m."timestamp" <= $3');
+    }
+    expect(calls[0][1]).toEqual(['hello', 2, 2, 1, 1]);
+    expect(calls[1][1]).toEqual(['hello', 2, 2]);
+  });
+
   it('does not credit a namesake in another schema: an empty active-schema probe means 501, not "available"', async () => {
     // A public.messages.body_ts must not make FTS look available when the table the search queries
     // resolve (active schema) lacks the column. The scripted probe answers for the resolved table
@@ -169,5 +186,280 @@ describe('BuiltInFtsProvider (postgres probe)', () => {
     state.bodyTsPresent = true;
     expect((await provider.health()).ok).toBe(true);
     await expect(provider.search({ q: 'hello' })).resolves.toMatchObject({ provider: 'builtin-fts' });
+  });
+});
+
+describe('BuiltInFtsProvider match=contains terms (postgres)', () => {
+  /** A provider whose catalog read finds the trigram index ready, over a database that matches nothing. */
+  const containsReady = () => {
+    const query = jest.fn().mockResolvedValue([]);
+    const manager = {
+      query: jest.fn().mockResolvedValue([{ trgm: 'public', unaccent: 'public', fn: true, idx: true }]),
+    };
+    const ds = { options: { type: 'postgres' }, query, manager } as unknown as DataSource;
+    return { provider: new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } })), query };
+  };
+
+  // As show_trgm(openwa_unaccent(term)) reads them on PostgreSQL 16, with glibc and with musl: a Hangul
+  // word of two syllables, a modifier letter unaccent turns into an apostrophe and superscript digits
+  // give pg_trgm no trigram to look up, so the search would read every row.
+  it.each(['안녕', '\u02bc'.repeat(3), '¹²³'])('refuses %j alone, which pg_trgm cannot look up', async q => {
+    const { provider, query } = containsReady();
+    await expect(provider.search({ q, match: 'contains' })).rejects.toBeInstanceOf(ContainsTermsRefusedError);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  // Hangul syllables, a katakana word with its prolonged sound mark, and letter numbers (which unaccent
+  // spells in Latin) give it trigrams.
+  it.each(['서울역', 'ラーメン', 'ⅫⅫⅫ'])('looks %j up', async q => {
+    const { provider, query } = containsReady();
+    await expect(provider.search({ q, match: 'contains' })).resolves.toMatchObject({ total: 0 });
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('BuiltInFtsProvider contains index build lock (postgres)', () => {
+  beforeEach(() => {
+    jest.spyOn(LoggerService.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  /**
+   * A database whose build lock answers `locks` in turn and whose index exists once the lock is taken,
+   * while the catalog a search reads still lacks it: only a build attempt of the provider's own can
+   * make contains search ready.
+   */
+  const lockedOut = (locks: boolean[]) => {
+    const tryLock = jest.fn<Promise<Array<{ locked: boolean }>>, [string, unknown[]]>(() =>
+      Promise.resolve([{ locked: locks.shift() ?? false }]),
+    );
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn().mockResolvedValue([]),
+      manager: {
+        query: jest.fn((sql: string, params: unknown[]) =>
+          /pg_try_advisory_lock/.test(sql)
+            ? tryLock(sql, params)
+            : Promise.resolve([{ trgm: 'public', unaccent: 'public', fn: true, idx: true }]),
+        ),
+      },
+    };
+    const notReady = [{ trgm: 'public', unaccent: 'public', fn: false, idx: null }];
+    const ds = {
+      options: { type: 'postgres' },
+      createQueryRunner: () => runner,
+      query: jest.fn().mockResolvedValue([]),
+      manager: { query: jest.fn().mockResolvedValue(notReady) },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } }));
+    Object.assign(provider, { containsBuildRetryMs: 0 });
+    return { provider, tryLock };
+  };
+  const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+
+  it('keys the lock to the messages table and tries it again until the index is ready', async () => {
+    const { provider, tryLock } = lockedOut([false, false, true]);
+    const search = () => provider.search({ q: 'voic', match: 'contains' });
+
+    await provider.buildContainsIndex();
+    await expect(search()).rejects.toThrow(/still being built/);
+    for (
+      let i = 0;
+      i < 100 &&
+      (await search().then(
+        () => false,
+        () => true,
+      ));
+      i++
+    )
+      await settle();
+
+    await expect(search()).resolves.toMatchObject({ total: 0 });
+    expect(tryLock).toHaveBeenCalledTimes(3);
+    expect(tryLock).toHaveBeenCalledWith(expect.stringContaining("to_regclass('messages')"), [TRIGRAM_BUILD_LOCK_KEY]);
+    await provider.onModuleDestroy();
+  });
+
+  it('stops trying once the module is destroyed', async () => {
+    const { provider, tryLock } = lockedOut([]);
+
+    await provider.buildContainsIndex();
+    await provider.onModuleDestroy();
+    await settle();
+
+    expect(tryLock).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a PostgreSQL trigram build on destroy without running DDL and still restores timeout, lock, and runner', async () => {
+    let releaseSetTimeout!: () => void;
+    const setTimeoutGate = new Promise<void>(resolve => (releaseSetTimeout = resolve));
+    let enteredSetTimeout!: () => void;
+    const onSetTimeout = new Promise<void>(resolve => (enteredSetTimeout = resolve));
+    const runnerQueries: Array<{ sql: string; params?: unknown[] }> = [];
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn(async (sql: string, params?: unknown[]) => {
+        runnerQueries.push({ sql, params });
+        if (/SET statement_timeout = 0/.test(sql)) {
+          enteredSetTimeout();
+          await setTimeoutGate;
+        }
+        return [];
+      }),
+      manager: {
+        query: jest.fn((sql: string) => {
+          if (/datctype/.test(sql)) return Promise.resolve([{ ctype: 'en_US.UTF-8' }]);
+          if (/pg_try_advisory_lock/.test(sql)) return Promise.resolve([{ locked: true }]);
+          if (/SHOW statement_timeout/.test(sql)) return Promise.resolve([{ statement_timeout: '30s' }]);
+          return Promise.resolve([{ trgm: 'public', unaccent: 'public', fn: false, idx: null }]);
+        }),
+      },
+    };
+    const ds = {
+      options: { type: 'postgres' },
+      createQueryRunner: () => runner,
+      query: jest.fn().mockResolvedValue([]),
+      manager: { query: jest.fn().mockResolvedValue([{ trgm: 'public', unaccent: 'public', fn: false, idx: null }]) },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } }));
+
+    const buildP = provider.buildContainsIndex();
+    await onSetTimeout;
+
+    let destroyed = false;
+    const destroyP = provider.onModuleDestroy().then(() => {
+      destroyed = true;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(destroyed).toBe(false);
+
+    releaseSetTimeout();
+    await destroyP;
+    await buildP;
+
+    expect(destroyed).toBe(true);
+    expect(runnerQueries.some(({ sql }) => /CREATE EXTENSION|openwa_unaccent|DROP INDEX|CREATE INDEX/.test(sql))).toBe(
+      false,
+    );
+    expect(runnerQueries).toContainEqual({
+      sql: "SELECT set_config('statement_timeout', $1, false)",
+      params: ['30s'],
+    });
+    expect(runnerQueries.some(({ sql }) => /pg_advisory_unlock/.test(sql))).toBe(true);
+    expect(runner.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops before acquiring the advisory lock when destroyed while reading database ctype', async () => {
+    let releaseCtype!: () => void;
+    const ctypeGate = new Promise<void>(resolve => (releaseCtype = resolve));
+    let enteredCtype!: () => void;
+    const onCtype = new Promise<void>(resolve => (enteredCtype = resolve));
+    const managerSql: string[] = [];
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn().mockResolvedValue([]),
+      manager: {
+        query: jest.fn(async (sql: string) => {
+          managerSql.push(sql);
+          if (/datctype/.test(sql)) {
+            enteredCtype();
+            await ctypeGate;
+            return [{ ctype: 'en_US.UTF-8' }];
+          }
+          return [{ locked: true }];
+        }),
+      },
+    };
+    const ds = {
+      options: { type: 'postgres' },
+      createQueryRunner: () => runner,
+      query: jest.fn().mockResolvedValue([]),
+      manager: { query: jest.fn().mockResolvedValue([]) },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } }));
+
+    const buildP = provider.buildContainsIndex();
+    await onCtype;
+
+    const destroyP = provider.onModuleDestroy();
+    releaseCtype();
+    await destroyP;
+    await buildP;
+
+    expect(managerSql.some(sql => /pg_try_advisory_lock/.test(sql))).toBe(false);
+    expect(runner.query).not.toHaveBeenCalled();
+    expect(runner.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('still runs pg_advisory_unlock when set_config fails and evicts the pooled PG connection', async () => {
+    const setConfigErr = new Error('connection reset during set_config');
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      manager: {
+        query: jest.fn((sql: string) => {
+          if (/datctype/.test(sql)) return Promise.resolve([{ ctype: 'en_US.UTF-8' }]);
+          if (/pg_try_advisory_lock/.test(sql)) return Promise.resolve([{ locked: true }]);
+          if (/SHOW statement_timeout/.test(sql)) return Promise.resolve([{ statement_timeout: '30s' }]);
+          return Promise.resolve([{ trgm: 'public', unaccent: 'public', fn: false, idx: null }]);
+        }),
+      },
+      query: jest.fn((sql: string) => {
+        if (/set_config\('statement_timeout'/.test(sql)) return Promise.reject(setConfigErr);
+        return Promise.resolve([]);
+      }),
+      release: jest.fn().mockResolvedValue(undefined),
+      releasePostgresConnection: jest.fn().mockResolvedValue(undefined),
+    };
+    const ds = {
+      options: { type: 'postgres' },
+      createQueryRunner: jest.fn().mockReturnValue(runner),
+      query: jest.fn().mockResolvedValue([]),
+      manager: {
+        query: jest.fn((sql: string) => {
+          if (/pg_extension/.test(sql)) return Promise.resolve([{ extname: 'pg_trgm' }, { extname: 'unaccent' }]);
+          if (/pg_class/.test(sql) && /pg_attribute/.test(sql)) return Promise.resolve([{ attname: 'body' }]);
+          if (/current_schemas/.test(sql)) return Promise.resolve([{ schema: 'public' }]);
+          if (/SHOW lc_ctype/.test(sql)) return Promise.resolve([{ lc_ctype: 'C.UTF-8' }]);
+          return Promise.resolve([]);
+        }),
+      },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } }));
+
+    await provider.buildContainsIndex();
+
+    const runnerSqls = (runner.query as jest.Mock).mock.calls.map(([sql]) => String(sql));
+    expect(runnerSqls.some(sql => /pg_advisory_unlock/.test(sql))).toBe(true);
+    expect(runner.releasePostgresConnection).toHaveBeenCalledWith(setConfigErr);
+    expect(runner.release).not.toHaveBeenCalled();
+  });
+
+  it('evaluates ts_headline only in outer SELECT after CTE ORDER BY LIMIT/OFFSET on Postgres word search', async () => {
+    const query = jest.fn((sql: string) => {
+      if (/COUNT\(\*\)/.test(sql)) return Promise.resolve([{ count: '0' }]);
+      return Promise.resolve([]);
+    });
+    const ds = {
+      options: { type: 'postgres' },
+      query,
+      manager: { query: jest.fn().mockResolvedValue([]) },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds);
+    Object.assign(provider as unknown as Record<string, unknown>, { ftsAvailable: true, containsAvailable: true });
+
+    await provider.search({ q: 'hello', match: 'word', limit: 10, offset: 5 });
+
+    const dataCall = query.mock.calls.find(([sql]) => /ts_headline/i.test(String(sql)));
+    expect(dataCall).toBeDefined();
+    const sql = String(dataCall![0]);
+    const limitIdx = sql.search(/\bLIMIT\b/i);
+    const headlineIdx = sql.search(/\bts_headline\s*\(/i);
+    expect(sql).toMatch(/\bWITH\b/i);
+    expect(limitIdx).toBeGreaterThan(-1);
+    expect(headlineIdx).toBeGreaterThan(limitIdx);
   });
 });

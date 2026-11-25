@@ -7,6 +7,7 @@ import { HealthController } from './health.controller';
 import { ReadinessResponseDto } from './dto/health-response.dto';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { AuthService } from '../auth/auth.service';
+import { BrowserSessionService } from '../auth/browser-session.service';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 
@@ -16,6 +17,7 @@ describe('HealthController', () => {
   const dataQuery = jest.fn();
   const isShuttingDown = jest.fn();
   const validateApiKey = jest.fn();
+  const validateSessionToken = jest.fn();
   const logWarn = jest.fn().mockResolvedValue(null);
 
   const reqWith = (headers: Record<string, string> = {}, ip = '127.0.0.1'): Request =>
@@ -33,6 +35,7 @@ describe('HealthController', () => {
         { provide: getDataSourceToken('data'), useValue: { query: dataQuery } },
         { provide: ShutdownService, useValue: { isShuttingDown } },
         { provide: AuthService, useValue: { validateApiKey } },
+        { provide: BrowserSessionService, useValue: { validateSessionToken } },
         { provide: AuditService, useValue: { logWarn } },
         { provide: ConfigService, useValue: { get: () => undefined } },
       ],
@@ -46,6 +49,7 @@ describe('HealthController', () => {
     dataQuery.mockReset();
     isShuttingDown.mockReset();
     validateApiKey.mockReset();
+    validateSessionToken.mockReset();
     logWarn.mockClear(); // keep the resolved value, drop cross-test call history
   });
 
@@ -100,6 +104,47 @@ describe('HealthController', () => {
 
       expect(result.version).toBeDefined();
       expect(validateApiKey).toHaveBeenCalledWith('good-key', '127.0.0.1');
+    });
+
+    it('reports the running version to a valid openwa_session cookie when no API key header is sent', async () => {
+      validateSessionToken.mockResolvedValue({ session: { id: 'bs-1' }, apiKey: { id: 'k1' } });
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { version } = require('../../../package.json') as { version: string };
+
+      const result = await controller.check(reqWith({ cookie: 'openwa_session=valid-cookie-tok' }));
+
+      expect(result.version).toBe(version);
+      expect(validateSessionToken).toHaveBeenCalledWith('valid-cookie-tok', '127.0.0.1');
+      expect(validateApiKey).not.toHaveBeenCalled();
+    });
+
+    it('does not fall back to openwa_session cookie when an invalid X-API-Key header is presented', async () => {
+      validateApiKey.mockRejectedValue(new UnauthorizedException('Invalid API key'));
+      validateSessionToken.mockResolvedValue({ session: { id: 'bs-1' }, apiKey: { id: 'k1' } });
+
+      const result = await controller.check(
+        reqWith({ 'x-api-key': 'wrong-key', cookie: 'openwa_session=valid-cookie-tok' }),
+      );
+
+      expect(result.status).toBe('ok');
+      expect(result).not.toHaveProperty('version');
+      expect(validateApiKey).toHaveBeenCalledWith('wrong-key', '127.0.0.1');
+      expect(validateSessionToken).not.toHaveBeenCalled();
+    });
+
+    it('withholds version and audits an invalid openwa_session cookie', async () => {
+      validateSessionToken.mockRejectedValue(new UnauthorizedException('Invalid session'));
+
+      const result = await controller.check(reqWith({ cookie: 'openwa_session=bad-cookie-tok' }));
+
+      expect(result.status).toBe('ok');
+      expect(result).not.toHaveProperty('version');
+      expect(logWarn).toHaveBeenCalledWith(AuditAction.API_KEY_AUTH_FAILED, {
+        ipAddress: '127.0.0.1',
+        method: 'GET',
+        path: '/api/health',
+        errorMessage: 'Invalid session',
+      });
     });
   });
 
@@ -269,6 +314,89 @@ describe('HealthController', () => {
       expect(await unavailableBody()).toEqual({ status: 'error', details: { shutdown: { status: 'draining' } } });
       expect(mainQuery).not.toHaveBeenCalled();
       expect(dataQuery).not.toHaveBeenCalled();
+    });
+
+    // The route is public and exempt from the throttler, so a burst of callers must not become a burst of queries.
+    describe('under a burst of probes', () => {
+      afterEach(() => jest.useRealTimers());
+
+      it('shares one pair of probes between requests that arrive together', async () => {
+        const results = await Promise.all([controller.readiness(), controller.readiness(), controller.readiness()]);
+
+        expect(results.map(result => result.status)).toEqual(['ok', 'ok', 'ok']);
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+        expect(dataQuery).toHaveBeenCalledTimes(1);
+      });
+
+      it('answers from the last verdict for a second, then probes again', async () => {
+        jest.useFakeTimers();
+        await controller.readiness();
+        await controller.readiness();
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+
+        jest.advanceTimersByTime(999);
+        await controller.readiness();
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+
+        jest.advanceTimersByTime(2);
+        await controller.readiness();
+        expect(mainQuery).toHaveBeenCalledTimes(2);
+        expect(dataQuery).toHaveBeenCalledTimes(2);
+      });
+
+      it('reuses a down verdict for the same second, and recovers once it expires', async () => {
+        jest.useFakeTimers();
+        mainQuery.mockRejectedValueOnce(new Error('connection refused'));
+        expect(await unavailableBody()).toEqual({
+          status: 'error',
+          details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+        });
+
+        expect(await unavailableBody()).toEqual({
+          status: 'error',
+          details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+        });
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+
+        jest.advanceTimersByTime(1000);
+        expect((await controller.readiness()).status).toBe('ok');
+        expect(mainQuery).toHaveBeenCalledTimes(2);
+      });
+
+      it('probes again when the clock was set back past the verdict it kept', async () => {
+        jest.useFakeTimers();
+        await controller.readiness();
+
+        jest.setSystemTime(Date.now() - 60_000);
+        await controller.readiness();
+
+        expect(mainQuery).toHaveBeenCalledTimes(2);
+      });
+
+      it('reports draining at once, never from a verdict it kept', async () => {
+        await controller.readiness();
+        isShuttingDown.mockReturnValue(true);
+
+        expect(await unavailableBody()).toEqual({ status: 'error', details: { shutdown: { status: 'draining' } } });
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+      });
+
+      it('tells every waiter that a probe which hangs is down after 3 s', async () => {
+        jest.useFakeTimers();
+        mainQuery.mockReturnValue(new Promise(() => {}));
+        const first = unavailableBody();
+        const second = unavailableBody();
+
+        await jest.advanceTimersByTimeAsync(3000);
+
+        const expected = {
+          status: 'error',
+          details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+        };
+        expect(await first).toEqual(expected);
+        expect(await second).toEqual(expected);
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+      });
     });
 
     // The draining 503 answers while every database is up, so the contract must not describe the

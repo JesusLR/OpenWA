@@ -8,7 +8,7 @@ before(async () => {
 });
 
 beforeEach(() => {
-  sessionStorage.setItem('openwa_api_key', 'key-a');
+  sessionStorage.setItem('openwa_api_key_id', 'key-a');
 });
 
 /** Fake page source: holds `total` rows, but never returns more than `serverMax` per call. */
@@ -165,7 +165,7 @@ test('a walk stops once the key it started with is signed out or replaced', asyn
   const { fetchPage } = fakeSource(1_000, 200);
   const sentWith: Array<string | null> = [];
   const keyedPage = async (limit: number, offset: number) => {
-    sentWith.push(sessionStorage.getItem('openwa_api_key'));
+    sentWith.push(sessionStorage.getItem('openwa_api_key_id'));
     return fetchPage(limit, offset);
   };
 
@@ -177,7 +177,7 @@ test('a walk stops once the key it started with is signed out or replaced', asyn
         const page = await keyedPage(limit, offset);
         if (offset === 200 && !throttled) {
           throttled = true;
-          sessionStorage.removeItem('openwa_api_key');
+          sessionStorage.removeItem('openwa_api_key_id');
           throw httpError(429);
         }
         return page;
@@ -190,11 +190,11 @@ test('a walk stops once the key it started with is signed out or replaced', asyn
 
   // Signed in again with another key while a page was out: no page goes out as the new key.
   sentWith.length = 0;
-  sessionStorage.setItem('openwa_api_key', 'key-a');
+  sessionStorage.setItem('openwa_api_key_id', 'key-a');
   await assert.rejects(
     fetchAllPages(async (limit, offset) => {
       const page = await keyedPage(limit, offset);
-      if (offset === 200) sessionStorage.setItem('openwa_api_key', 'key-b');
+      if (offset === 200) sessionStorage.setItem('openwa_api_key_id', 'key-b');
       return page;
     }),
     /Signed out/,
@@ -202,11 +202,11 @@ test('a walk stops once the key it started with is signed out or replaced', asyn
   assert.deepEqual(sentWith, ['key-a', 'key-a']);
 
   // Signed out while the last page was out: its rows do not come back as a finished walk.
-  sessionStorage.setItem('openwa_api_key', 'key-a');
+  sessionStorage.setItem('openwa_api_key_id', 'key-a');
   await assert.rejects(
     fetchAllPages(async (limit, offset) => {
       const page = await fetchPage(limit, offset);
-      if (offset === 800) sessionStorage.removeItem('openwa_api_key');
+      if (offset === 800) sessionStorage.removeItem('openwa_api_key_id');
       return page;
     }),
     /Signed out/,
@@ -214,13 +214,13 @@ test('a walk stops once the key it started with is signed out or replaced', asyn
 
   // Signed out while the last retry of a throttled page was out: the rows in hand do not come back
   // as a throttled partial walk.
-  sessionStorage.setItem('openwa_api_key', 'key-a');
+  sessionStorage.setItem('openwa_api_key_id', 'key-a');
   let refused = 0;
   await assert.rejects(
     fetchAllPages(
       async (limit, offset) => {
         if (offset === 0) return fetchPage(limit, offset);
-        if (++refused === 3) sessionStorage.removeItem('openwa_api_key');
+        if (++refused === 3) sessionStorage.removeItem('openwa_api_key_id');
         throw httpError(429);
       },
       { retryDelayMs: 0 },
@@ -237,11 +237,11 @@ test('a walk does not send its retry when the key is signed out during the throt
   await assert.rejects(
     fetchAllPages(
       async (limit, offset) => {
-        sentWith.push(sessionStorage.getItem('openwa_api_key'));
+        sentWith.push(sessionStorage.getItem('openwa_api_key_id'));
         if (offset === 200 && !refused) {
           refused = true;
           // The refusal settles first; the operator signs out while the walk waits to retry it.
-          setTimeout(() => sessionStorage.removeItem('openwa_api_key'), 5);
+          setTimeout(() => sessionStorage.removeItem('openwa_api_key_id'), 5);
           throw httpError(429);
         }
         return fetchPage(limit, offset);
@@ -271,4 +271,36 @@ test('the throttle backoff doubles on each retry', async () => {
     globalThis.setTimeout = realSetTimeout;
   }
   assert.deepEqual(delays, [40, 80]);
+});
+
+test('a walk does not retry a 503', async () => {
+  let calls = 0;
+  await assert.rejects(
+    retryThrottled(async () => {
+      calls += 1;
+      throw httpError(503);
+    }, 5),
+    { status: 503 },
+  );
+  assert.equal(calls, 1);
+});
+
+test('a retried 503 waits at least its Retry-After, up to ten seconds, and a 429 keeps its fixed waits', async () => {
+  const delays: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+    delays.push(ms ?? 0);
+    return realSetTimeout(fn, 0);
+  }) as typeof setTimeout;
+  const refuse = (code: number, retryAfterSeconds: number) => async () => {
+    throw Object.assign(httpError(code), { retryAfterSeconds });
+  };
+  try {
+    await assert.rejects(retryThrottled(refuse(503, 2), 40, [503]), { status: 503 });
+    await assert.rejects(retryThrottled(refuse(503, 3600), 40, [503]), { status: 503 });
+    await assert.rejects(retryThrottled(refuse(429, 3600), 40, [429]), { status: 429 });
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  assert.deepEqual(delays, [2000, 2000, 10_000, 10_000, 40, 80]);
 });

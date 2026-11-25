@@ -22,8 +22,10 @@ interface ComposeService {
   restart?: string;
   networks?: string[];
   security_opt?: string[];
+  cap_drop?: string[];
+  cap_add?: string[];
   environment?: Record<string, string>;
-  command?: string;
+  command?: string | string[];
   volumes?: string[];
   ports?: string[];
   labels?: string[];
@@ -51,6 +53,8 @@ interface CapturedConfig {
     RestartPolicy: { Name: string };
     Binds?: string[];
     SecurityOpt?: string[];
+    CapDrop?: string[];
+    CapAdd?: string[];
     PortBindings?: Record<string, { HostIp: string; HostPort: string }[]>;
     Memory?: number;
     NanoCpus?: number;
@@ -61,6 +65,15 @@ interface CapturedConfig {
 }
 
 const PROFILES = ['postgres', 'redis', 'minio'] as const;
+
+const parseComposeMemLimit = (v: string): number => {
+  const m = /^(\d+)([mMgG])$/.exec(v);
+  if (!m) throw new Error(`unexpected compose mem_limit: ${v}`);
+  const unit = m[2].toLowerCase() === 'g' ? 1024 * 1024 * 1024 : 1024 * 1024;
+  return parseInt(m[1], 10) * unit;
+};
+
+const unescapeComposeDollar = (s: string): string => s.replace(/\$\$/g, '$');
 
 const VOLUME_PATH: Record<string, string> = {
   postgres: '/var/lib/postgresql/data',
@@ -111,9 +124,16 @@ async function capture(profile: string, Service: typeof DockerService = DockerSe
 describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
   const compose = yaml.load(readFileSync(join(__dirname, '../../../docker-compose.yml'), 'utf8')) as ComposeFile;
 
-  // getContainerSpec reads the S3 credential env vars at call time; scrub them so the
+  // getContainerSpec reads the credential env vars at call time; scrub them so the
   // default-fallback assertions don't depend on the developer's shell.
-  const S3_VARS = ['S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_ACCESS_KEY', 'S3_SECRET_KEY'];
+  const S3_VARS = [
+    'S3_ACCESS_KEY_ID',
+    'S3_SECRET_ACCESS_KEY',
+    'S3_ACCESS_KEY',
+    'S3_SECRET_KEY',
+    'DATABASE_PASSWORD',
+    'REDIS_PASSWORD',
+  ];
   let savedEnv: Record<string, string | undefined> = {};
   beforeEach(() => {
     savedEnv = {};
@@ -200,18 +220,21 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
     });
   });
 
-  it.each(PROFILES)('%s: sets no CPU/memory/PID limits on either path (only openwa-api is limited)', async profile => {
+  it.each(PROFILES)('%s: applies the same capability drop/add and memory/PID limits on both paths', async profile => {
     const svc = compose.services[profile];
-    expect(svc.mem_limit).toBeUndefined();
-    expect(svc.pids_limit).toBeUndefined();
+    expect(svc.cap_drop).toEqual(['ALL']);
+    expect(svc.mem_limit).toBeDefined();
+    expect(svc.pids_limit).toBeDefined();
     expect(svc.deploy).toBeUndefined();
     const cfg = await capture(profile);
-    expect(cfg.HostConfig.Memory).toBeUndefined();
+    expect(cfg.HostConfig.CapDrop).toEqual(svc.cap_drop);
+    expect(cfg.HostConfig.CapAdd).toEqual(svc.cap_add);
+    expect(cfg.HostConfig.Memory).toBe(parseComposeMemLimit(svc.mem_limit!));
     expect(cfg.HostConfig.NanoCpus).toBeUndefined();
-    expect(cfg.HostConfig.PidsLimit).toBeUndefined();
+    expect(cfg.HostConfig.PidsLimit).toBe(svc.pids_limit);
   });
 
-  it('postgres: provisions the fixed built-in credentials; compose defaults agree on user/db only', async () => {
+  it('postgres: provisions the default built-in credentials; compose defaults agree on user/db only', async () => {
     const cfg = await capture('postgres');
     expect(cfg.Env).toEqual(['POSTGRES_USER=openwa', 'POSTGRES_PASSWORD=openwa', 'POSTGRES_DB=openwa']);
     const env = compose.services.postgres.environment!;
@@ -222,6 +245,39 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
     expect(env.POSTGRES_USER).toBe('${DATABASE_USERNAME:-openwa}');
     expect(env.POSTGRES_DB).toBe('${DATABASE_NAME:-openwa}');
     expect(env.POSTGRES_PASSWORD).toBe('${DATABASE_PASSWORD:-}');
+  });
+
+  it('postgres: initializes the role with the password the app will dial with', async () => {
+    process.env.DATABASE_PASSWORD = 'S3cure-pw-9';
+    const cfg = await capture('postgres');
+    expect(cfg.Env).toEqual(['POSTGRES_USER=openwa', 'POSTGRES_PASSWORD=S3cure-pw-9', 'POSTGRES_DB=openwa']);
+  });
+
+  it('postgres: provisions the password the next boot reads, not the one this process booted with', async () => {
+    // A password saved from the dashboard reached process.env from data/.env.generated at boot; a later
+    // save has rewritten the file, and the restart that creates the container runs in this old process.
+    // Fresh modules: the precedence snapshot is global.
+    const dir = mkdtempSync(join(tmpdir(), 'openwa-pg-'));
+    mkdirSync(join(dir, 'data'));
+    writeFileSync(join(dir, 'data', '.env.generated'), 'DATABASE_PASSWORD=S3cure-pw-9\n');
+    const cwd = jest.spyOn(process, 'cwd').mockReturnValue(dir);
+    try {
+      let FreshDockerService: typeof DockerService = DockerService;
+      jest.isolateModules(() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const precedence = require('../../config/env-precedence') as typeof import('../../config/env-precedence');
+        precedence.recordOsEnvKeys({});
+        precedence.recordPinnedEnvKeys({});
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        FreshDockerService = (require('./docker.service') as typeof import('./docker.service')).DockerService;
+      });
+      process.env.DATABASE_PASSWORD = 'old-boot-password';
+      const cfg = await capture('postgres', FreshDockerService);
+      expect(cfg.Env).toEqual(['POSTGRES_USER=openwa', 'POSTGRES_PASSWORD=S3cure-pw-9', 'POSTGRES_DB=openwa']);
+    } finally {
+      cwd.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('postgres: healthcheck resolves to the same pg_isready command as compose', async () => {
@@ -238,12 +294,26 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
     expect(cfg.HostConfig.PortBindings).toBeUndefined();
   });
 
-  it('redis: runs the same command and healthcheck, with no credentials, like compose', async () => {
-    const cfg = await capture('redis');
-    expect(cfg.Cmd?.join(' ')).toBe(compose.services.redis.command);
-    expect(cfg.Healthcheck!.Test).toEqual(compose.services.redis.healthcheck!.test);
-    expect(compose.services.redis.environment).toBeUndefined();
-    expect(cfg.Env).toBeUndefined();
+  it('redis: runs the same command and healthcheck and forwards optional REDIS_PASSWORD like compose', async () => {
+    const composeCmd = (
+      Array.isArray(compose.services.redis.command) ? compose.services.redis.command : [compose.services.redis.command!]
+    ).map(unescapeComposeDollar);
+    const composeHealth = compose.services.redis.healthcheck!.test.map(unescapeComposeDollar);
+
+    const cfgNoPw = await capture('redis');
+    expect(cfgNoPw.Cmd).toEqual(composeCmd);
+    expect(cfgNoPw.Healthcheck!.Test).toEqual(composeHealth);
+    expect(compose.services.redis.environment).toEqual({ REDIS_PASSWORD: '${REDIS_PASSWORD:-}' });
+    expect(cfgNoPw.Env).toBeUndefined();
+
+    process.env.REDIS_PASSWORD = 'redis-strong-pw';
+    const cfgWithPw = await capture('redis');
+    expect(cfgWithPw.Env).toEqual(['REDIS_PASSWORD=redis-strong-pw']);
+    expect(cfgWithPw.Cmd?.join(' ')).toContain('--requirepass');
+    // Both branches of sh -c must delegate back to docker-entrypoint.sh so redis:7-alpine drops
+    // root privileges via su-exec redis instead of running redis-server as UID 0.
+    const redisShellScript = cfgNoPw.Cmd?.[2] ?? '';
+    expect(redisShellScript.match(/exec docker-entrypoint\.sh redis-server/g)).toHaveLength(2);
   });
 
   // docker-compose.yml has NO env_file — the `environment:` list is an explicit allow-list, so a
@@ -330,9 +400,6 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
       MINIO_BUILTIN: 'dashboard-managed',
       QUEUE_ENABLED: 'dashboard-managed (.env.example documents that a host value is not forwarded)',
       WEBHOOK_SSRF_PROTECT: 'fails safe (default on)',
-      // The dev stack manages no built-in datastores; its daemon is the host's local socket, and a
-      // stray DOCKER_HOST would point the app at an unrelated daemon.
-      DOCKER_HOST: 'local socket is the dev default (production pins its socket-proxy)',
     },
   };
 
@@ -382,11 +449,8 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
       ...readFileSync(join(__dirname, '../../../Dockerfile'), 'utf8').matchAll(/^ENV (PUPPETEER_\w+)=/gm),
     ].map(match => match[1]);
     expect(names.length).toBeGreaterThan(0);
-    // A file path, not require.resolve: jest maps `puppeteer` to a mock.
-    const config = readFileSync(
-      join(__dirname, '../../../node_modules/puppeteer/lib/cjs/puppeteer/getConfiguration.js'),
-      'utf8',
-    );
+    // Resolve the exported internal path without loading Puppeteer's ESM entry point.
+    const config = readFileSync(require.resolve('puppeteer/internal/getConfiguration.js'), 'utf8');
     expect(names.filter(name => !config.includes(`'${name}'`))).toEqual([]);
   });
 
@@ -430,11 +494,11 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
 
   it('redis: sets the noeviction maxmemory policy BullMQ requires, on both launch paths', async () => {
     const cfg = await capture('redis');
-    // The parity assertion above only proves the two launch paths AGREE — dropping the flag from
-    // both would keep it green. BullMQ needs noeviction: under any other policy Redis may evict
-    // queue keys once maxmemory is reached, losing queued jobs with no error surfaced anywhere.
-    expect(compose.services.redis.command).toContain('--maxmemory-policy noeviction');
-    expect(cfg.Cmd).toEqual(expect.arrayContaining(['--maxmemory-policy', 'noeviction']));
+    const composeCmd = Array.isArray(compose.services.redis.command)
+      ? compose.services.redis.command.join(' ')
+      : (compose.services.redis.command ?? '');
+    expect(composeCmd).toContain('--maxmemory-policy noeviction');
+    expect(cfg.Cmd?.join(' ')).toContain('--maxmemory-policy noeviction');
   });
 
   it('redis: publishes no host ports, like compose', async () => {
@@ -446,7 +510,7 @@ describe('DockerService managed specs ↔ docker-compose.yml parity', () => {
   it('minio: runs the same server command and healthcheck as compose', async () => {
     const cfg = await capture('minio');
     // Compose quotes the console address; the argv form needs no quotes.
-    expect(cfg.Cmd?.join(' ')).toBe(compose.services.minio.command!.replace(/"/g, ''));
+    expect(cfg.Cmd?.join(' ')).toBe((compose.services.minio.command as string).replace(/"/g, ''));
     expect(cfg.Healthcheck!.Test).toEqual(compose.services.minio.healthcheck!.test);
   });
 

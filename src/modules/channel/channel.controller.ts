@@ -16,7 +16,7 @@ import {
   ENGINE_REFUSED_403,
 } from '../../common/openapi/engine-status-responses';
 
-/** Delete, mute and unsubscribe refuse a non-channel id up front, before any channel lookup. */
+/** Delete, mute, unsubscribe, demote and transfer refuse a non-channel id up front, before any channel lookup. */
 const CHANNEL_ID_INVALID_404 =
   'The id is not a channel id (it does not end in `@newsletter`). Retrying the same id cannot succeed.';
 
@@ -25,6 +25,19 @@ const CHANNEL_ID_INVALID_404 =
 const THROTTLED_503 =
   ' On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); ' +
   'retry after a pause.';
+
+// On whatsapp-web.js the delete, the mute and the unsubscription are sent in the page, so WhatsApp's own status decides the
+// answer, and none of its retryable statuses can promise the write did not go through: the page sends a delete or a mute
+// up to four times and only the last error surfaces, and an unsubscription is one request whose reply may not have come.
+const WWJS_STATUS_503 =
+  ' On whatsapp-web.js, also when WhatsApp Web reports a timeout, a rate limit or a server error (408, 423, 429 or ' +
+  '5xx): that report does not say whether the operation was applied, so it may or may not have been applied; check ' +
+  'before repeating it.';
+
+// A repeat of a delete meets a channel that is gone once the first one went through; a repeat of an unsubscription, a
+// channel that is no longer followed.
+const WWJS_GONE_403 = ' A repeat of it may meet a channel that is gone, which answers 403.';
+const WWJS_UNFOLLOWED = ' A repeat of it may meet a channel that is no longer followed.';
 
 @ApiTags('channels')
 @Controller('sessions/:sessionId/channels')
@@ -39,6 +52,12 @@ export class ChannelController {
   @ApiResponse({
     status: 501,
     description: 'Not supported by the active engine: the Baileys adapter cannot list subscribed channels.',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'On whatsapp-web.js, answered when the page died mid-read or WhatsApp Web did not answer within the protocol timeout, ' +
+      'so nothing could be read. Retry shortly.',
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async findAll(@Param('sessionId') sessionId: string) {
@@ -80,13 +99,19 @@ export class ChannelController {
   @ApiQuery({
     name: 'limit',
     required: false,
-    type: Number,
+    type: 'integer',
     description: 'Max messages to return (default 50, max 100)',
   })
   @ApiResponse({ status: 200, description: 'List of channel messages', type: [ChannelMessageDto] })
   @ApiResponse({
     status: 501,
     description: 'Not supported by the active engine: the Baileys adapter cannot read channel messages.',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'On whatsapp-web.js, answered when the page died mid-read or WhatsApp Web did not answer within the protocol timeout, ' +
+      'so nothing could be read. Retry shortly.',
   })
   @ApiResponse({ status: 400, description: 'Session not started' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
@@ -143,7 +168,10 @@ export class ChannelController {
   @ApiResponse({
     status: 503,
     description:
-      'WhatsApp did not answer within the request budget — the operation may or may not have applied.' + THROTTLED_503,
+      'WhatsApp did not answer within the request budget — the operation may or may not have applied.' +
+      THROTTLED_503 +
+      WWJS_STATUS_503 +
+      WWJS_GONE_403,
   })
   @ApiResponse({ status: 400, description: 'Session not started' })
   @ApiResponse({ status: 403, description: 'The engine refused — not found, or this account does not own it' })
@@ -171,7 +199,9 @@ export class ChannelController {
   @ApiResponse({
     status: 503,
     description:
-      'WhatsApp did not answer within the request budget — the operation may or may not have applied.' + THROTTLED_503,
+      'WhatsApp did not answer within the request budget — the operation may or may not have applied.' +
+      THROTTLED_503 +
+      WWJS_STATUS_503,
   })
   @ApiResponse({ status: 400, description: 'Session not started, or validation failed' })
   @ApiResponse({ status: 403, description: 'The engine refused' })
@@ -218,6 +248,7 @@ export class ChannelController {
       'The whatsapp-web.js engine cannot perform this: the WhatsApp Web module its library method ' +
       'targets no longer exports the function. Use the Baileys engine.',
   })
+  @ApiResponse({ status: 404, description: CHANNEL_ID_INVALID_404 })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async demoteAdmin(
     @Param('sessionId') sessionId: string,
@@ -263,6 +294,7 @@ export class ChannelController {
       'The whatsapp-web.js engine cannot perform this: its page function rejects every call locally ' +
       'against a subscriber list the page cannot repopulate. Use the Baileys engine.',
   })
+  @ApiResponse({ status: 404, description: CHANNEL_ID_INVALID_404 })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async transferOwnership(
     @Param('sessionId') sessionId: string,
@@ -317,7 +349,10 @@ export class ChannelController {
   @ApiResponse({
     status: 503,
     description:
-      'WhatsApp did not answer within the request budget — the operation may or may not have applied.' + THROTTLED_503,
+      'WhatsApp did not answer within the request budget — the operation may or may not have applied.' +
+      THROTTLED_503 +
+      WWJS_STATUS_503 +
+      WWJS_UNFOLLOWED,
   })
   @ApiResponse({ status: 400, description: 'Session not started' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })

@@ -1,5 +1,9 @@
 import { BadRequestException } from '@nestjs/common';
 import { ProfileService } from './profile.service';
+import { provesNothingSent } from '../../common/errors/engine-not-sent.error';
+import { SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
+import { resolveMediaBuffer } from '../../engine/adapters/baileys-messaging';
+import { toMessageMedia } from '../../engine/adapters/wwebjs-messaging';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine, MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
 
@@ -56,6 +60,16 @@ describe('ProfileService', () => {
       );
     });
 
+    it('rejects a url that is not an absolute http(s) URL (400), also when it reaches the service without the DTO', () => {
+      const setProfilePicture = jest.fn();
+      const svc = makeService({ setProfilePicture });
+      for (const url of ['ftp://example.com/a.jpg', 'example.com/a.jpg']) {
+        expect(() => svc.setProfilePicture('s1', { url })).toThrow(BadRequestException);
+        expect(() => svc.setProfilePicture('s1', { url })).toThrow('url must be an absolute http(s) URL');
+      }
+      expect(setProfilePicture).not.toHaveBeenCalled();
+    });
+
     it('maps a base64 body to a MediaInput (base64 wins over a stale url, #670)', async () => {
       const setProfilePicture = jest.fn().mockResolvedValue(undefined);
       await makeService({ setProfilePicture }).setProfilePicture('s1', {
@@ -80,6 +94,43 @@ describe('ProfileService', () => {
         mimetype: 'image/png',
       });
       expect(setProfilePicture).toHaveBeenCalledWith({ mimetype: 'image/png', data: 'QUJD' });
+    });
+  });
+
+  // A media URL the SSRF guard refuses is the caller's input: a 400, as on a send, where the guard's own error was a 500.
+  // Each engine stand-in does only what its adapter does first, fetch the URL through the shared loader; an internal
+  // address is refused before any socket is opened.
+  describe('setProfilePicture with a media URL the SSRF guard refuses', () => {
+    const failureOf = (call: () => Promise<unknown>): Promise<unknown> =>
+      Promise.resolve()
+        .then(call)
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+
+    it.each([
+      ['Baileys', (media: MediaInput) => resolveMediaBuffer(media, undefined).then(() => undefined)],
+      ['whatsapp-web.js', (media: MediaInput) => toMessageMedia(media, undefined).then(() => undefined)],
+    ])('answers 400 with the generic text on %s and proves nothing was sent', async (_engine, setProfilePicture) => {
+      const error = await failureOf(() =>
+        makeService({ setProfilePicture }).setProfilePicture('s1', { url: 'http://10.0.0.1/a.jpg' }),
+      );
+
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect((error as BadRequestException).message).toBe(SSRF_BLOCKED_CLIENT_MESSAGE);
+      expect(provesNothingSent(error)).toBe(true);
+    });
+
+    it('leaves another engine failure as it is', async () => {
+      const failure = new Error('socket closed');
+      const setProfilePicture = jest.fn().mockRejectedValue(failure);
+
+      const error = await failureOf(() =>
+        makeService({ setProfilePicture }).setProfilePicture('s1', { url: 'https://example.com/a.jpg' }),
+      );
+
+      expect(error).toBe(failure);
     });
   });
 });

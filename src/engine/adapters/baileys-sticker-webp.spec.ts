@@ -3,16 +3,17 @@ import { BadRequestException } from '@nestjs/common';
 import sharp from 'sharp';
 import { BaileysMessaging, MAX_STICKER_FRAMES, blockSvgDecoding, type BaileysMessagingHost } from './baileys-messaging';
 import { createLogger } from '../../common/services/logger.service';
+import { provesNothingSent } from '../../common/errors/engine-not-sent.error';
 
 /**
  * Baileys stamps the sticker mimetype unconditionally: `prepareWAMessageMedia` applies
  * `if (!uploadData.mimetype) uploadData.mimetype = MIMETYPE_MAP[mediaType]` with
- * `MIMETYPE_MAP.sticker = 'image/webp'` (Utils/messages.js:18, 86-88), and nothing on that path
+ * `MIMETYPE_MAP.sticker = 'image/webp'` (Utils/messages.js), and nothing on that path
  * transcodes. So whatever bytes the adapter hands over are published AS WebP whether they are WebP
  * or not — a PNG goes out labelled `image/webp` with PNG bytes, and the send reports success.
  *
  * whatsapp-web.js does not have this problem: `sendMediaAsSticker: true` routes through
- * `Util.formatToWebpSticker` (Client.js:1532, Util.js:152-159), which converts `image/*` and
+ * `Util.formatToWebpSticker` (called from `Client.sendMessage`), which converts `image/*` and
  * throws `Invalid media format` for anything else.
  *
  * These assertions are about what reaches the socket, because that is where the two engines
@@ -158,6 +159,8 @@ describe('BaileysMessaging.sendStickerMessage — what reaches the socket must r
       await expect(send).rejects.toThrow(`has ${MAX_STICKER_FRAMES + 1} frames; at most ${MAX_STICKER_FRAMES}`);
       expect(convert).not.toHaveBeenCalled();
       expect(sock.sendMessage).not.toHaveBeenCalled();
+      // Refused before anything reached WhatsApp, so a keyed send frees its Idempotency-Key.
+      expect(provesNothingSent(await send.catch((error: unknown) => error))).toBe(true);
     } finally {
       convert.mockRestore();
     }

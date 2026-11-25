@@ -81,7 +81,7 @@ describe('WebhookReconcilerService', () => {
       'message.received',
       'stored-key_wh-1',
       { from: '628123456789@c.us' },
-      { signal: expect.any(AbortSignal) as AbortSignal },
+      { signal: expect.any(AbortSignal) as AbortSignal, oneDirectAttempt: false },
     );
     // redeliver retires a delivered event's row itself; a second close here only repeats the write.
     expect(outbox.close).not.toHaveBeenCalled();
@@ -105,6 +105,68 @@ describe('WebhookReconcilerService', () => {
     // Left pending on purpose: the next sweep picks it up again until the budget runs out.
     expect(outbox.close).not.toHaveBeenCalled();
     expect(stats).toMatchObject({ replayed: 0, failed: 1 });
+  });
+
+  // Direct mode replays one row at a time with the full retry schedule. A receiver that never answers
+  // would cost that schedule per stranded row and hold every webhook queued behind it.
+  describe('a receiver that already failed in this pass', () => {
+    const replayedWith = (): Array<[string, boolean]> =>
+      delivery.redeliver.mock.calls.map(
+        ([wh, , , key, , options]: [
+          { id: string },
+          string,
+          string,
+          string,
+          unknown,
+          { oneDirectAttempt: boolean },
+        ]) => [`${wh.id}/${key}`, options.oneDirectAttempt],
+      );
+
+    beforeEach(() => {
+      webhooks.findOne.mockImplementation(({ where }: { where: { id: string } }) =>
+        Promise.resolve({ id: where.id, sessionId: 'sess-1', active: true, events: ['*'] }),
+      );
+      outbox.findStale.mockResolvedValue([
+        row({ id: 'r1', webhookId: 'wh-down', idempotencyKey: 'k1' }),
+        row({ id: 'r2', webhookId: 'wh-down', idempotencyKey: 'k2' }),
+        row({ id: 'r3', webhookId: 'wh-up', idempotencyKey: 'k3' }),
+        row({ id: 'r4', webhookId: 'wh-down', idempotencyKey: 'k4' }),
+      ]);
+    });
+
+    it('gets one attempt per further row, while other webhooks keep the full schedule', async () => {
+      delivery.redeliver.mockImplementation((wh: { id: string }) =>
+        Promise.resolve(wh.id === 'wh-down' ? 'failed' : 'delivered'),
+      );
+
+      const stats = await service.sweep(OPTS);
+
+      expect(replayedWith()).toEqual([
+        ['wh-down/k1', false],
+        ['wh-down/k2', true],
+        ['wh-up/k3', false],
+        ['wh-down/k4', true],
+      ]);
+      expect(stats).toMatchObject({ replayed: 1, failed: 3 });
+    });
+
+    it('is forgotten by the next sweep, which gives the receiver its full schedule again', async () => {
+      delivery.redeliver.mockResolvedValue('failed');
+      await service.sweep(OPTS);
+      delivery.redeliver.mockClear();
+
+      await service.sweep(OPTS);
+
+      expect(replayedWith()[0]).toEqual(['wh-down/k1', false]);
+    });
+
+    it('does not count an unexpected fault as the receiver being down', async () => {
+      delivery.redeliver.mockRejectedValue(new Error('boom'));
+
+      await service.sweep(OPTS);
+
+      expect(replayedWith().every(([, once]) => !once)).toBe(true);
+    });
   });
 
   it('leaves retirement of an enqueued replay to the worker', async () => {
@@ -234,17 +296,46 @@ describe('WebhookReconcilerService', () => {
   });
 
   it('moves its cursor past rows a page read could not return, instead of reading them again', async () => {
-    // A page made only of rows whose stored payload is unreadable returns nothing, but it was scanned.
-    outbox.findStale.mockImplementationOnce((_cutoff, _limit, _after, onScanned?: (lastId: string) => void) => {
-      onScanned?.('row-9');
-      return Promise.resolve([]);
-    });
+    // A page made only of rows whose stored payload is unreadable returns nothing, but it was scanned, and it filled
+    // its batch: more rows may lie behind it.
+    outbox.findStale.mockImplementationOnce(
+      (_cutoff, _limit, _after, onScanned?: (lastId: string, covered: number) => void) => {
+        onScanned?.('row-9', OPTS.batchSize);
+        return Promise.resolve([]);
+      },
+    );
 
     await service.sweep(OPTS);
     expect(outbox.findStale).toHaveBeenCalledTimes(1);
 
     await service.sweep(OPTS);
     expect((outbox.findStale.mock.calls as unknown[][])[1][2]).toBe('row-9');
+  });
+
+  it('starts the next pass at the oldest row when a page did not fill its batch', async () => {
+    outbox.findStale.mockImplementationOnce(
+      (_cutoff, _limit, _after, onScanned?: (lastId: string, covered: number) => void) => {
+        onScanned?.('row-3', 3); // three unreadable rows and the end of the stale rows
+        return Promise.resolve([]);
+      },
+    );
+
+    await service.sweep(OPTS);
+    await service.sweep(OPTS);
+
+    expect((outbox.findStale.mock.calls as unknown[][])[1][2]).toBeUndefined();
+  });
+
+  it('keeps its cursor behind a page of readable rows that filled the batch, and drops it behind one that did not', async () => {
+    const page = (size: number) => Array.from({ length: size }, (_, index) => row({ id: `row-${index}` }));
+    outbox.findStale.mockResolvedValueOnce(page(OPTS.batchSize)).mockResolvedValueOnce(page(OPTS.batchSize - 1));
+
+    await service.sweep(OPTS);
+    await service.sweep(OPTS);
+    await service.sweep(OPTS);
+
+    const afters = (outbox.findStale.mock.calls as unknown[][]).map(call => call[2]);
+    expect(afters).toEqual([undefined, `row-${OPTS.batchSize - 1}`, undefined]);
   });
 
   it('never stacks a second pass on top of a slow one', async () => {
@@ -357,5 +448,91 @@ describe('WebhookReconcilerService', () => {
       if (prev === undefined) delete process.env.WEBHOOK_RECONCILE_INTERVAL_MS;
       else process.env.WEBHOOK_RECONCILE_INTERVAL_MS = prev;
     }
+  });
+
+  it('closes a queued outbox row when a terminal WebhookDeliveryFailure (attempts > 0) already exists instead of re-enqueuing', async () => {
+    const failureRepo = {
+      findOne: jest.fn().mockResolvedValue({ id: 'fail-1' }),
+    };
+    const webhooks = {
+      findOne: jest.fn().mockResolvedValue({
+        id: 'wh-1',
+        sessionId: 'sess-1',
+        active: true,
+        events: ['message.received'],
+        url: 'https://example.com/hook',
+      }),
+    };
+    const outbox = {
+      findStale: jest
+        .fn()
+        .mockResolvedValue([row({ state: 'queued', deliveryId: 'dlv-failed-1', attempts: 0 } as never)]),
+      close: jest.fn().mockResolvedValue(undefined),
+      countAttempt: jest.fn().mockResolvedValue(true),
+    };
+    const delivery = {
+      isQueueJobPending: jest.fn().mockResolvedValue(false),
+      hasQueueJobCompleted: jest.fn().mockResolvedValue(false),
+      isLocallyPending: jest.fn().mockReturnValue(false),
+      redeliver: jest.fn().mockResolvedValue(undefined),
+      recordReplayExhaustion: jest.fn().mockResolvedValue(true),
+    };
+    const svc = new WebhookReconcilerService(
+      webhooks as never,
+      outbox as never,
+      delivery as never,
+      new ConfigService(),
+      failureRepo as never,
+    );
+
+    const stats = await svc.sweep(OPTS);
+
+    expect(outbox.close).toHaveBeenCalledWith('wh-1', 'stored-key_wh-1', 'failed');
+    expect(outbox.countAttempt).not.toHaveBeenCalled();
+    expect(delivery.redeliver).not.toHaveBeenCalled();
+    expect(stats.replayed).toBe(0);
+    expect(stats.skipped).toBe(1);
+  });
+
+  it('preserves crash-recovery re-enqueue for a queued outbox row when no terminal WebhookDeliveryFailure exists', async () => {
+    const failureRepo = {
+      findOne: jest.fn().mockResolvedValue(null),
+    };
+    const webhooks = {
+      findOne: jest.fn().mockResolvedValue({
+        id: 'wh-1',
+        sessionId: 'sess-1',
+        active: true,
+        events: ['message.received'],
+        url: 'https://example.com/hook',
+      }),
+    };
+    const outbox = {
+      findStale: jest
+        .fn()
+        .mockResolvedValue([row({ state: 'queued', deliveryId: 'dlv-crashed-1', attempts: 0 } as never)]),
+      close: jest.fn().mockResolvedValue(undefined),
+      countAttempt: jest.fn().mockResolvedValue(true),
+    };
+    const delivery = {
+      isQueueJobPending: jest.fn().mockResolvedValue(false),
+      hasQueueJobCompleted: jest.fn().mockResolvedValue(false),
+      isLocallyPending: jest.fn().mockReturnValue(false),
+      redeliver: jest.fn().mockResolvedValue(undefined),
+      recordReplayExhaustion: jest.fn().mockResolvedValue(true),
+    };
+    const svc = new WebhookReconcilerService(
+      webhooks as never,
+      outbox as never,
+      delivery as never,
+      new ConfigService(),
+      failureRepo as never,
+    );
+
+    const stats = await svc.sweep(OPTS);
+
+    expect(outbox.close).not.toHaveBeenCalled();
+    expect(delivery.redeliver).toHaveBeenCalledTimes(1);
+    expect(stats.replayed).toBe(1);
   });
 });

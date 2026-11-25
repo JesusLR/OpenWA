@@ -1,5 +1,7 @@
+import * as http from 'http';
+import type { AddressInfo } from 'net';
 import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
-import type { withSafeFetch } from '../../common/security/ssrf-guard';
+import { withSafeFetch } from '../../common/security/ssrf-guard';
 
 /** A stand-in for withSafeFetch that hands `use` a canned Response and records the init it was given. */
 function fakeSafeFetch(response: Response, sink: { init?: RequestInit }): typeof withSafeFetch {
@@ -88,6 +90,14 @@ describe('performPluginFetch', () => {
     expect(sink.init?.signal).toBeInstanceOf(AbortSignal);
   });
 
+  it.each([1.5, 0.4, 2500.9])('accepts a fractional timeoutMs of %s', async timeoutMs => {
+    // AbortSignal.timeout throws ERR_OUT_OF_RANGE for a non-integer, which failed the plugin's request.
+    const fetcher = fakeSafeFetch(cannedResponse('{}', {}), {});
+    await expect(
+      performPluginFetch('https://api.example.com/t', { timeoutMs }, { fetch: fetcher }),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
   it('rejects a response whose declared content-length exceeds the cap', async () => {
     const sink: { init?: RequestInit } = {};
     const big = String(11 * 1024 * 1024);
@@ -133,6 +143,42 @@ describe('performPluginFetch', () => {
       });
     }
     expect(sink.init?.method).toBe('GET');
+  });
+
+  it('aborts a live local HTTP request when the external AbortSignal aborts', async () => {
+    let requestReceived!: () => void;
+    let serverClosed!: () => void;
+    const onRequestReceived = new Promise<void>(resolve => (requestReceived = resolve));
+    const onServerClosed = new Promise<void>(resolve => (serverClosed = resolve));
+
+    const server = http.createServer(req => {
+      requestReceived();
+      req.on('close', () => serverClosed());
+      // Intentionally hang without writing headers so only abort terminates the request.
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const controller = new AbortController();
+
+    try {
+      const fetchPromise = performPluginFetch(
+        `http://127.0.0.1:${port}/hang`,
+        { timeoutMs: 30_000 },
+        {
+          fetch: (url, init, use) => withSafeFetch(url, init, use, { guard: false }),
+          signal: controller.signal,
+        },
+      );
+
+      await onRequestReceived;
+      controller.abort(new Error('capability timed out'));
+
+      await expect(fetchPromise).rejects.toThrow();
+      await onServerClosed;
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 });
 

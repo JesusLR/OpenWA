@@ -35,6 +35,15 @@ describe('PluginStorageService sandboxed per-plugin storage containment', () => 
     }
   };
 
+  // A temp name built by appending to the key's file name ran past the 255-byte name limit first, so a key near the
+  // limit failed, and one a little shorter started failing once the process-wide write counter grew a digit.
+  it('writes and rewrites a key whose file name is at the 255-byte limit', async () => {
+    const key = 'k'.repeat(184); // key- + 246 base64url characters + .json
+    await storage.set(key, { v: 1 });
+    await storage.set(key, { v: 2 });
+    expect(await storage.get(key)).toEqual({ v: 2 });
+  });
+
   it('round-trips a normal key', async () => {
     await storage.set('state', { a: 1 });
     expect(await storage.get('state')).toEqual({ a: 1 });
@@ -105,6 +114,27 @@ describe('PluginStorageService sandboxed per-plugin storage containment', () => 
     expect(jsonFiles).toHaveLength(2);
   });
 
+  it("does not let a key spelled like another key's encoded filename read or delete that key", async () => {
+    // 'foo' is stored as key-Zm9v.json. The literal key 'key-Zm9v' has its own encoded file; its legacy
+    // fallback (<key>.json) is that same path, which belongs to 'foo'.
+    await storage.set('foo', { kept: true });
+
+    expect(await storage.get('key-Zm9v')).toBeNull();
+    await storage.delete('key-Zm9v');
+
+    expect(await storage.get('foo')).toEqual({ kept: true });
+    expect(await storage.list()).toEqual(['foo']);
+  });
+
+  it('does not list a canonical encoded filename whose key get and set would refuse', async () => {
+    const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
+    await storage.set('real', { ok: true });
+    const encoded = (key: string): string => `key-${Buffer.from(key).toString('base64url')}.json`;
+    for (const key of ['', '../escape']) fs.writeFileSync(path.join(pluginDataDir, encoded(key)), '{}');
+
+    expect(await storage.list()).toEqual(['real']);
+  });
+
   it('deletes a legacy plain-key file', async () => {
     const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
     fs.writeFileSync(path.join(pluginDataDir, 'legacy.json'), JSON.stringify({ old: true }));
@@ -129,6 +159,83 @@ describe('PluginStorageService sandboxed per-plugin storage containment', () => 
 
     expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8'))).toEqual({ id: pluginId });
     expect(JSON.parse(fs.readFileSync(packagePath, 'utf8'))).toEqual({ name: pluginId });
+  });
+
+  // The legacy file is the key plus ".json" resolved as a path, so the guard asks whether that path names the package
+  // file itself and not how the key is spelled. "./manifest" always does. A case-insensitive filesystem also reaches it
+  // as "Manifest", and APFS as a spelling with a long s (U+017F) or, for package.json, a Kelvin sign (U+212A); on a
+  // case-sensitive one those are files of their own, and legacy keys that read and delete as before. The test asks the
+  // filesystem which it is, so each run covers the branch its filesystem takes.
+  it.each([
+    ['manifest', './manifest'],
+    ['manifest', './/manifest'],
+    ['manifest', 'Manifest'],
+    ['manifest', 'MANIFEST'],
+    ['manifest', 'manife\u017Ft'],
+    ['package', './package'],
+    ['package', './/package'],
+    ['package', 'Package'],
+    ['package', 'pac\u212Aage'],
+  ])('keeps %s.json out of reach of the key %p where the key names that file', async (name, key) => {
+    const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
+    const own = path.join(pluginDataDir, `${name}.json`);
+    fs.writeFileSync(own, JSON.stringify({ code: name }));
+    const target = path.join(pluginDataDir, `${key}.json`);
+    const sameName = fs.existsSync(target) && fs.statSync(target).ino === fs.statSync(own).ino;
+
+    if (sameName) {
+      // The key reaches the package file: it is never a legacy key.
+      expect(await storage.get(key)).toBeNull();
+      await storage.delete(key);
+      expect(JSON.parse(fs.readFileSync(own, 'utf8'))).toEqual({ code: name });
+      // It is still an ordinary storage key: it stores and reads back through its encoded file.
+      await storage.set(key, { state: true });
+      expect(await storage.get(key)).toEqual({ state: true });
+      expect(JSON.parse(fs.readFileSync(own, 'utf8'))).toEqual({ code: name });
+    } else {
+      // A file of its own: a legacy key, read and deleted as before, and the package file is not touched.
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, JSON.stringify({ old: key }));
+      expect(await storage.get(key)).toEqual({ old: key });
+      await storage.delete(key);
+      expect(fs.existsSync(target)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(own, 'utf8'))).toEqual({ code: name });
+    }
+  });
+
+  // A filesystem may report no file id (a zero, as some network and FUSE mounts do), which leaves nothing to compare:
+  // the keys that name the package files exactly are still never legacy keys.
+  it('keeps manifest.json and package.json out of reach of their exact names on a filesystem that reports no file id', async () => {
+    const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
+    const own = {
+      manifest: path.join(pluginDataDir, 'manifest.json'),
+      package: path.join(pluginDataDir, 'package.json'),
+    };
+    fs.writeFileSync(own.manifest, JSON.stringify({ id: pluginId }));
+    fs.writeFileSync(own.package, JSON.stringify({ name: pluginId }));
+    const real = fs.statSync;
+    jest.spyOn(fs, 'statSync').mockImplementation((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const stat = real(target, options) as unknown as fs.BigIntStats;
+      return options && 'bigint' in options && options.bigint ? Object.assign(stat, { ino: 0n }) : stat;
+    });
+
+    for (const key of ['manifest', 'package', './manifest', './/package']) {
+      expect(await storage.get(key)).toBeNull();
+      await storage.delete(key);
+    }
+
+    expect(JSON.parse(fs.readFileSync(own.manifest, 'utf8'))).toEqual({ id: pluginId });
+    expect(JSON.parse(fs.readFileSync(own.package, 'utf8'))).toEqual({ name: pluginId });
+  });
+
+  it('still reads and deletes a legacy key that only resembles a package file', async () => {
+    const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
+    for (const key of ['manifests', 'manifest-old', 'package-lock']) {
+      fs.writeFileSync(path.join(pluginDataDir, `${key}.json`), JSON.stringify({ old: key }));
+      expect(await storage.get(key)).toEqual({ old: key });
+      await storage.delete(key);
+      expect(fs.existsSync(path.join(pluginDataDir, `${key}.json`))).toBe(false);
+    }
   });
 
   it('lists no package file as a key when storage shares the package directory', async () => {
@@ -215,6 +322,18 @@ describe('PluginStorageService.deletePluginData (uninstall storage cleanup)', ()
     expect(() => service.deletePluginData('never-stored')).not.toThrow();
   });
 
+  it('throws when the storage dir cannot be removed, so the caller does not report it gone', async () => {
+    await service.createPluginStorage('stuck-plg').set('token', { secret: 'abc' });
+    const rm = jest.spyOn(fs, 'rmSync').mockImplementationOnce(() => {
+      throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' });
+    });
+
+    expect(() => service.deletePluginData('stuck-plg')).toThrow('EBUSY');
+
+    rm.mockRestore();
+    expect(fs.existsSync(path.join(dataDir, 'plugins', 'stuck-plg'))).toBe(true);
+  });
+
   it('refuses a traversal id that resolves outside the storage root', () => {
     // A real directory the escaping id would resolve to — it must survive the call.
     const outside = path.join(dataDir, 'not-plugin-storage');
@@ -282,6 +401,99 @@ describe('PluginStorageService per-plugin storage quota', () => {
     await expect(storage.set('big', 'x'.repeat(50 * 1024 * 1024 - 1))).rejects.toThrow(
       /storage quota exceeded.*max 52428800\)/,
     );
+  });
+
+  describe('running total', () => {
+    const pluginDir = (id = 'quota-plugin'): string => path.join(dataDir, 'plugins', id);
+
+    it('reads the directory once, not on every write', async () => {
+      const storage = makeStorage(10 * 1024 * 1024);
+      const readdir = jest.spyOn(fs, 'readdirSync');
+      try {
+        for (let i = 0; i < 50; i++) await storage.set(`key-${i}`, 'x'.repeat(100));
+        expect(readdir.mock.calls.filter(([dir]) => String(dir) === pluginDir())).toHaveLength(1);
+      } finally {
+        readdir.mockRestore();
+      }
+    });
+
+    it('frees a deleted key and counts a replaced key at its new size', async () => {
+      const storage = makeStorage(1024);
+      await storage.set('a', 'x'.repeat(500)); // 502 bytes
+      await storage.set('b', 'y'.repeat(400)); // 402 bytes
+      await expect(storage.set('c', 'z'.repeat(300))).rejects.toThrow(/storage quota exceeded/);
+
+      await storage.delete('a');
+      await expect(storage.set('c', 'z'.repeat(300))).resolves.toBeUndefined(); // 402 + 302
+
+      await storage.set('b', 'y'.repeat(10)); // 402 -> 12 bytes
+      await expect(storage.set('d', 'w'.repeat(600))).resolves.toBeUndefined(); // 302 + 12 + 602
+      await expect(storage.set('e', 'v'.repeat(300))).rejects.toThrow(/storage quota exceeded/);
+    });
+
+    it('recounts from the directory before refusing, so files removed behind its back do not block writes', async () => {
+      const storage = makeStorage(1024);
+      await storage.set('a', 'x'.repeat(900)); // 902 bytes
+
+      for (const file of fs.readdirSync(pluginDir())) fs.unlinkSync(path.join(pluginDir(), file));
+
+      await expect(storage.set('b', 'y'.repeat(900))).resolves.toBeUndefined();
+      // The recount did not forget the new key: a third write that cannot fit is still refused.
+      await expect(storage.set('c', 'z'.repeat(300))).rejects.toThrow(/storage quota exceeded/);
+    });
+
+    it('starts again from zero once the plugin data is deleted', async () => {
+      const configService = {
+        get: (k: string) => (k === 'dataDir' ? dataDir : k === 'plugins.storageMaxBytes' ? 1024 : undefined),
+      } as unknown as ConfigService;
+      const service = new PluginStorageService(configService);
+      const first = service.createPluginStorage('reinstalled');
+      await first.set('state', 'x'.repeat(900));
+
+      service.deletePluginData('reinstalled');
+      const second = service.createPluginStorage('reinstalled');
+
+      await expect(second.set('state', 'y'.repeat(900))).resolves.toBeUndefined();
+    });
+
+    // The recount before a refusal puts a stale total right, so a write that ends up accepted cannot tell
+    // one from a correct total. What a stale total costs is a directory read on the main thread.
+    it('takes a deleted key out of the total, so a write that then fits does not read the directory', async () => {
+      const storage = makeStorage(1024);
+      await storage.set('a', 'x'.repeat(500)); // 502 bytes
+      await storage.set('b', 'y'.repeat(400)); // 402 bytes
+      await storage.delete('a');
+
+      const readdir = jest.spyOn(fs, 'readdirSync');
+      try {
+        // 402 + 302 fits the quota only once the 502 bytes of 'a' are out of the total.
+        await storage.set('c', 'z'.repeat(300));
+        expect(readdir.mock.calls.filter(([dir]) => String(dir) === pluginDir())).toHaveLength(0);
+      } finally {
+        readdir.mockRestore();
+      }
+    });
+
+    it('seeds the total again, once, after the plugin data is deleted', async () => {
+      const configService = {
+        get: (k: string) => (k === 'dataDir' ? dataDir : k === 'plugins.storageMaxBytes' ? 1024 : undefined),
+      } as unknown as ConfigService;
+      const service = new PluginStorageService(configService);
+      await service.createPluginStorage('reinstalled').set('state', 'x'.repeat(100));
+
+      service.deletePluginData('reinstalled');
+      const second = service.createPluginStorage('reinstalled');
+
+      const readdir = jest.spyOn(fs, 'readdirSync');
+      try {
+        // Small writes, so a total carried over from before the delete would still look right.
+        await second.set('a', 'y'.repeat(100));
+        await second.set('b', 'z'.repeat(100));
+        expect(readdir.mock.calls.filter(([dir]) => String(dir) === pluginDir('reinstalled'))).toHaveLength(1);
+      } finally {
+        readdir.mockRestore();
+      }
+    });
   });
 });
 

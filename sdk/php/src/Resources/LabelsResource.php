@@ -21,16 +21,24 @@ class LabelsResource
         $this->http = $http;
     }
 
-    /** @return array<int,array<string,mixed>> */
+    /**
+     * List all labels available in the business account. whatsapp-web.js only; Baileys answers 501.
+     *
+     * @return array<int,array<string,mixed>>
+     */
     public function list(string $sessionId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels") ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels") ?? [];
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Get a single label by id. whatsapp-web.js only; Baileys answers 501.
+     *
+     * @return array<string,mixed>
+     */
     public function get(string $sessionId, string $labelId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}");
+        return $this->http->requestArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}");
     }
 
     /**
@@ -41,7 +49,7 @@ class LabelsResource
      */
     public function chats(string $sessionId, string $labelId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}/chats") ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}/chats") ?? [];
     }
 
     /**
@@ -57,7 +65,7 @@ class LabelsResource
      */
     public function upsert(string $sessionId, string $labelId, array $body): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}", [], $body);
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}", [], $body);
     }
 
     /**
@@ -67,13 +75,17 @@ class LabelsResource
      */
     public function delete(string $sessionId, string $labelId): array
     {
-        return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}");
+        return $this->http->requestArray('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/{$this->http->encodeSegment($labelId)}");
     }
 
-    /** @return array<int,array<string,mixed>> */
+    /**
+     * Get the labels currently applied to a chat. whatsapp-web.js only; Baileys answers 501.
+     *
+     * @return array<int,array<string,mixed>>
+     */
     public function forChat(string $sessionId, string $chatId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/chat/{$this->http->encodeSegment($chatId)}") ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/chat/{$this->http->encodeSegment($chatId)}") ?? [];
     }
 
     /**
@@ -84,12 +96,12 @@ class LabelsResource
      */
     public function addToChat(string $sessionId, string $chatId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/chat/{$this->http->encodeSegment($chatId)}", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/chat/{$this->http->encodeSegment($chatId)}", [], $body);
     }
 
     /** Remove a label from a chat. Requires an OPERATOR-level key. */
     public function removeFromChat(string $sessionId, string $chatId, string $labelId): array
     {
-        return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/chat/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($labelId)}");
+        return $this->http->requestArray('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/labels/chat/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($labelId)}");
     }
 }

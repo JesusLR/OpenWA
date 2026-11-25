@@ -1,9 +1,20 @@
-import { Repository } from 'typeorm';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { ConfigService } from '@nestjs/config';
+import { ModuleRef } from '@nestjs/core';
+import { DataSource, Repository } from 'typeorm';
 import { ScopeBindingService } from './scope-binding.service';
 import { PluginInstanceService } from './plugin-instance.service';
+import { PluginInstance } from './entities/plugin-instance.entity';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
+import { PluginStorageService } from '../../core/plugins/plugin-storage.service';
+import { PLUGIN_INSTANCE_PORT } from '../../core/plugins/plugin-host-ports';
+import { HookManager } from '../../core/hooks';
+import { PluginsService } from '../plugins/plugins.service';
 import { AuditService } from '../audit/audit.service';
-import { Session } from '../session/entities/session.entity';
+import { Session, SessionStatus } from '../session/entities/session.entity';
+import type { PluginWorkerHost } from '../../core/plugins/sandbox/plugin-worker-host';
 
 // The boot-time reconciler re-derives each ENABLED instance's runtime scope binding from the persisted
 // plugin_instances rows, so a binding lost at provisioning time (plugin momentarily unloaded) is
@@ -558,5 +569,533 @@ describe('ScopeBindingService.resyncAfterImport', () => {
     );
 
     await expect(service.resyncAfterImport([])).rejects.toThrow('db down');
+  });
+});
+
+/**
+ * A wildcard instance is projected into the plugin's BASE config, and that write merges, so it cannot
+ * delete a key. A secret the instance no longer defines (the operator revoked it) stayed in the base
+ * config, in registry.json and in every hook and ingress delivery's config, while the instance row and
+ * its GET already showed it gone.
+ */
+describe('ScopeBindingService.applyScopeBinding retracts a secret an instance no longer defines', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      apiToken: { type: 'string', secret: true },
+      baseUrl: { type: 'string' },
+      replyDelayMs: { type: 'number' },
+      crm: { type: 'object', properties: { key: { type: 'string', secret: true }, url: { type: 'string' } } },
+    },
+  };
+
+  // What the earlier projection of the instance left in the plugin's base config.
+  const projected = {
+    apiToken: 'LEAKED',
+    baseUrl: 'https://crm',
+    replyDelayMs: 5,
+    crm: { key: 'K', url: 'https://x' },
+  };
+
+  function build(baseConfig: Record<string, unknown> = projected) {
+    const updatePluginConfig = jest.fn();
+    const setPluginSessionConfig = jest.fn();
+    const setPluginSessions = jest.fn();
+    const loader = {
+      getPlugin: jest.fn().mockReturnValue({
+        manifest: { id: 'chatwoot', configSchema: schema },
+        activeSessions: ['*'],
+        config: baseConfig,
+      }),
+      setPluginSessionConfig,
+      setPluginSessions,
+      updatePluginConfig,
+    } as unknown as PluginLoaderService;
+    const audit = { logInfo: jest.fn(), logWarn: jest.fn() } as unknown as AuditService;
+    const sessions = { findOne: jest.fn().mockResolvedValue({ id: 'sess-1' }) } as unknown as Repository<Session>;
+    const list = jest.fn().mockResolvedValue([]);
+    const svc = new ScopeBindingService({ list } as unknown as PluginInstanceService, loader, audit, sessions);
+    return { svc, list, updatePluginConfig, setPluginSessionConfig, setPluginSessions };
+  }
+
+  const sibling = (
+    instanceId: string,
+    config: Record<string, unknown>,
+    enabled = true,
+    sessionScope: string | null = null,
+  ) => ({
+    pluginId: 'chatwoot',
+    instanceId,
+    sessionScope,
+    config,
+    enabled,
+  });
+
+  it('writes null for the removed secret together with the rest of the instance config', async () => {
+    const { svc, updatePluginConfig } = build();
+
+    await svc.applyScopeBinding('chatwoot', null, { baseUrl: 'https://crm' }, true, {
+      previousConfig: { apiToken: 'LEAKED', baseUrl: 'https://crm' },
+    });
+
+    expect(updatePluginConfig).toHaveBeenCalledTimes(1);
+    expect(updatePluginConfig).toHaveBeenCalledWith('chatwoot', { baseUrl: 'https://crm', apiToken: null });
+  });
+
+  it('retracts a secret nested under a key the instance dropped, and leaves a plain key alone', async () => {
+    const { svc, updatePluginConfig } = build();
+
+    await svc.applyScopeBinding('chatwoot', '*', { baseUrl: 'https://crm' }, true, {
+      previousConfig: { baseUrl: 'https://crm', replyDelayMs: 5, crm: { key: 'K', url: 'https://x' } },
+    });
+
+    expect(updatePluginConfig).toHaveBeenCalledWith('chatwoot', { baseUrl: 'https://crm', crm: null });
+  });
+
+  it('hands the base the value another enabled wildcard instance still defines, not the removed one', async () => {
+    const { svc, list, updatePluginConfig } = build();
+    list.mockResolvedValue([
+      sibling('a', { baseUrl: 'https://crm' }),
+      sibling('b', { apiToken: 'B-OLD' }),
+      sibling('c', { apiToken: 'C-TOKEN' }),
+      sibling('d', { apiToken: 'D-DISABLED' }, false),
+      sibling('e', { apiToken: 'E-CONCRETE' }, true, 'sess-1'),
+    ]);
+
+    await svc.applyScopeBinding('chatwoot', null, { baseUrl: 'https://crm' }, true, {
+      previousConfig: { apiToken: 'LEAKED', baseUrl: 'https://crm' },
+    });
+
+    // The last wildcard instance by id wins, as it does when boot reconciliation replays them.
+    expect(updatePluginConfig).toHaveBeenCalledWith('chatwoot', { baseUrl: 'https://crm', apiToken: 'C-TOKEN' });
+  });
+
+  // instances.list() is a find() with no ORDER BY, so SQLite and PostgreSQL return the rows in different orders.
+  // Boot reconciliation replays the wildcard instances by id, so the base ends up with the value of the last
+  // one; the value handed back has to be the same whichever order the database lists them in.
+  it.each([
+    ['c', 'a', 'b'],
+    ['b', 'c', 'a'],
+    ['a', 'b', 'c'],
+  ])('hands back the value of the greatest instance id when the siblings are listed as %s, %s, %s', async (...ids) => {
+    const { svc, list, updatePluginConfig } = build();
+    list.mockResolvedValue(ids.map(id => sibling(id, { apiToken: `${id}-token` })));
+
+    await svc.applyScopeBinding('chatwoot', null, {}, false, { previousConfig: { apiToken: 'LEAKED' } });
+
+    expect(updatePluginConfig).toHaveBeenCalledWith('chatwoot', { apiToken: 'c-token' });
+  });
+
+  // A secret that was never set is nothing to take back: an empty or null value is not a credential the plugin
+  // holds, and writing null over the base's own empty value would be a change nobody asked for.
+  it.each([
+    ['an empty string', ''],
+    ['null', null],
+  ])('takes nothing back for a previous secret that was %s', async (_label, held) => {
+    const { svc, list, updatePluginConfig } = build({ ...projected, apiToken: held });
+
+    await svc.applyScopeBinding('chatwoot', null, {}, false, { previousConfig: { apiToken: held } });
+
+    expect(updatePluginConfig).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledTimes(1); // only the '*' retirement check reads the siblings
+  });
+
+  it('retracts every secret the instance held when it is torn down, and ends the "*" activation as before', async () => {
+    const { svc, updatePluginConfig, setPluginSessions } = build();
+
+    await svc.applyScopeBinding('chatwoot', null, {}, false, {
+      previousConfig: { apiToken: 'LEAKED', baseUrl: 'https://crm', crm: { key: 'K', url: 'https://x' } },
+    });
+
+    expect(updatePluginConfig).toHaveBeenCalledTimes(1);
+    expect(updatePluginConfig).toHaveBeenCalledWith('chatwoot', { apiToken: null, crm: null });
+    expect(setPluginSessions).toHaveBeenCalledWith('chatwoot', []);
+  });
+
+  it('hands the base the value another enabled wildcard instance still defines when it is torn down', async () => {
+    const { svc, list, updatePluginConfig } = build();
+    list.mockResolvedValue([sibling('b', { apiToken: 'B-TOKEN' }), sibling('c', { baseUrl: 'https://c' })]);
+
+    await svc.applyScopeBinding('chatwoot', '*', {}, false, { previousConfig: { apiToken: 'LEAKED' } });
+
+    expect(updatePluginConfig).toHaveBeenCalledWith('chatwoot', { apiToken: 'B-TOKEN' });
+  });
+
+  it('leaves the base config alone on a teardown that holds no secret, or that is given no previous config', async () => {
+    const { svc, list, updatePluginConfig } = build();
+
+    await svc.applyScopeBinding('chatwoot', null, {}, false, { previousConfig: { baseUrl: 'https://crm' } });
+    await svc.applyScopeBinding('chatwoot', null, {}, false, { previousConfig: null });
+    await svc.applyScopeBinding('chatwoot', null, {}, false);
+
+    expect(updatePluginConfig).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledTimes(3); // only the '*' retirement check reads the siblings
+  });
+
+  // The base config is shared. A value the operator has set on the plugin since, or one a sibling projected
+  // after this instance, is not this instance's to take back.
+  it('leaves a base value that is no longer the one the instance put there', async () => {
+    const operator = build({ ...projected, apiToken: 'OPERATOR' });
+
+    await operator.svc.applyScopeBinding('chatwoot', null, {}, false, { previousConfig: { apiToken: 'LEAKED' } });
+    expect(operator.updatePluginConfig).not.toHaveBeenCalled();
+    expect(operator.list).toHaveBeenCalledTimes(1); // only the '*' retirement check reads the siblings
+
+    const partial = build({ ...projected, crm: { key: 'OTHER', url: 'https://x' } });
+    await partial.svc.applyScopeBinding('chatwoot', null, { baseUrl: 'https://crm' }, true, {
+      previousConfig: projected,
+    });
+    expect(partial.updatePluginConfig).toHaveBeenCalledWith('chatwoot', { apiToken: null, baseUrl: 'https://crm' });
+  });
+
+  it('only looks at siblings when a secret was removed', async () => {
+    const { svc, list, updatePluginConfig } = build();
+
+    await svc.applyScopeBinding('chatwoot', null, { apiToken: 'NEW' }, true, {
+      previousConfig: { apiToken: 'OLD' },
+    });
+    await svc.applyScopeBinding('chatwoot', null, { baseUrl: 'https://crm' }, true);
+
+    expect(list).not.toHaveBeenCalled();
+    expect(updatePluginConfig).toHaveBeenNthCalledWith(1, 'chatwoot', { apiToken: 'NEW' });
+    expect(updatePluginConfig).toHaveBeenNthCalledWith(2, 'chatwoot', { baseUrl: 'https://crm' });
+  });
+
+  it('never touches the base config for a concrete scope, whose slice is replaced whole', async () => {
+    const { svc, updatePluginConfig, setPluginSessionConfig } = build();
+
+    await svc.applyScopeBinding('chatwoot', 'sess-1', { baseUrl: 'https://crm' }, true, {
+      previousConfig: { apiToken: 'LEAKED', baseUrl: 'https://crm' },
+    });
+
+    expect(updatePluginConfig).not.toHaveBeenCalled();
+    expect(setPluginSessionConfig).toHaveBeenCalledWith('chatwoot', 'sess-1', { baseUrl: 'https://crm' });
+  });
+});
+
+describe('Base host redirect sanitizes persisted plugin_instances rows across ingress dispatch and restart', () => {
+  const PLUGIN_ID = 'crm-adapter';
+  const manifestJson = {
+    id: PLUGIN_ID,
+    name: 'CRM Adapter',
+    version: '1.0.0',
+    type: 'extension',
+    main: 'index.js',
+    permissions: ['webhook:ingress', 'net:fetch'],
+    ingress: [{ route: 'events', signature: { scheme: 'hmac-sha256', header: 'x-signature' } }],
+    net: { allowConfigHosts: ['baseUrl'] },
+    configSchema: {
+      type: 'object',
+      properties: {
+        baseUrl: { type: 'string' },
+        apiKey: { type: 'string', secret: true },
+        label: { type: 'string' },
+      },
+    },
+  };
+
+  async function buildStack() {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-inst-redirect-'));
+    const pluginDir = path.join(tmpDir, 'plugins', PLUGIN_ID);
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'manifest.json'), JSON.stringify(manifestJson));
+    fs.writeFileSync(path.join(pluginDir, 'index.js'), 'module.exports = {};');
+
+    const ds = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [PluginInstance, Session],
+      synchronize: true,
+    });
+    await ds.initialize();
+    const sessionsRepo = ds.getRepository(Session);
+    for (const sid of ['sess-A', 'sess-B']) {
+      await sessionsRepo.save(
+        sessionsRepo.create({ id: sid, name: sid, status: SessionStatus.DISCONNECTED, config: {} }),
+      );
+    }
+
+    const instances = new PluginInstanceService(ds.getRepository(PluginInstance));
+    const audit = { logInfo: jest.fn(), logWarn: jest.fn() } as unknown as AuditService;
+    const configService = new ConfigService({
+      dataDir: tmpDir,
+      plugins: { directory: path.join(tmpDir, 'plugins') },
+    });
+    const moduleRef = {
+      get: jest.fn((token: unknown) => {
+        if (token === PLUGIN_INSTANCE_PORT) return instances;
+        throw new Error(`Unexpected token: ${String(token)}`);
+      }),
+    } as unknown as ModuleRef;
+
+    const bootLoader = () => {
+      const storage = new PluginStorageService(configService);
+      const loader = new PluginLoaderService(configService, new HookManager(), storage, moduleRef);
+      loader.loadPlugin(pluginDir);
+      const pluginsService = new PluginsService(loader, configService);
+      const scopeBinding = new ScopeBindingService(instances, loader, audit, sessionsRepo);
+      const webhookCalls: Array<{ instanceId: string; config?: Record<string, unknown> }> = [];
+      (loader as unknown as { sandboxHosts: Map<string, PluginWorkerHost> }).sandboxHosts.set(PLUGIN_ID, {
+        dispatchWebhook: (payload: { instanceId: string; config?: Record<string, unknown> }) => {
+          webhookCalls.push({ instanceId: payload.instanceId, config: payload.config });
+          return Promise.resolve({ ok: true, status: 200 });
+        },
+        sendConfigChange: jest.fn(),
+      } as unknown as PluginWorkerHost);
+      return { storage, loader, pluginsService, scopeBinding, webhookCalls };
+    };
+
+    const cleanup = async () => {
+      if (ds.isInitialized) await ds.destroy();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    };
+
+    return { instances, ds, bootLoader, cleanup };
+  }
+
+  it('strips inherited secrets from concrete and wildcard instances on base config redirect, blocks ingress leakage, and prevents resurrection on restart reconcile', async () => {
+    const { instances, bootLoader, cleanup } = await buildStack();
+    try {
+      const first = bootLoader();
+      expect(
+        (
+          await first.pluginsService.updateConfig(PLUGIN_ID, {
+            baseUrl: 'https://good.example',
+            apiKey: 'BASE-SECRET',
+          })
+        ).success,
+      ).toBe(true);
+
+      const instConcrete = await instances.create(PLUGIN_ID, 'inst-1', {
+        sessionScope: 'sess-A',
+        config: { apiKey: 'INST-SECRET', label: 'A' },
+      });
+      const instWild = await instances.create(PLUGIN_ID, 'inst-wild', {
+        config: { apiKey: 'WILD-SECRET', label: 'W' },
+      });
+      const instOwn = await instances.create(PLUGIN_ID, 'inst-own', {
+        sessionScope: 'sess-B',
+        config: { baseUrl: 'https://own.example', apiKey: 'OWN-SECRET', label: 'B' },
+      });
+
+      await first.scopeBinding.applyScopeBinding(PLUGIN_ID, instConcrete.sessionScope, instConcrete.config!, true);
+      await first.scopeBinding.applyScopeBinding(PLUGIN_ID, instOwn.sessionScope, instOwn.config!, true);
+      await first.scopeBinding.applyScopeBinding(PLUGIN_ID, instWild.sessionScope, instWild.config!, true);
+
+      // Redirect the base host away from good.example.
+      expect(
+        (await first.pluginsService.updateConfig(PLUGIN_ID, { baseUrl: 'https://attacker.example' })).success,
+      ).toBe(true);
+
+      // Immediate next ingress dispatches must never carry INST-SECRET or WILD-SECRET to attacker.example.
+      await first.loader.dispatchWebhookForInstance({
+        pluginId: PLUGIN_ID,
+        instanceId: 'inst-1',
+        route: 'events',
+        deliveryId: 'd-1',
+        sessionId: 'sess-A',
+        payload: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+      });
+      await first.loader.dispatchWebhookForInstance({
+        pluginId: PLUGIN_ID,
+        instanceId: 'inst-wild',
+        route: 'events',
+        deliveryId: 'd-wild',
+        payload: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+      });
+      await first.loader.dispatchWebhookForInstance({
+        pluginId: PLUGIN_ID,
+        instanceId: 'inst-own',
+        route: 'events',
+        deliveryId: 'd-own',
+        sessionId: 'sess-B',
+        payload: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+      });
+
+      expect(first.webhookCalls[0]).toEqual({
+        instanceId: 'inst-1',
+        config: { baseUrl: 'https://attacker.example', label: 'A' },
+      });
+      expect(first.webhookCalls[1]).toEqual({
+        instanceId: 'inst-wild',
+        config: { baseUrl: 'https://attacker.example', label: 'W' },
+      });
+      expect(first.webhookCalls[2]).toEqual({
+        instanceId: 'inst-own',
+        config: { baseUrl: 'https://own.example', apiKey: 'OWN-SECRET', label: 'B' },
+      });
+
+      // Persisted instance rows must reflect the stripped secrets while preserving inst-own.
+      expect((await instances.resolve(PLUGIN_ID, 'inst-1'))?.config).toEqual({ label: 'A' });
+      expect((await instances.resolve(PLUGIN_ID, 'inst-wild'))?.config).toEqual({ label: 'W' });
+      expect((await instances.resolve(PLUGIN_ID, 'inst-own'))?.config).toEqual({
+        baseUrl: 'https://own.example',
+        apiKey: 'OWN-SECRET',
+        label: 'B',
+      });
+
+      // Simulated restart + ScopeBindingService.reconcile() must NOT resurrect INST-SECRET or WILD-SECRET.
+      const restarted = bootLoader();
+      await restarted.scopeBinding.reconcile();
+      const pluginAfterRestart = restarted.loader.getPlugin(PLUGIN_ID)!;
+      expect(pluginAfterRestart.config).toEqual({ baseUrl: 'https://attacker.example', label: 'W' });
+      expect(pluginAfterRestart.sessionConfig?.['sess-A']).toEqual({ label: 'A' });
+      expect(pluginAfterRestart.sessionConfig?.['sess-B']).toEqual({
+        baseUrl: 'https://own.example',
+        apiKey: 'OWN-SECRET',
+        label: 'B',
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('strips inherited secrets from sibling instances when a wildcard instance projection redirects the base host', async () => {
+    const { instances, bootLoader, cleanup } = await buildStack();
+    try {
+      const stack = bootLoader();
+      expect(
+        (
+          await stack.pluginsService.updateConfig(PLUGIN_ID, {
+            baseUrl: 'https://good.example',
+            apiKey: 'BASE-SECRET',
+          })
+        ).success,
+      ).toBe(true);
+
+      const instConcrete = await instances.create(PLUGIN_ID, 'inst-1', {
+        sessionScope: 'sess-A',
+        config: { apiKey: 'INST-SECRET', label: 'A' },
+      });
+      const instWildOld = await instances.create(PLUGIN_ID, 'inst-wild-old', {
+        config: { apiKey: 'OLD-WILD-SECRET', label: 'W1' },
+      });
+      const instOwn = await instances.create(PLUGIN_ID, 'inst-own', {
+        sessionScope: 'sess-B',
+        config: { baseUrl: 'https://own.example', apiKey: 'OWN-SECRET', label: 'B' },
+      });
+      await stack.scopeBinding.applyScopeBinding(PLUGIN_ID, instConcrete.sessionScope, instConcrete.config!, true);
+      await stack.scopeBinding.applyScopeBinding(PLUGIN_ID, instOwn.sessionScope, instOwn.config!, true);
+      await stack.scopeBinding.applyScopeBinding(PLUGIN_ID, instWildOld.sessionScope, instWildOld.config!, true);
+
+      // Provision a new wildcard instance pointing at a different origin with its own secret.
+      const instWildNew = await instances.create(PLUGIN_ID, 'inst-wild-new', {
+        config: { baseUrl: 'https://moved.example', apiKey: 'NEW-WILD-SECRET', label: 'W2' },
+      });
+      const sanitizeSpy = jest.spyOn(instances, 'sanitizeForBaseRedirect');
+      await stack.scopeBinding.applyScopeBinding(PLUGIN_ID, instWildNew.sessionScope, instWildNew.config!, true);
+
+      expect(sanitizeSpy).toHaveBeenCalledTimes(1);
+      sanitizeSpy.mockRestore();
+
+      expect((await instances.resolve(PLUGIN_ID, 'inst-1'))?.config).toEqual({ label: 'A' });
+      expect((await instances.resolve(PLUGIN_ID, 'inst-wild-old'))?.config).toEqual({ label: 'W1' });
+      expect((await instances.resolve(PLUGIN_ID, 'inst-wild-new'))?.config).toEqual({
+        baseUrl: 'https://moved.example',
+        apiKey: 'NEW-WILD-SECRET',
+        label: 'W2',
+      });
+      expect((await instances.resolve(PLUGIN_ID, 'inst-own'))?.config).toEqual({
+        baseUrl: 'https://own.example',
+        apiKey: 'OWN-SECRET',
+        label: 'B',
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('rejects a base host redirect and leaves registry.json untouched when instance DB sanitization fails', async () => {
+    const { instances, ds, bootLoader, cleanup } = await buildStack();
+    try {
+      const stack = bootLoader();
+      expect(
+        (
+          await stack.pluginsService.updateConfig(PLUGIN_ID, {
+            baseUrl: 'https://good.example',
+            apiKey: 'BASE-SECRET',
+          })
+        ).success,
+      ).toBe(true);
+
+      const instConcrete = await instances.create(PLUGIN_ID, 'inst-1', {
+        sessionScope: 'sess-A',
+        config: { apiKey: 'INST-SECRET', label: 'A' },
+      });
+      await stack.scopeBinding.applyScopeBinding(PLUGIN_ID, instConcrete.sessionScope, instConcrete.config!, true);
+
+      const repo = ds.getRepository(PluginInstance);
+      const updateSpy = jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('db write unavailable'));
+
+      await expect(
+        stack.pluginsService.updateConfig(PLUGIN_ID, { baseUrl: 'https://attacker.example' }),
+      ).rejects.toThrow();
+
+      // Neither runtime config nor persisted registry.json may be redirected when DB sanitization failed.
+      expect(stack.loader.getPlugin(PLUGIN_ID)?.config).toMatchObject({ baseUrl: 'https://good.example' });
+      expect(stack.storage.getPluginConfig(PLUGIN_ID)).toMatchObject({ baseUrl: 'https://good.example' });
+
+      // Because the redirect was aborted, a subsequent read must NOT strip INST-SECRET via a phantom retry.
+      updateSpy.mockRestore();
+      expect((await instances.resolve(PLUGIN_ID, 'inst-1'))?.config).toEqual({ apiKey: 'INST-SECRET', label: 'A' });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('durably sanitizes plugin_instances before updateConfig resolves so an immediate cold restart cannot resurrect secrets', async () => {
+    const { instances, ds, bootLoader, cleanup } = await buildStack();
+    try {
+      const first = bootLoader();
+      expect(
+        (
+          await first.pluginsService.updateConfig(PLUGIN_ID, {
+            baseUrl: 'https://good.example',
+            apiKey: 'BASE-SECRET',
+          })
+        ).success,
+      ).toBe(true);
+
+      const instConcrete = await instances.create(PLUGIN_ID, 'inst-1', {
+        sessionScope: 'sess-A',
+        config: { apiKey: 'INST-SECRET', label: 'A' },
+      });
+      const instWild = await instances.create(PLUGIN_ID, 'inst-wild', {
+        config: { apiKey: 'WILD-SECRET', label: 'W' },
+      });
+      await first.scopeBinding.applyScopeBinding(PLUGIN_ID, instConcrete.sessionScope, instConcrete.config!, true);
+      await first.scopeBinding.applyScopeBinding(PLUGIN_ID, instWild.sessionScope, instWild.config!, true);
+
+      // Slow DB updates so a non-awaited background sanitization would still be in flight when updateConfig returns.
+      const repo = ds.getRepository(PluginInstance);
+      const origUpdate = repo.update.bind(repo);
+      const updateSpy = jest.spyOn(repo, 'update').mockImplementation(async (...args) => {
+        await new Promise(resolve => setTimeout(resolve, 40));
+        return origUpdate(...args);
+      });
+
+      const result = await first.pluginsService.updateConfig(PLUGIN_ID, { baseUrl: 'https://attacker.example' });
+      expect(result.success).toBe(true);
+      updateSpy.mockRestore();
+
+      // Simulate a cold restart with a fresh PluginInstanceService (no in-memory barriers) immediately after return.
+      const freshInstances = new PluginInstanceService(ds.getRepository(PluginInstance));
+      const restarted = bootLoader();
+      const restartedScopeBinding = new ScopeBindingService(
+        freshInstances,
+        restarted.loader,
+        { logInfo: jest.fn(), logWarn: jest.fn() } as unknown as AuditService,
+        ds.getRepository(Session),
+      );
+      await restartedScopeBinding.reconcile();
+
+      expect(restarted.loader.getPlugin(PLUGIN_ID)?.config).toEqual({
+        baseUrl: 'https://attacker.example',
+        label: 'W',
+      });
+      expect(restarted.loader.getPlugin(PLUGIN_ID)?.sessionConfig?.['sess-A']).toEqual({ label: 'A' });
+    } finally {
+      await cleanup();
+    }
   });
 });

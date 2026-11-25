@@ -26,22 +26,24 @@ class GroupsResource
      */
     public function list(string $sessionId, array $query = []): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups", $query) ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups", $query) ?? [];
     }
 
     /** @return array<string,mixed> */
     public function get(string $sessionId, string $groupId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}");
+        return $this->http->requestArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}");
     }
 
     /**
+     * Create a group. Baileys only; whatsapp-web.js answers 501.
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */
     public function create(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups", [], HttpExecutor::lists($body, 'participants'));
     }
 
     /**
@@ -53,7 +55,7 @@ class GroupsResource
      */
     public function joinInfo(string $sessionId, string $code): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/join-info", ['code' => $code]);
+        return $this->http->requestArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/join-info", ['code' => $code]);
     }
 
     /**
@@ -64,43 +66,67 @@ class GroupsResource
      */
     public function joinGroup(string $sessionId, string $inviteCode): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/join", [], ['inviteCode' => $inviteCode]);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/join", [], ['inviteCode' => $inviteCode]);
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * @param array<string> $participants
+     * @return array<string,mixed>
+     */
     public function addParticipants(string $sessionId, string $groupId, array $participants): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants", [], ['participants' => $participants]);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants", [], ['participants' => array_values($participants)]);
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * @param array<string> $participants
+     * @return array<string,mixed>
+     */
     public function removeParticipants(string $sessionId, string $groupId, array $participants): array
     {
-        return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants", [], ['participants' => $participants]);
+        return $this->http->requestArray('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants", [], ['participants' => array_values($participants)]);
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * @param array<string> $participants
+     * @return array<string,mixed>
+     */
     public function promoteParticipants(string $sessionId, string $groupId, array $participants): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants/promote", [], ['participants' => $participants]);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants/promote", [], ['participants' => array_values($participants)]);
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * @param array<string> $participants
+     * @return array<string,mixed>
+     */
     public function demoteParticipants(string $sessionId, string $groupId, array $participants): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants/demote", [], ['participants' => $participants]);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/participants/demote", [], ['participants' => array_values($participants)]);
     }
 
     /** @return array<string,mixed> */
     public function setSubject(string $sessionId, string $groupId, string $subject): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/subject", [], ['subject' => $subject]);
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/subject", [], ['subject' => $subject]);
     }
 
     /** @return array<string,mixed> */
     public function setDescription(string $sessionId, string $groupId, string $description): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/description", [], ['description' => $description]);
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/description", [], ['description' => $description]);
+    }
+
+    /**
+     * Set this account's member label in the group (an empty string clears it).
+     * Baileys only; whatsapp-web.js answers 501. A 200 means the label message
+     * was handed to WhatsApp; it cannot be read back.
+     *
+     * @return array<string,mixed>
+     */
+    public function setMemberLabel(string $sessionId, string $groupId, string $label): array
+    {
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/member-label", [], ['label' => $label]);
     }
 
     /**
@@ -112,7 +138,7 @@ class GroupsResource
      */
     public function getGroupSettings(string $sessionId, string $groupId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/settings");
+        return $this->http->requestArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/settings");
     }
 
     /**
@@ -126,13 +152,13 @@ class GroupsResource
      */
     public function updateGroupSettings(string $sessionId, string $groupId, array $settings): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/settings", [], $settings);
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/settings", [], $settings);
     }
 
     /** @return array<string,mixed> */
     public function leave(string $sessionId, string $groupId): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/leave");
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/leave");
     }
 
     /**
@@ -142,40 +168,40 @@ class GroupsResource
      */
     public function getPicture(string $sessionId, string $groupId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/picture") ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/picture") ?? [];
     }
 
     /**
-     * Set the group's picture. Requires admin rights on the group.
+     * Set the group's picture. Requires the right to edit the group info: an admin, or any member of a group whose info is not restricted to admins.
      *
      * @param array<string,mixed> $body url OR base64 (base64 wins), plus mimetype with base64.
      * @return array<string,mixed>
      */
     public function setPicture(string $sessionId, string $groupId, array $body): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/picture", [], $body) ?? [];
+        return $this->http->requestNullableArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/picture", [], $body) ?? [];
     }
 
     /**
-     * Remove the group's picture. Requires admin rights on the group.
+     * Remove the group's picture. Requires the right to edit the group info: an admin, or any member of a group whose info is not restricted to admins.
      *
      * @return array<string,mixed>
      */
     public function deletePicture(string $sessionId, string $groupId): array
     {
-        return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/picture") ?? [];
+        return $this->http->requestNullableArray('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/picture") ?? [];
     }
 
     /** @return array<string,mixed> */
     public function inviteCode(string $sessionId, string $groupId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/invite-code");
+        return $this->http->requestArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/invite-code");
     }
 
     /** @return array<string,mixed> */
     public function revokeInviteCode(string $sessionId, string $groupId): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/invite-code/revoke");
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/invite-code/revoke");
     }
 
     /**
@@ -187,7 +213,7 @@ class GroupsResource
      */
     public function getMembershipRequests(string $sessionId, string $groupId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests") ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests") ?? [];
     }
 
     /**
@@ -196,29 +222,29 @@ class GroupsResource
      * A partial refusal answers 200 and reports it per participant in `results`, so `success` alone
      * does not mean everyone was let in.
      *
-     * @param list<string>|null $participants
+     * @param array<string>|null $participants
      * @return array<string,mixed>
      */
     public function approveMembershipRequests(string $sessionId, string $groupId, ?array $participants = null): array
     {
         // An omitted list is an empty object on the wire, as the other SDKs send, not an empty array.
-        $body = $participants === null ? new \stdClass() : ['participants' => $participants];
+        $body = $participants === null ? new \stdClass() : ['participants' => array_values($participants)];
 
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests/approve", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests/approve", [], $body);
     }
 
     /**
      * Reject pending join requests. Pass null to reject every pending request.
      *
-     * @param list<string>|null $participants
+     * @param array<string>|null $participants
      * @return array<string,mixed>
      */
     public function rejectMembershipRequests(string $sessionId, string $groupId, ?array $participants = null): array
     {
         // An omitted list is an empty object on the wire, as the other SDKs send, not an empty array.
-        $body = $participants === null ? new \stdClass() : ['participants' => $participants];
+        $body = $participants === null ? new \stdClass() : ['participants' => array_values($participants)];
 
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests/reject", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests/reject", [], $body);
     }
 
 }

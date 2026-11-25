@@ -7,17 +7,21 @@ import configuration from '../../config/configuration';
 import { PLUGIN_SHUTDOWN_WAIT_MS } from '../../core/plugins/plugin-loader.service';
 import { ApiKeyUsageTracker } from '../../modules/auth/api-key-usage-tracker.service';
 import { WS_REDIS_QUIT_TIMEOUT_MS } from '../../modules/events/redis-io.adapter';
-import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
+import { INGRESS_SHUTDOWN_WAIT_MS } from '../../modules/integration/integration.constants';
 import { MAX_WORKER_CLOSE_WAIT_MS } from '../../modules/queue/processors/close-worker';
 import { QUEUE_NAMES } from '../../modules/queue/queue-names';
 import { QUEUE_CLOSE_TIMEOUT_MS } from '../../modules/queue/shutdown-safe-queue';
 import { ENGINE_TEARDOWN_TIMEOUT_MS } from '../../modules/session/session-lifecycle-fences';
 import { AUTOSTART_SHUTDOWN_WAIT_MS } from '../../modules/session/session.service';
+import { BULK_SHUTDOWN_DRAIN_MS } from '../../modules/message/bulk-message.service';
 import {
   DEFAULT_SHUTDOWN_DELAY_MS,
   DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS,
   SHUTDOWN_KILL_DEADLINE_MS,
+  SHUTDOWN_MAINTENANCE_WAIT_MS,
   SHUTDOWN_TEARDOWN_LIMIT_MS,
+  STORAGE_FALLBACK_SHUTDOWN_WAIT_MS,
+  WEBHOOK_PRUNE_SHUTDOWN_WAIT_MS,
   shutdownTeardownLimitMs,
 } from './shutdown-budget';
 
@@ -33,9 +37,12 @@ describe('shutdown time budget', () => {
   const QUEUE_COUNT = Object.keys(QUEUE_NAMES).length;
   const base =
     DEFAULT_SHUTDOWN_DELAY_MS +
-    INGRESS_DISPATCH_TIMEOUT_MS +
+    INGRESS_SHUTDOWN_WAIT_MS +
     ENGINE_TEARDOWN_TIMEOUT_MS +
     AUTOSTART_SHUTDOWN_WAIT_MS +
+    BULK_SHUTDOWN_DRAIN_MS +
+    SHUTDOWN_MAINTENANCE_WAIT_MS * 4 +
+    STORAGE_FALLBACK_SHUTDOWN_WAIT_MS +
     DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS +
     ApiKeyUsageTracker.SHUTDOWN_FLUSH_TIMEOUT_MS;
   const withPlugins = base + PLUGIN_SHUTDOWN_WAIT_MS;
@@ -45,10 +52,12 @@ describe('shutdown time budget', () => {
     QUEUE_CLOSE_TIMEOUT_MS * QUEUE_COUNT +
     THROTTLER_REDIS_QUIT_TIMEOUT_MS +
     CACHE_QUIT_TIMEOUT_MS +
+    WS_REDIS_QUIT_TIMEOUT_MS +
     WS_REDIS_QUIT_TIMEOUT_MS;
 
   it('sums to the documented totals', () => {
-    expect([base, withPlugins, clustered]).toEqual([33_000, 43_000, 63_000]);
+    expect([base, withPlugins, clustered]).toEqual([43_000, 53_000, 75_000]);
+    expect(WEBHOOK_PRUNE_SHUTDOWN_WAIT_MS).toBeLessThanOrEqual(DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS);
   });
 
   it('registers one queue module per queue name, so the queue stage is counted per queue', () => {
@@ -71,8 +80,8 @@ describe('shutdown time budget', () => {
     ).toBe('ok');
   });
 
-  it('keeps the 67 s teardown limit and the 5 s kill margin the docs quote', () => {
-    expect(SHUTDOWN_TEARDOWN_LIMIT_MS).toBe(67_000);
+  it('keeps the 82 s teardown limit and the 5 s kill margin the docs quote', () => {
+    expect(SHUTDOWN_TEARDOWN_LIMIT_MS).toBe(82_000);
     expect(SHUTDOWN_KILL_DEADLINE_MS - DEFAULT_SHUTDOWN_DELAY_MS - SHUTDOWN_TEARDOWN_LIMIT_MS).toBe(5_000);
   });
 

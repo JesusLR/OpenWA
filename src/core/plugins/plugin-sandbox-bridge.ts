@@ -1,23 +1,42 @@
 import * as path from 'path';
 import { ConfigService } from '@nestjs/config';
 import { createLogger } from '../../common/services/logger.service';
-import { HookManager, HookEvent, KNOWN_HOOK_EVENTS, isKnownHookEvent, normalizeHookPriority } from '../hooks';
+import {
+  HOOK_FAIL_CLOSED_SYMBOL,
+  HookContext,
+  HookEvent,
+  HookManager,
+  KNOWN_HOOK_EVENTS,
+  PRE_EGRESS_HOOK_EVENTS,
+  isKnownHookEvent,
+  normalizeHookPriority,
+} from '../hooks';
 import { PluginCapabilityPermission, PluginContext, PluginInstance, PluginStatus } from './plugin.interfaces';
 import { PluginStorageService } from './plugin-storage.service';
 import { PluginHostServices } from './plugin-host-services';
 import { PluginCapabilityContext } from './plugin-capability-context';
-import { isPluginActiveForSession, resolveInstanceConfig, resolvePluginConfig } from './plugin-activation';
-import { PluginWorkerHost } from './sandbox/plugin-worker-host';
+import {
+  isPluginActiveForSession,
+  resolveInstanceConfig,
+  resolvePluginConfig,
+  sessionScopeKey,
+} from './plugin-activation';
+import { PluginWorkerHost, type CapabilityDispatcher } from './sandbox/plugin-worker-host';
 import { dispatchCapabilityVerb } from './sandbox/capability-router';
-import { PluginLogLevel } from './sandbox/protocol';
+import { PluginLogLevel, SANDBOX_LOG_MAX_PER_WINDOW, SANDBOX_LOG_WINDOW_MS } from './sandbox/protocol';
 import { shouldDispatchToPlugin } from './handover-gate';
+import { countMetaValues, metaText } from './sandbox-log-meta';
 import { makeOnWebhookSubscribe } from './webhook-subscribe.util';
 import { registerPluginSearchProvider, unregisterPluginSearchProvider } from './search-provider-registration.util';
 import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
+import { ingressDeliveryVerified, isQueryBorne } from '../../modules/integration/ingress-signature';
 import type { IngressJobData } from '../../modules/queue/processors/ingress.processor';
+import { resolveFeatureFlags } from '../../config/feature-flags';
 
 /** Time budget for a sandboxed plugin's hook handler before the chain proceeds without it. */
 const SANDBOX_HOOK_TIMEOUT_MS = 5000;
+/** Keep queued dispatch below BullMQ's default 30 s job lock. */
+const SANDBOX_QUEUED_WEBHOOK_MAX_MS = 25000;
 /** A sandboxed plugin's healthCheck must answer within this, else it's reported unhealthy (not hung). */
 const SANDBOX_HEALTH_TIMEOUT_MS = 5000;
 /** A sandboxed plugin's search handler must answer within this, else /search fails fast (not hung). */
@@ -29,6 +48,8 @@ const SANDBOX_SEARCH_TIMEOUT_MS = 10000;
  * connections should still finish well under it.
  */
 const SANDBOX_LIFECYCLE_TIMEOUT_MS = 30000;
+/** Periodic idle liveness interval for production sandbox workers. */
+const SANDBOX_LIVENESS_INTERVAL_MS = 30_000;
 
 /**
  * Rate limit for the structured sandboxed-hook error log: at most one line per event per window so a
@@ -38,13 +59,12 @@ const SANDBOX_LIFECYCLE_TIMEOUT_MS = 30000;
 const SANDBOX_HOOK_ERROR_LOG_INTERVAL_MS = 60000;
 
 /**
- * Worker log-relay bounds (per sandboxed plugin): at most this many lines per window are relayed;
+ * Worker log-relay bounds (per sandboxed plugin): at most SANDBOX_LOG_MAX_PER_WINDOW lines per window are relayed;
  * excess is dropped, counted, and surfaced as one warn per window. Longer lines are truncated. The
  * worker is not a security boundary — these are robustness bounds against a chatty/buggy plugin
- * flooding the host log, not isolation.
+ * flooding the host log, not isolation. The worker applies the same per-window bound before it posts a line
+ * (WorkerLogLimiter), so this relay is the backstop for a worker that posts straight to its port.
  */
-const SANDBOX_LOG_MAX_PER_WINDOW = 200;
-const SANDBOX_LOG_WINDOW_MS = 10000;
 const SANDBOX_LOG_MAX_MESSAGE_LENGTH = 8192;
 
 /** Per-enable log-relay rate-limit window, shared by the onLog relay and the onWorkerExit final flush. */
@@ -59,7 +79,7 @@ interface SandboxLogRelayState {
  * closure and calls it exactly where enableSandboxed used to call the method.
  */
 type CreateSandboxHostFn = (
-  capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+  capDispatcher?: CapabilityDispatcher,
   onHookSubscribe?: (event: string, priority?: number) => void,
   onWebhookSubscribe?: (route: string) => void,
   onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
@@ -67,6 +87,7 @@ type CreateSandboxHostFn = (
   onSearchProviderRegister?: () => void,
   onWorkerExit?: (code: number, intentional: boolean, reason?: string) => void,
   onUnresponsive?: () => void,
+  livenessIntervalMs?: number,
 ) => PluginWorkerHost;
 
 /**
@@ -183,7 +204,7 @@ export class PluginSandboxBridge {
    * since, or when the worker's handler itself reports
    * failure (`!result.ok`, e.g. a 502/504/500) — either way BullMQ's retry/DLQ machinery takes over.
    */
-  async dispatchWebhookForInstance(d: IngressJobData): Promise<void> {
+  async dispatchWebhookForInstance(d: IngressJobData, options?: { queued?: boolean }): Promise<void> {
     const host = this.sandboxHosts.get(d.pluginId);
     if (!host) {
       throw new Error('no live sandbox host for plugin ' + d.pluginId);
@@ -195,8 +216,18 @@ export class PluginSandboxBridge {
     const route = plugin?.manifest.ingress?.find(candidate => candidate.route === d.route);
     // Reaching dispatch means every authenticating scheme already passed host verification. A route
     // explicitly configured with scheme:none is unauthenticated and must never be labelled verified.
-    // Missing/hot-swapped route metadata fails closed.
-    const verified = route ? route.signature.scheme !== 'none' : false;
+    // The verdict is the one recorded at admission: a plugin update can change the route's scheme while
+    // a delivery waits, and it must not relabel a payload nobody authenticated. A delivery admitted before
+    // the verdict was recorded reads the route as it stands. Missing/hot-swapped route metadata fails closed.
+    // A recorded verdict is still withdrawn for a query-borne delivery on a signing route: earlier releases recorded
+    // those as verified, though no signature covers the query.
+    const recorded = d.payload.admission?.verified;
+    const verified =
+      !!route &&
+      (recorded === undefined
+        ? ingressDeliveryVerified(route.signature.scheme, d.payload.rawBody, d.payload.query)
+        : recorded &&
+          (route.signature.scheme === 'shared-secret' || !isQueryBorne(d.payload.rawBody, d.payload.query)));
     const instance = await this.hostServices.getPluginInstancePort().resolve(d.pluginId, d.instanceId);
     // The live door and the reconciler refuse an unknown or disabled instance; a queued job, a retry,
     // the inline fallback and a redrive all land here instead, so the same rule is enforced once more.
@@ -205,6 +236,11 @@ export class PluginSandboxBridge {
     // Throwing hands the job to the normal retry/dead-letter path.
     if (!instance || instance.enabled === false) {
       throw new Error('instance ' + d.instanceId + ' of plugin ' + d.pluginId + ' is disabled or deleted');
+    }
+    // The job carries the session the instance acted on at admission. Rebound since, the delivery would
+    // reach the handler under that session with the new session's config, so it is refused instead.
+    if (sessionScopeKey(instance.sessionScope) !== sessionScopeKey(d.sessionId)) {
+      throw new Error('instance ' + d.instanceId + ' of plugin ' + d.pluginId + ' was rebound since this delivery');
     }
     // Three layers, most specific last: the base ('*') config, then the operator's per-session
     // override from PUT /plugins/:id/sessions/:sessionId/config, then THIS instance's own config.
@@ -239,9 +275,12 @@ export class PluginSandboxBridge {
                 plugin.sessionConfig,
                 instance?.sessionScope ?? undefined,
                 plugin.manifest.sessionScoped !== false,
+                plugin.manifest,
               )
             : plugin.config,
           instance?.config,
+          plugin.manifest,
+          plugin.config,
         )
       : undefined;
     const result = await host.dispatchWebhook({
@@ -253,10 +292,16 @@ export class PluginSandboxBridge {
       body: d.payload.body,
       rawBody: d.payload.rawBody,
       verified,
-      deliveryId: d.deliveryId,
+      deliveryId: d.payload.providerDeliveryId ?? d.deliveryId,
+      dedupKey: d.deliveryId,
       sessionId: d.sessionId,
       config,
-      timeoutMs: INGRESS_DISPATCH_TIMEOUT_MS,
+      timeoutMs: options?.queued
+        ? Math.min(
+            SANDBOX_QUEUED_WEBHOOK_MAX_MS,
+            resolveFeatureFlags(this.configService).simulateTypingMaxMs + INGRESS_DISPATCH_TIMEOUT_MS,
+          )
+        : INGRESS_DISPATCH_TIMEOUT_MS,
     });
     if (!result.ok) {
       throw new Error(result.error ?? 'ingress dispatch failed with status ' + result.status);
@@ -297,13 +342,22 @@ export class PluginSandboxBridge {
    * calls and hooks round-trip to the host, which enforces permission + session scope. A failure
    * tears the worker back down.
    */
-  async enableSandboxed(pluginId: string, plugin: PluginInstance): Promise<void> {
+  async enableSandboxed(
+    pluginId: string,
+    plugin: PluginInstance,
+    opts?: { preserveExistingHooks?: boolean },
+  ): Promise<void> {
     // A new worker generation starts from a clean slate. disablePlugin clears this too, but a crash
     // and a failed enable both end a generation WITHOUT going through disable — so clearing only
     // there let the replacement worker inherit a dead one's hook error and report it through
     // checkPluginHealth as current. Enforced here, at the one point every generation begins, rather
     // than repeated on each way a generation can end.
     this.lastSandboxHookError.delete(pluginId);
+    // Drop any leftover hooks upfront unless the caller is preserving fail-closed ERROR shims across
+    // re-enable (PluginLifecycle removes those atomically once onEnable succeeds).
+    if (!opts?.preserveExistingHooks) {
+      this.hookManager.unregisterPlugin(pluginId);
+    }
     // Containment guard: reject a manifest.main that escapes the plugin dir.
     // Anchored to the directory the package was loaded from, which is not necessarily
     // <plugins.dir>/<id>: the loader also scans the legacy plugins directory, and the worker's
@@ -319,7 +373,7 @@ export class PluginSandboxBridge {
     // identically. The worker can only ask; the host is the gatekeeper.
     const context = this.capabilities.createPluginContext(plugin);
 
-    const onHookSubscribe = this.buildHookSubscribeHandler(pluginId, plugin);
+    const onHookSubscribe = this.buildHookSubscribeHandler(pluginId, plugin, () => host);
 
     // When the worker claims an ingress route, check the claim against the manifest-declared routes
     // and log an undeclared one (warn once). Same hardening as onHookSubscribe (the wire `route` is an
@@ -337,7 +391,7 @@ export class PluginSandboxBridge {
 
     const onSearchProviderRegister = this.buildSearchProviderRegistrar(pluginId, plugin);
 
-    const onWorkerExit = this.buildWorkerExitHandler(pluginId, logRelayState);
+    const onWorkerExit = this.buildWorkerExitHandler(pluginId, logRelayState, () => host);
 
     // A worker whose event loop stays blocked after a dispatch timeout (a synchronous loop in plugin
     // code) would otherwise keep running and queue every later dispatch for the full budget each.
@@ -354,7 +408,12 @@ export class PluginSandboxBridge {
     };
 
     const host: PluginWorkerHost = this.createHost(
-      (verb, args) => dispatchCapabilityVerb(context, verb, args),
+      (verb, args, dispatchContext, signal) =>
+        dispatchContext
+          ? this.capabilities.runWithDispatchContext(dispatchContext, () =>
+              dispatchCapabilityVerb(context, verb, args, signal),
+            )
+          : dispatchCapabilityVerb(context, verb, args, signal),
       onHookSubscribe,
       onWebhookSubscribe,
       onLog,
@@ -364,10 +423,14 @@ export class PluginSandboxBridge {
       onSearchProviderRegister,
       onWorkerExit,
       onUnresponsive,
+      SANDBOX_LIVENESS_INTERVAL_MS,
     );
     this.sandboxHosts.set(pluginId, host);
+    // The worker keeps this config as its base until a config-change arrives, and a save made while the
+    // plugin is still enabling is not pushed (it is not ENABLED yet). Every save replaces plugin.config.
+    const loadedConfig = plugin.config;
     try {
-      await host.load(mainPath, { pluginId, config: plugin.config }, SANDBOX_LIFECYCLE_TIMEOUT_MS);
+      await host.load(mainPath, { pluginId, config: loadedConfig }, SANDBOX_LIFECYCLE_TIMEOUT_MS);
       await host.runLifecycle('onLoad', SANDBOX_LIFECYCLE_TIMEOUT_MS);
       await host.runLifecycle('onEnable', SANDBOX_LIFECYCLE_TIMEOUT_MS);
     } catch (error) {
@@ -379,6 +442,9 @@ export class PluginSandboxBridge {
       await host.terminate().catch(() => undefined);
       throw error;
     }
+    // After onEnable, never during it: the worker runs messages concurrently, so a push mid-enable would run
+    // onConfigChange before onEnable finished.
+    if (plugin.config !== loadedConfig) host.sendConfigChange(plugin.config);
   }
 
   /**
@@ -438,6 +504,7 @@ export class PluginSandboxBridge {
   private buildHookSubscribeHandler(
     pluginId: string,
     plugin: PluginInstance,
+    getExpectedHost: () => PluginWorkerHost,
   ): (event: string, priority?: number) => void {
     const subscribedEvents = new Map<HookEvent, { hookId: string; priority: number }>();
     let unknownEventWarned = false;
@@ -470,8 +537,8 @@ export class PluginSandboxBridge {
         pluginId,
         event,
         async hookCtx => {
-          const liveHost = this.sandboxHosts.get(pluginId);
-          if (!liveHost) return { continue: true };
+          const failClosed =
+            (hookCtx as HookContext & { [HOOK_FAIL_CLOSED_SYMBOL]?: boolean })[HOOK_FAIL_CLOSED_SYMBOL] === true;
           // Per-session activation gate: a session-scoped plugin only sees events for the sessions
           // it is activated for. Pass-through (don't dispatch into the worker) otherwise.
           if (
@@ -482,6 +549,14 @@ export class PluginSandboxBridge {
             )
           )
             return { continue: true };
+          const liveHost = this.sandboxHosts.get(pluginId);
+          const expectedHost = getExpectedHost();
+          if (!liveHost || liveHost !== expectedHost || plugin.status === PluginStatus.ERROR) {
+            if (failClosed && plugin.status === PluginStatus.ERROR) {
+              return { continue: true, error: new Error('plugin worker is no longer running') };
+            }
+            return { continue: true };
+          }
           // Handover gate: once a human has taken over (or closed) a conversation, the bot stops
           // seeing its inbound messages. Scoped to message:received only — every other hook event is
           // unaffected. Best-effort + fail-open: a lookup failure (or an event/mapping shape the gate
@@ -504,40 +579,54 @@ export class PluginSandboxBridge {
               });
             }
           }
+          let timedOut = false;
           return liveHost
             .dispatchHook({
               event,
               data: hookCtx.data,
               sessionId: hookCtx.sessionId,
               source: hookCtx.source,
-              // The host resolves the per-session slice (real secrets — the worker is the plugin's
+              // The host resolves the per-session slice (real secrets; the worker is the plugin's
               // trusted execution context) and ships it; the worker exposes it as ctx.config.
               config: resolvePluginConfig(
                 plugin.config,
                 plugin.sessionConfig,
                 hookCtx.sessionId,
                 plugin.manifest.sessionScoped !== false,
+                plugin.manifest,
               ),
               // The chain this dispatch belongs to, so a capability the handler calls is guarded
               // against re-firing any event of it (not only this one) once it returns to the host.
               inFlight: this.hookManager.currentInFlight(),
+              ...(failClosed ? { failClosed: true } : {}),
               timeoutMs: SANDBOX_HOOK_TIMEOUT_MS,
               // Rate-limited like a handler error: a plugin that times out on every message must be
               // visible (log + health) without writing one line per event.
-              onTimeout: () =>
+              onTimeout: () => {
+                timedOut = true;
                 this.recordSandboxHookError(
                   pluginId,
                   event,
                   `timed out after ${SANDBOX_HOOK_TIMEOUT_MS}ms`,
                   hookErrorLogState,
                   'sandbox_hook_timeout',
-                ),
+                );
+              },
             })
             .then(result => {
-              // The worker reports (not throws) a hook-handler failure: surface it host-side instead
-              // of failing open in silence. The chain itself still proceeds fail-open.
-              if (result.error) this.recordSandboxHookError(pluginId, event, result.error, hookErrorLogState);
-              return { continue: result.continue, data: result.data };
+              // Surface non-timeout failures host-side with rate-limiting (timeouts already recorded
+              // in onTimeout above). Propagate `error` to HookManager ONLY when fail-closed mode is
+              // active so fail-open chains keep the 60s log flood guard, avoid timeout double-logs,
+              // and preserve earlier-handler redactions within the same sandboxed plugin.
+              const hasError = result.error !== undefined;
+              if (hasError && !timedOut) {
+                this.recordSandboxHookError(pluginId, event, result.error || 'sandbox hook failed', hookErrorLogState);
+              }
+              return {
+                continue: result.continue,
+                data: result.data,
+                ...(hasError && failClosed ? { error: new Error(result.error || 'sandbox hook failed') } : {}),
+              };
             });
         },
         priority,
@@ -576,23 +665,32 @@ export class PluginSandboxBridge {
         state.dropped++;
         return;
       }
-      // Like the level below, the message and meta come off the wire unchecked: a non-string message is coerced
-      // before the length check, and a meta whose JSON form exceeds the same cap is replaced by a size
-      // marker (not a truncated string, which would hide its keys from the logger's secret redaction).
+      // Like the level below, the message and meta come off the wire unchecked: a non-string message is replaced by
+      // a fixed marker (turning an array into text would write a shared reference out at every use), and a meta
+      // whose text, as the logger writes it (metaText), exceeds the same cap is replaced by a size marker (not a
+      // truncated string, which would hide its keys from the logger's secret redaction).
       // logger.error's reason travels as a string meta.error, so that one key survives the replacement.
       const truncate = (value: string): string =>
         value.length > SANDBOX_LOG_MAX_MESSAGE_LENGTH
           ? `${value.slice(0, SANDBOX_LOG_MAX_MESSAGE_LENGTH)}…[truncated]`
           : value;
-      const bounded = truncate(typeof message === 'string' ? message : String(message));
+      const bounded = truncate(typeof message === 'string' ? message : '[non-string log message]');
       let boundedMeta = meta;
       if (meta !== undefined) {
         const reason = typeof meta?.error === 'string' ? { error: truncate(meta.error) } : undefined;
-        try {
-          const metaLength = JSON.stringify(meta).length;
-          if (metaLength > SANDBOX_LOG_MAX_MESSAGE_LENGTH) boundedMeta = { ...reason, metaTruncated: true, metaLength };
-        } catch {
-          boundedMeta = reason; // not serializable (circular or BigInt), so it cannot be logged as JSON anyway
+        // A count past the size limit (values, string characters and property name characters) marks a meta that is
+        // replaced without being written out. The text is only built, to learn its length, for a meta under the
+        // limit: building it for any other could take seconds, as a shared reference is written out at every use.
+        if (countMetaValues(meta, SANDBOX_LOG_MAX_MESSAGE_LENGTH) > SANDBOX_LOG_MAX_MESSAGE_LENGTH) {
+          boundedMeta = { ...reason, metaTruncated: true };
+        } else {
+          try {
+            const metaLength = (metaText(meta) ?? '').length;
+            if (metaLength > SANDBOX_LOG_MAX_MESSAGE_LENGTH)
+              boundedMeta = { ...reason, metaTruncated: true, metaLength };
+          } catch {
+            boundedMeta = reason; // circular, or holding a BigInt, whose text is not built on the host
+          }
         }
       }
       // The level comes off the wire unchecked (plugin code can post to parentPort directly), and the
@@ -610,9 +708,13 @@ export class PluginSandboxBridge {
   // a manifest without 'search:provide' is denied there — the wire declaration is untrusted input, and
   // this bridge bypasses the capability router that gates the ctx.* capabilities.
   private buildSearchProviderRegistrar(pluginId: string, plugin: PluginInstance): () => void {
+    // One declaration per worker. Plugin code can post the message itself, and every repeat would take the active
+    // provider back in auto mode, or log the denial again.
+    let declared = false;
     return (): void => {
       const liveHost = this.sandboxHosts.get(pluginId);
-      if (!liveHost) return;
+      if (!liveHost || declared) return;
+      declared = true;
       registerPluginSearchProvider({
         pluginId,
         label: `${plugin.manifest.name} (plugin)`,
@@ -626,8 +728,10 @@ export class PluginSandboxBridge {
     };
   }
 
-  // Shared ERROR transition for a crashed or unresponsive worker: mark the plugin ERROR, drop its hook
-  // shims and the dead host. The exit handler releases the search provider.
+  // Shared ERROR transition for a crashed or unresponsive worker: mark the plugin ERROR, drop the
+  // dead host, and unregister its hook shims. When pre-egress fail-closed mode is enabled, retain
+  // pre-egress shims (`message:sending`, `webhook:before`) so subsequent sends and webhooks keep
+  // failing closed until the operator disables, unloads, or re-enables the plugin.
   private markWorkerFailed(pluginId: string, reason: string): void {
     const plugin = this.plugins.get(pluginId);
     if (plugin) {
@@ -635,7 +739,11 @@ export class PluginSandboxBridge {
       plugin.error = reason;
       this.pluginStorage.setPluginStatus(pluginId, PluginStatus.ERROR);
     }
-    this.hookManager.unregisterPlugin(pluginId);
+    if (this.hookManager.isPreEgressFailClosed()) {
+      this.hookManager.unregisterPluginExcept(pluginId, PRE_EGRESS_HOOK_EVENTS);
+    } else {
+      this.hookManager.unregisterPlugin(pluginId);
+    }
     this.sandboxHosts.delete(pluginId);
   }
 
@@ -646,6 +754,7 @@ export class PluginSandboxBridge {
   private buildWorkerExitHandler(
     pluginId: string,
     logRelayState: SandboxLogRelayState,
+    getSourceHost: () => PluginWorkerHost,
   ): (code: number, intentional: boolean, reason?: string) => void {
     return (code: number, intentional: boolean, reason?: string): void => {
       // Final log-relay flush: the per-window drop warn above only fires when a new line arrives in a
@@ -658,9 +767,10 @@ export class PluginSandboxBridge {
         );
         logRelayState.dropped = 0;
       }
-      // Always release the search-provider slot so the registry can fall back to builtin-fts. On a crash
-      // this is the only cleanup; on a deliberate disable/enable-failure the explicit unregister already
-      // ran, making this a harmless no-op.
+      // A replacement owns its provider, hooks and status. An absent host still needs cleanup after
+      // markWorkerFailed removed the retiring worker before its termination completed.
+      const currentHost = this.sandboxHosts.get(pluginId);
+      if (currentHost && currentHost !== getSourceHost()) return;
       unregisterPluginSearchProvider(this.hostServices.getSearchRegistryPort(), pluginId);
       if (intentional) return; // routine disable/enable-failure already logged and expected
       // Unexpected crash after a successful enable: the worker is gone. Drop the dead host +

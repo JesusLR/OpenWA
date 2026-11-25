@@ -1,9 +1,14 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsIn, IsObject, IsOptional, IsString, IsUrl, Matches, MaxLength, MinLength, Validate } from 'class-validator';
+import { ToStrictString } from '../../../common/utils/strict-boolean';
 import { MaxCodePoints } from '../../../common/validation/max-code-points';
 import { HasDecodableProxyCredentialsConstraint } from './has-decodable-proxy-credentials.validator';
-import { normaliseSessionConfig, RecognisedSessionConfigConstraint } from './recognised-session-config.validator';
+import {
+  MAX_SESSION_CONFIG_BYTES,
+  normaliseSessionConfig,
+  RecognisedSessionConfigConstraint,
+} from './recognised-session-config.validator';
 
 export class CreateSessionDto {
   @ApiProperty({
@@ -12,6 +17,7 @@ export class CreateSessionDto {
     minLength: 3,
     maxLength: 50,
   })
+  @ToStrictString()
   @IsString()
   @MinLength(3)
   @MaxLength(50)
@@ -22,16 +28,19 @@ export class CreateSessionDto {
 
   @ApiPropertyOptional({
     description:
-      'Session configuration. Only three keys are read: autoRejectCalls (boolean, default false, ' +
+      'Session configuration. Only four keys are read: autoRejectCalls (boolean, default false, ' +
       'Baileys engine only) rejects incoming calls as soon as they ring, and the call.received event is still emitted ' +
       'first; maxReconnectAttempts (0-20, default unlimited) caps consecutive reconnects (the count ' +
-      'restarts once the session has stayed READY for 5 minutes) and ' +
+      'restarts once the session has stayed READY for 5 minutes); ' +
       'reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the ' +
       "gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a " +
-      'fixed backoff and no cap). Anything else is ' +
-      'stored but ignored. All three can be changed later with PATCH /api/sessions/{sessionId}/config ' +
-      'without a restart: autoRejectCalls applies from the next incoming call, the two reconnect settings ' +
-      'from the next session start.',
+      'fixed backoff and no cap); and linkPreview (boolean, default unset) is the link preview of a ' +
+      'send-text or send-template that sets neither linkPreview nor customLinkPreview. Anything else is ' +
+      'stored but ignored, up to ' +
+      `${MAX_SESSION_CONFIG_BYTES} bytes for the whole object serialised as JSON (a larger one is refused with 400). ` +
+      'All four can be changed later with PATCH /api/sessions/{sessionId}/config ' +
+      'without a restart: autoRejectCalls applies from the next incoming call, linkPreview from the next ' +
+      'send, the two reconnect settings from the next session start.',
     example: { autoRejectCalls: false, maxReconnectAttempts: 5, reconnectBaseDelay: 5000 },
   })
   @Transform(({ value }) => normaliseSessionConfig(value))
@@ -52,6 +61,7 @@ export class CreateSessionDto {
     maxLength: 255,
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @MaxCodePoints(255)
   // Reject a malformed/non-proxy URL at the boundary (credentialed http://user:pass@host and

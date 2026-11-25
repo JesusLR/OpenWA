@@ -1,5 +1,9 @@
 import { UnauthorizedException } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
+import { DataSource } from 'typeorm';
+import { BrowserSession } from '../auth/entities/browser-session.entity';
+import { LoggerService } from '../../common/services/logger.service';
+import { ChatScopeService } from '../auth/chat-scope.service';
 
 // ConfigService stub for the media-shed knob: no override means the default cap applies.
 const asConfig = (): { get: jest.Mock } => ({ get: jest.fn((_key: string, defaultValue?: unknown) => defaultValue) });
@@ -11,6 +15,7 @@ import { AuditAction } from '../audit/entities/audit-log.entity';
 import { SUBSCRIBABLE_EVENTS, buildRoomName } from './dto/ws-messages.dto';
 import type { WSClientMessage, WSErrorResponse, WSSubscribedResponse, WSEventMessage } from './dto/ws-messages.dto';
 import { WEBHOOK_RESERVED_EVENTS } from '../webhook/dto/webhook.dto';
+import { SlidingWindowLimiter } from './ws-rate-limit';
 
 describe('isSessionSubscriptionAllowed (WS session-scope enforcement)', () => {
   it('allows an unrestricted key (null allowedSessions) to subscribe to anything, including *', () => {
@@ -180,6 +185,8 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(res.code).toBe('UNAUTHORIZED');
     expect(unauthorizedEmits(sock)).toHaveLength(1);
     expect(auditService.logWarn).toHaveBeenCalledWith(AuditAction.API_KEY_AUTH_FAILED, {
+      // The key the socket connected with, so the row says which key to revoke or re-scope.
+      apiKey: expect.objectContaining({ name: 'k' }) as unknown,
       ipAddress: '203.0.113.5',
       metadata: { surface: 'websocket' },
       errorMessage: 'API key revoked',
@@ -493,6 +500,76 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(sessionRoomJoins(sock)).toEqual([]);
   });
 
+  describe('pending subscription cancellation', () => {
+    const pendingSubscribe = async (sessionId = 'sess-1') => {
+      const apiKey = { id: 'k1', name: 'k', role: 'viewer', allowedSessions: null };
+      authService.validateApiKey.mockResolvedValue(apiKey);
+      const sock = makeSocket({ apiKey: 'good' });
+      sock.join.mockImplementation((room: string) => sock.rooms.add(room));
+      sock.leave.mockImplementation((room: string) => sock.rooms.delete(room));
+      await gateway.handleConnection(asSocket(sock));
+      let resolve!: (key: typeof apiKey) => void;
+      let reject!: (error: Error) => void;
+      const validation = new Promise<typeof apiKey>((yes, no) => {
+        resolve = yes;
+        reject = no;
+      });
+      let entered!: () => void;
+      const started = new Promise<void>(yes => (entered = yes));
+      authService.validateApiKey.mockImplementationOnce(() => {
+        entered();
+        return validation;
+      });
+      const subscribing = gateway.handleMessage(asSocket(sock), subscribeMsg(sessionId, ['message.received']));
+      await started;
+      return { sock, apiKey, resolve, reject, subscribing };
+    };
+    const pendingFor = (sock: MockSocket) =>
+      (gateway as unknown as { pendingSubscriptions: WeakMap<Socket, Set<unknown>> }).pendingSubscriptions.get(
+        asSocket(sock),
+      );
+
+    it.each([
+      ['sess-1', 'sess-1'],
+      ['sess-1', '*'],
+      ['*', '*'],
+    ])('cancels a pending subscribe to %s when unsubscribing from %s', async (sessionId, unsubscribe) => {
+      const pending = await pendingSubscribe(sessionId);
+      expect(
+        await gateway.handleMessage(asSocket(pending.sock), { type: 'unsubscribe', sessionId: unsubscribe }),
+      ).toMatchObject({ type: 'unsubscribed' });
+      pending.resolve(pending.apiKey);
+      expect(await pending.subscribing).toMatchObject({ code: 'SUBSCRIPTION_CANCELLED', requestId: 'r1' });
+      expect(sessionRoomJoins(pending.sock)).toEqual([]);
+      expect(pendingFor(pending.sock)).toBeUndefined();
+
+      expect(
+        await gateway.handleMessage(asSocket(pending.sock), subscribeMsg(sessionId, ['message.received'])),
+      ).toMatchObject({ type: 'subscribed' });
+      expect(pending.sock.rooms.has(buildRoomName(sessionId, 'message.received'))).toBe(true);
+    });
+
+    it('does not cancel a pending subscribe when another session is unsubscribed', async () => {
+      const pending = await pendingSubscribe();
+      expect(
+        await gateway.handleMessage(asSocket(pending.sock), { type: 'unsubscribe', sessionId: 'sess-2' }),
+      ).toMatchObject({ type: 'unsubscribed' });
+      pending.resolve(pending.apiKey);
+      expect(await pending.subscribing).toMatchObject({ type: 'subscribed' });
+      expect(pending.sock.rooms.has(buildRoomName('sess-1', 'message.received'))).toBe(true);
+    });
+
+    it('still refuses failed authorization after a cancellation and clears the pending subscription', async () => {
+      const pending = await pendingSubscribe();
+      await gateway.handleMessage(asSocket(pending.sock), { type: 'unsubscribe', sessionId: '*' });
+      pending.reject(new UnauthorizedException('API key revoked'));
+      expect(await pending.subscribing).toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(pending.sock.disconnected).toBe(true);
+      expect(sessionRoomJoins(pending.sock)).toEqual([]);
+      expect(pendingFor(pending.sock)).toBeUndefined();
+    });
+  });
+
   // Client-IP resolution: an IP-restricted key (allowedIps set) must be ENFORCED at the WS surface,
   // not blanket-rejected. validateApiKey throws "Client IP could not be determined" when allowedIps is
   // set but no clientIp is supplied — so the gateway must pass the trusted-proxy-aware IP at connect
@@ -590,7 +667,7 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
       await jest.advanceTimersByTimeAsync(60_000);
       expect(sweep).toHaveBeenCalledTimes(2);
 
-      gateway.onModuleDestroy();
+      await gateway.onModuleDestroy();
       await jest.advanceTimersByTimeAsync(120_000);
       expect(sweep).toHaveBeenCalledTimes(2);
     } finally {
@@ -861,6 +938,32 @@ describe('EventsGateway session.qr role gate', () => {
     expect(sock.rooms.has(QR_DENIED_ROOM)).toBe(true);
     expect(qrEvents(sock)).toEqual([]);
   });
+
+  it('delivers message.receipt only to sockets that named it, never through a wildcard', async () => {
+    const wildcard = await connect('operator');
+    await subscribe(wildcard, '*', ['*']);
+    const sessionWildcard = await connect('operator');
+    await subscribe(sessionWildcard, 'sess-1', ['*']);
+    const named = await connect('operator');
+    await subscribe(named, 'sess-1', ['message.receipt']);
+    const namedAllSessions = await connect('operator');
+    await subscribe(namedAllSessions, '*', ['message.receipt']);
+
+    gateway.emitMessageReceipt('sess-1', {
+      id: 'OUT1',
+      messageId: 'OUT1',
+      chatId: '120363000000000001@g.us',
+      participant: '628222@c.us',
+      status: 'read',
+      timestamp: 1700000000,
+    });
+
+    const events = (s: RoomSocket): string[] => s.received.map(m => m.payload.event);
+    expect(events(wildcard)).toEqual([]);
+    expect(events(sessionWildcard)).toEqual([]);
+    expect(events(named)).toEqual(['message.receipt']);
+    expect(events(namedAllSessions)).toEqual(['message.receipt']);
+  });
 });
 
 describe('event catalog ⇔ emitter invariants (drift guard)', () => {
@@ -1046,7 +1149,7 @@ describe('EventsGateway rate limiting', () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '3';
       process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
       // Failed handshakes are what the window is for — an authenticated one is refunded (below).
-      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      authService.validateApiKey.mockRejectedValue(new UnauthorizedException('Invalid API key'));
       const gw = buildGateway();
 
       for (let i = 0; i < 3; i++) {
@@ -1070,7 +1173,7 @@ describe('EventsGateway rate limiting', () => {
 
     it('emits the RATE_LIMITED error frame BEFORE disconnecting, so the client can tell throttling from a dead server', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
-      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      authService.validateApiKey.mockRejectedValue(new UnauthorizedException('Invalid API key'));
       const gw = buildGateway();
 
       await gw.handleConnection(asSocket(makeSock('s1', { apiKey: 'good' })));
@@ -1109,15 +1212,50 @@ describe('EventsGateway rate limiting', () => {
       expect(authService.validateApiKey).toHaveBeenCalledTimes(6);
     });
 
+    it.each([false, true])(
+      'keeps newer failures charged after a delayed valid handshake (pruned: %s)',
+      async pruned => {
+        let now = 0;
+        let finish!: (key: unknown) => void;
+        const validation = new Promise(resolve => (finish = resolve));
+        authService.validateApiKey.mockImplementation((raw: string) =>
+          raw === 'good' ? validation : Promise.reject(new UnauthorizedException('Invalid API key')),
+        );
+        const gw = buildGateway();
+        (gw as unknown as { handshakeLimiter: SlidingWindowLimiter }).handshakeLimiter = new SlidingWindowLimiter(
+          2,
+          1000,
+          () => now,
+        );
+        const good = makeSock('good', { apiKey: 'good' });
+        const connecting = gw.handleConnection(asSocket(good));
+        now = pruned ? 1001 : 500;
+        await gw.handleConnection(asSocket(makeSock('bad-1', { apiKey: 'bad' })));
+        now = pruned ? 1002 : 600;
+        finish({ id: 'k1', name: 'k', allowedSessions: null });
+        await connecting;
+        expect(good.disconnect).not.toHaveBeenCalled();
+        expect(authService.validateApiKey).toHaveBeenCalledWith('good', '203.0.113.5');
+        now = pruned ? 1003 : 1001;
+        await gw.handleConnection(asSocket(makeSock('bad-2', { apiKey: 'bad' })));
+        const blocked = makeSock('bad-3', { apiKey: 'bad' });
+        await gw.handleConnection(asSocket(blocked));
+        expect(blocked.emit).toHaveBeenCalledWith('message', expect.objectContaining({ code: 'RATE_LIMITED' }));
+        expect(authService.validateApiKey).toHaveBeenCalledTimes(3);
+        gw.handleDisconnect(asSocket(good));
+      },
+    );
+
     it('throttles an unauthenticated handshake flood before any credential/audit work', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '2';
       const gw = buildGateway();
+      const floodIp = '203.0.113.201';
 
       // Three key-less handshakes from one IP: the first two reach the missing-key audit,
       // the third is gated by the limiter instead (no per-attempt auth failure processing).
-      await gw.handleConnection(asSocket(makeSock('a')));
-      await gw.handleConnection(asSocket(makeSock('b')));
-      await gw.handleConnection(asSocket(makeSock('c')));
+      await gw.handleConnection(asSocket(makeSock('a', {}, floodIp)));
+      await gw.handleConnection(asSocket(makeSock('b', {}, floodIp)));
+      await gw.handleConnection(asSocket(makeSock('c', {}, floodIp)));
 
       const authFailed = warnCalls().filter(([action]) => action === AuditAction.API_KEY_AUTH_FAILED);
       expect(authFailed).toHaveLength(2);
@@ -1128,7 +1266,7 @@ describe('EventsGateway rate limiting', () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
       process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
       jest.useFakeTimers();
-      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      authService.validateApiKey.mockRejectedValue(new UnauthorizedException('Invalid API key'));
       const gw = buildGateway();
 
       await gw.handleConnection(asSocket(makeSock('a', { apiKey: 'good' })));
@@ -1151,7 +1289,7 @@ describe('EventsGateway rate limiting', () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
       process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
       jest.useFakeTimers();
-      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      authService.validateApiKey.mockRejectedValue(new UnauthorizedException('Invalid API key'));
       const gw = buildGateway();
 
       await gw.handleConnection(asSocket(makeSock('a', { apiKey: 'good' }))); // allowed
@@ -1193,7 +1331,7 @@ describe('EventsGateway rate limiting', () => {
 
     it('shares the handshake window and the violation sample across a /64, keeping the real address', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
-      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      authService.validateApiKey.mockRejectedValue(new UnauthorizedException('Invalid API key'));
       const gw = buildGateway();
 
       await gw.handleConnection(asSocket(makeSock('a', { apiKey: 'good' }, '2001:db8:1:2::a')));
@@ -1367,6 +1505,637 @@ describe('EventsGateway rate limiting', () => {
       const next = makeSock('next', { apiKey: 'good' });
       await gw.handleConnection(asSocket(next));
       expect(next.disconnect).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('browser session cookie auth and CSWSH defense', () => {
+    let browserSessionService: { validateSessionToken: jest.Mock; validateSessionById: jest.Mock };
+    const savedEnv = { cors: process.env.CORS_ORIGINS, nodeEnv: process.env.NODE_ENV };
+
+    const makeCookieSock = (
+      id: string,
+      headers: Record<string, string>,
+      opts: { secure?: boolean; address?: string } = {},
+    ): MockSocket => {
+      const s: MockSocket = {
+        id,
+        handshake: {
+          headers,
+          query: {},
+          auth: {},
+          address: opts.address ?? '203.0.113.5',
+          ...(opts.secure !== undefined ? { secure: opts.secure } : {}),
+        },
+        data: {},
+        emit: jest.fn(),
+        disconnect: jest.fn(() => {
+          s.disconnected = true;
+        }),
+        join: jest.fn(),
+        leave: jest.fn(),
+        rooms: new Set<string>([id]),
+      };
+      return s;
+    };
+
+    const buildCookieGateway = () => {
+      const Ctor = EventsGateway as unknown as new (...args: unknown[]) => EventsGateway;
+      return new Ctor(authService, auditService, asConfig(), undefined, browserSessionService);
+    };
+
+    beforeEach(() => {
+      browserSessionService = {
+        validateSessionToken: jest.fn(),
+        validateSessionById: jest.fn(),
+      };
+    });
+
+    afterEach(() => {
+      if (savedEnv.cors === undefined) delete process.env.CORS_ORIGINS;
+      else process.env.CORS_ORIGINS = savedEnv.cors;
+      if (savedEnv.nodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = savedEnv.nodeEnv;
+    });
+
+    it('rejects cookie-authenticated WS handshakes missing Origin or from an untrusted Origin (CSWSH defense)', async () => {
+      process.env.NODE_ENV = 'development';
+      delete process.env.CORS_ORIGINS;
+      const gw = buildCookieGateway();
+
+      const missingOrigin = makeCookieSock('ws-no-origin', {
+        cookie: 'openwa_session=tok-1',
+        host: 'wa.example.com',
+      });
+      await gw.handleConnection(asSocket(missingOrigin));
+      expect(missingOrigin.disconnect).toHaveBeenCalledWith(true);
+      expect(browserSessionService.validateSessionToken).not.toHaveBeenCalled();
+
+      const evilOrigin = makeCookieSock('ws-evil-origin', {
+        cookie: 'openwa_session=tok-1',
+        host: 'wa.example.com',
+        origin: 'https://evil.example',
+      });
+      await gw.handleConnection(asSocket(evilOrigin));
+      expect(evilOrigin.disconnect).toHaveBeenCalledWith(true);
+      expect(browserSessionService.validateSessionToken).not.toHaveBeenCalled();
+
+      // Scheme downgrade: http:// origin on a secure (wss/https) handshake must be refused.
+      const downgradeOrigin = makeCookieSock(
+        'ws-downgrade-origin',
+        {
+          cookie: 'openwa_session=tok-1',
+          host: 'wa.example.com',
+          origin: 'http://wa.example.com',
+        },
+        { secure: true },
+      );
+      await gw.handleConnection(asSocket(downgradeOrigin));
+      expect(downgradeOrigin.disconnect).toHaveBeenCalledWith(true);
+      expect(browserSessionService.validateSessionToken).not.toHaveBeenCalled();
+
+      // Sec-Fetch-Site: cross-site or same-site without explicit CORS_ORIGINS is refused even if Origin matches Host.
+      for (const site of ['cross-site', 'same-site']) {
+        const crossSite = makeCookieSock(
+          `ws-${site}`,
+          {
+            cookie: 'openwa_session=tok-1',
+            host: 'wa.example.com',
+            origin: 'https://wa.example.com',
+            'sec-fetch-site': site,
+          },
+          { secure: true },
+        );
+        await gw.handleConnection(asSocket(crossSite));
+        expect(crossSite.disconnect).toHaveBeenCalledWith(true);
+      }
+
+      // Origin-less polling handshake with Sec-Fetch-Site: same-origin but foreign/downgraded Referer is refused.
+      const foreignReferer = makeCookieSock('ws-foreign-referer', {
+        cookie: 'openwa_session=tok-1',
+        host: 'wa.example.com',
+        'sec-fetch-site': 'same-origin',
+        referer: 'https://evil.example/sessions',
+      });
+      await gw.handleConnection(asSocket(foreignReferer));
+      expect(foreignReferer.disconnect).toHaveBeenCalledWith(true);
+
+      const downgradedReferer = makeCookieSock(
+        'ws-downgraded-referer',
+        {
+          cookie: 'openwa_session=tok-1',
+          host: 'wa.example.com',
+          referer: 'http://wa.example.com/sessions',
+        },
+        { secure: true },
+      );
+      await gw.handleConnection(asSocket(downgradedReferer));
+      expect(downgradedReferer.disconnect).toHaveBeenCalledWith(true);
+      expect(browserSessionService.validateSessionToken).not.toHaveBeenCalled();
+    });
+
+    it('accepts Origin-less same-origin Socket.IO polling cookie handshakes verified by Sec-Fetch-Site or Referer', async () => {
+      const key = {
+        id: 'k-cookie-poll',
+        name: 'Cookie Poll Key',
+        role: 'admin',
+        isActive: true,
+        allowedSessions: null,
+        allowedChats: null,
+        allowedIps: null,
+        expiresAt: null,
+      };
+      browserSessionService.validateSessionToken.mockResolvedValue({
+        session: { id: 'bs-poll', apiKeyId: 'k-cookie-poll' },
+        apiKey: key,
+      });
+
+      const gw = buildCookieGateway();
+
+      // Modern browser HTTP long-polling GET omits Origin and sends Sec-Fetch-Site: same-origin + Referer.
+      const pollingWithReferer = makeCookieSock('ws-poll-sfs-ref', {
+        cookie: 'openwa_session=tok-poll',
+        host: '127.0.0.1:2785',
+        'sec-fetch-site': 'same-origin',
+        referer: 'http://127.0.0.1:2785/sessions',
+      });
+      await gw.handleConnection(asSocket(pollingWithReferer));
+      expect(pollingWithReferer.disconnect).not.toHaveBeenCalled();
+      expect(pollingWithReferer.data.browserSessionId).toBe('bs-poll');
+
+      // Modern browser with Referrer-Policy: no-referrer omits both Origin and Referer, sending Sec-Fetch-Site: same-origin.
+      const pollingNoReferer = makeCookieSock('ws-poll-sfs-only', {
+        cookie: 'openwa_session=tok-poll',
+        host: '127.0.0.1:2785',
+        'sec-fetch-site': 'same-origin',
+      });
+      await gw.handleConnection(asSocket(pollingNoReferer));
+      expect(pollingNoReferer.disconnect).not.toHaveBeenCalled();
+
+      // Older browser without Fetch Metadata omits Origin and Sec-Fetch-Site, sending same-origin Referer.
+      const legacyPolling = makeCookieSock('ws-poll-legacy-ref', {
+        cookie: 'openwa_session=tok-poll',
+        host: 'wa.example.com',
+        referer: 'https://wa.example.com/sessions',
+      });
+      await gw.handleConnection(asSocket(legacyPolling));
+      expect(legacyPolling.disconnect).not.toHaveBeenCalled();
+    });
+
+    it('authenticates same-origin cookie WS without storing raw keys, re-validates via validateSessionById, and supports evictBrowserSession', async () => {
+      const key = {
+        id: 'k-cookie',
+        name: 'Cookie Key',
+        role: 'admin',
+        isActive: true,
+        allowedSessions: null,
+        allowedChats: null,
+        allowedIps: null,
+        expiresAt: null,
+      };
+      browserSessionService.validateSessionToken.mockResolvedValue({
+        session: { id: 'bs-42', apiKeyId: 'k-cookie' },
+        apiKey: key,
+      });
+      browserSessionService.validateSessionById.mockResolvedValue({
+        session: { id: 'bs-42', apiKeyId: 'k-cookie' },
+        apiKey: key,
+      });
+
+      const gw = buildCookieGateway();
+      const sock = makeCookieSock(
+        'ws-ok',
+        {
+          cookie: 'openwa_session=tok-1',
+          host: 'wa.example.com:443',
+          origin: 'https://wa.example.com',
+        },
+        { secure: true },
+      );
+
+      await gw.handleConnection(asSocket(sock));
+      expect(sock.disconnect).not.toHaveBeenCalled();
+      expect(sock.data.browserSessionId).toBe('bs-42');
+      expect(sock.data.apiKeyId).toBe('k-cookie');
+      expect(sock.data.rawApiKey).toBeUndefined();
+
+      const subRes = await gw.handleMessage(asSocket(sock), {
+        type: 'subscribe',
+        sessionId: 's1',
+        events: ['session.status'],
+        requestId: 'r1',
+      } as unknown as WSClientMessage);
+      expect(subRes).toEqual(expect.objectContaining({ type: 'subscribed', sessionId: 's1' }));
+      expect(browserSessionService.validateSessionById).toHaveBeenCalledWith('bs-42', '203.0.113.5');
+
+      // Evicting the browser session disconnects the bound socket immediately.
+      (gw as unknown as { evictBrowserSession: (id: string) => void }).evictBrowserSession('bs-42');
+      expect(sock.disconnect).toHaveBeenCalledWith(true);
+
+      // Behind a trusted reverse proxy rewriting Host -> upstream and forwarding X-Forwarded-Host + X-Forwarded-Proto:
+      const savedProxies = process.env.TRUSTED_PROXIES;
+      delete process.env.TRUSTED_PROXIES;
+      try {
+        // Standard TLS-terminating reverse proxy over plain HTTP without TRUSTED_PROXIES configured:
+        const plainHttpBehindTlsProxy = makeCookieSock(
+          'ws-tls-proxy-default',
+          {
+            cookie: 'openwa_session=tok-1',
+            host: 'wa.example.com',
+            origin: 'https://wa.example.com',
+          },
+          { secure: false, address: '172.18.0.2' },
+        );
+        await gw.handleConnection(asSocket(plainHttpBehindTlsProxy));
+        expect(plainHttpBehindTlsProxy.disconnect).not.toHaveBeenCalled();
+
+        process.env.TRUSTED_PROXIES = '10.0.0.1';
+        const proxiedSock = makeCookieSock(
+          'ws-proxied',
+          {
+            cookie: 'openwa_session=tok-1',
+            host: 'openwa-backend:2785',
+            'x-forwarded-host': 'public.example.com:443',
+            'x-forwarded-proto': 'http, https',
+            origin: 'https://public.example.com',
+          },
+          { secure: false, address: '10.0.0.1' },
+        );
+        await gw.handleConnection(asSocket(proxiedSock));
+        expect(proxiedSock.disconnect).not.toHaveBeenCalled();
+
+        // Trusted proxy announcing HTTPS still refuses plain http:// downgrade Origin.
+        const proxiedDowngradeSock = makeCookieSock(
+          'ws-proxied-downgrade',
+          {
+            cookie: 'openwa_session=tok-1',
+            host: 'wa.example.com',
+            'x-forwarded-proto': 'https',
+            origin: 'http://wa.example.com',
+          },
+          { secure: false, address: '10.0.0.1' },
+        );
+        await gw.handleConnection(asSocket(proxiedDowngradeSock));
+        expect(proxiedDowngradeSock.disconnect).toHaveBeenCalledWith(true);
+      } finally {
+        if (savedProxies === undefined) delete process.env.TRUSTED_PROXIES;
+        else process.env.TRUSTED_PROXIES = savedProxies;
+      }
+    });
+
+    it('disconnects cookie-authenticated sockets during sweep when validateSessionById rejects', async () => {
+      const key = {
+        id: 'k-cookie',
+        name: 'Cookie Key',
+        role: 'admin',
+        isActive: true,
+        allowedSessions: null,
+        allowedChats: null,
+        allowedIps: null,
+        expiresAt: null,
+      };
+      (authService as unknown as { findAuthorizationStates: jest.Mock }).findAuthorizationStates = jest
+        .fn()
+        .mockResolvedValue([key]);
+      browserSessionService.validateSessionToken.mockResolvedValue({
+        session: { id: 'bs-99', apiKeyId: 'k-cookie' },
+        apiKey: key,
+      });
+      browserSessionService.validateSessionById.mockRejectedValue(
+        new UnauthorizedException('Session has been revoked'),
+      );
+
+      const gw = buildCookieGateway();
+      const sock = makeCookieSock(
+        'ws-sweep',
+        {
+          cookie: 'openwa_session=tok-99',
+          host: 'wa.example.com',
+          origin: 'https://wa.example.com',
+        },
+        { secure: true },
+      );
+      await gw.handleConnection(asSocket(sock));
+      expect(sock.disconnect).not.toHaveBeenCalled();
+
+      await (gw as unknown as { sweepApiKeyAuthorization: () => Promise<void> }).sweepApiKeyAuthorization();
+      expect(browserSessionService.validateSessionById).toHaveBeenCalledWith('bs-99', '203.0.113.5', undefined, {
+        recordUsage: false,
+      });
+      expect(sock.disconnect).toHaveBeenCalledWith(true);
+    });
+
+    it('stores browserSessionExpiresAt on client.data, enforces offline expiry even if findAuthorizationStates throws, and batch-queries browser_sessions via In(sessionIds)', async () => {
+      const ds = new DataSource({
+        type: 'better-sqlite3',
+        database: ':memory:',
+        entities: [BrowserSession],
+        synchronize: true,
+      });
+      await ds.initialize();
+      try {
+        const bsRepo = ds.getRepository(BrowserSession);
+        const now = Date.now();
+        await bsRepo.save([
+          {
+            id: 'bs-active',
+            tokenHash: 'h1',
+            apiKeyId: 'k-cookie',
+            createdAt: new Date(now - 60_000),
+            expiresAt: new Date(now + 600_000),
+            revokedAt: null,
+          },
+          {
+            id: 'bs-revoked',
+            tokenHash: 'h2',
+            apiKeyId: 'k-cookie',
+            createdAt: new Date(now - 60_000),
+            expiresAt: new Date(now + 600_000),
+            revokedAt: new Date(now - 1_000),
+          },
+          {
+            id: 'bs-offline-exp',
+            tokenHash: 'h3',
+            apiKeyId: 'k-cookie',
+            createdAt: new Date(now - 60_000),
+            expiresAt: new Date(now + 10_000),
+            revokedAt: null,
+          },
+        ]);
+
+        const key = {
+          id: 'k-cookie',
+          name: 'Cookie Key',
+          role: 'admin',
+          isActive: true,
+          allowedSessions: null,
+          allowedChats: null,
+          allowedIps: null,
+          expiresAt: null,
+        };
+        const findAuthSpy = jest.fn().mockRejectedValue(new Error('sqlite busy'));
+        (authService as unknown as { findAuthorizationStates: jest.Mock }).findAuthorizationStates = findAuthSpy;
+        browserSessionService.validateSessionToken
+          .mockResolvedValueOnce({
+            session: { id: 'bs-active', apiKeyId: 'k-cookie', expiresAt: new Date(now + 600_000) },
+            apiKey: key,
+          })
+          .mockResolvedValueOnce({
+            session: { id: 'bs-revoked', apiKeyId: 'k-cookie', expiresAt: new Date(now + 600_000) },
+            apiKey: key,
+          })
+          .mockResolvedValueOnce({
+            session: { id: 'bs-offline-exp', apiKeyId: 'k-cookie', expiresAt: new Date(now + 10_000) },
+            apiKey: key,
+          });
+
+        const Ctor = EventsGateway as unknown as new (...args: unknown[]) => EventsGateway;
+        const gw = new Ctor(
+          authService,
+          auditService,
+          asConfig(),
+          new ChatScopeService(),
+          browserSessionService,
+          undefined,
+          undefined,
+          ds,
+        );
+
+        const sActive = makeCookieSock(
+          's-active',
+          {
+            cookie: 'openwa_session=t1',
+            host: 'wa.example.com',
+            origin: 'https://wa.example.com',
+          },
+          { secure: true },
+        );
+        const sRevoked = makeCookieSock(
+          's-revoked',
+          {
+            cookie: 'openwa_session=t2',
+            host: 'wa.example.com',
+            origin: 'https://wa.example.com',
+          },
+          { secure: true },
+        );
+        const sExpired = makeCookieSock(
+          's-exp',
+          {
+            cookie: 'openwa_session=t3',
+            host: 'wa.example.com',
+            origin: 'https://wa.example.com',
+          },
+          { secure: true },
+        );
+
+        await gw.handleConnection(asSocket(sActive));
+        await gw.handleConnection(asSocket(sRevoked));
+        await gw.handleConnection(asSocket(sExpired));
+        expect(sExpired.data.browserSessionExpiresAt).toEqual(new Date(now + 10_000));
+
+        const findSpy = jest.spyOn(bsRepo, 'find');
+        const findBySpy = jest.spyOn(bsRepo, 'findBy');
+        await (gw as unknown as { sweepApiKeyAuthorization: (ts?: number) => Promise<void> }).sweepApiKeyAuthorization(
+          now + 20_000,
+        );
+
+        // Must enforce offline expiry + batch query even though findAuthorizationStates threw!
+        expect(sExpired.disconnect).toHaveBeenCalledWith(true);
+        expect(sRevoked.disconnect).toHaveBeenCalledWith(true);
+        expect(sActive.disconnect).not.toHaveBeenCalled();
+        expect(browserSessionService.validateSessionById).not.toHaveBeenCalled();
+        expect(findSpy.mock.calls.length + findBySpy.mock.calls.length).toBe(1);
+      } finally {
+        await ds.destroy();
+      }
+    });
+
+    it('throttles audit rows for unauthenticated WS handshake failures via allowUnauthenticatedAuditRow', async () => {
+      const savedMax = process.env.WS_RATE_LIMIT_HANDSHAKE_MAX;
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '100';
+      const gw = buildCookieGateway();
+      const isolatedIp = '198.51.100.77';
+      try {
+        for (let i = 0; i < 15; i++) {
+          const sock = makeCookieSock(`ws-anon-${i}`, { host: 'wa.example.com' }, { address: isolatedIp });
+          await gw.handleConnection(asSocket(sock));
+          expect(sock.disconnect).toHaveBeenCalledWith(true);
+        }
+        // allowUnauthenticatedAuditRow allows up to 10 rows per IP per minute; the rest are dropped.
+        const authFailedRows = auditService.logWarn.mock.calls.filter(
+          ([action]) => action === AuditAction.API_KEY_AUTH_FAILED,
+        );
+        expect(authFailedRows.length).toBeLessThanOrEqual(10);
+      } finally {
+        if (savedMax === undefined) delete process.env.WS_RATE_LIMIT_HANDSHAKE_MAX;
+        else process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = savedMax;
+      }
+    });
+
+    it('bounds chatDeliveries queue depth per chat with a rate-limited warning when identity lookup stalls', async () => {
+      const savedRedis = process.env.REDIS_ENABLED;
+      process.env.REDIS_ENABLED = 'true';
+      const warnSpy = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        let releaseLookup!: () => void;
+        const slowScope = new ChatScopeService({
+          phonesForLidsPersisted: jest.fn().mockResolvedValue({}),
+          lidsForPhonesPersisted: jest.fn(
+            () =>
+              new Promise<Record<string, string[]>>(res => {
+                releaseLookup = () => res({ '628111000111': ['111'] });
+              }),
+          ),
+        } as never);
+        const Ctor = EventsGateway as unknown as new (...args: unknown[]) => EventsGateway;
+        const gw = new Ctor(authService, auditService, asConfig(), slowScope);
+        const { server, emit } = makeCapturingServer();
+        (gw as unknown as { server: unknown }).server = server;
+        // Mark local restricted socket so emitToRooms enqueues into chatDeliveries.
+        const restrictedSock = makeCookieSock('ws-r', {});
+        restrictedSock.data.apiKey = {
+          id: 'k-r',
+          name: 'r',
+          role: 'viewer',
+          allowedSessions: null,
+          allowedChats: ['628111000111@c.us'],
+        };
+        (gw as unknown as { socketsByKeyId: Map<string, Set<Socket>> }).socketsByKeyId.set(
+          'k-r',
+          new Set([asSocket(restrictedSock)]),
+        );
+
+        for (let i = 0; i < 150; i++) {
+          gw.emitMessage('sess-stall', { chatId: '628111000111@c.us', id: `m-${i}` });
+        }
+
+        const queues = (gw as unknown as { chatDeliveries: Map<string, unknown[]> }).chatDeliveries;
+        const queueDepth =
+          queues.size > 0 ? Math.max(...[...queues.values()].map(q => (Array.isArray(q) ? q.length : 1))) : 0;
+        expect(queueDepth).toBeLessThanOrEqual(64);
+        expect(warnSpy).toHaveBeenCalled();
+
+        releaseLookup?.();
+        await new Promise(resolve => setImmediate(resolve));
+        expect(emit).toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+        if (savedRedis === undefined) delete process.env.REDIS_ENABLED;
+        else process.env.REDIS_ENABLED = savedRedis;
+      }
+    });
+
+    it('reports per-session depth cap accurately when session queue limit triggers across chats', async () => {
+      const savedRedis = process.env.REDIS_ENABLED;
+      process.env.REDIS_ENABLED = 'true';
+      const warnSpy = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        let releaseLookup!: () => void;
+        const slowScope = new ChatScopeService({
+          phonesForLidsPersisted: jest.fn().mockResolvedValue({}),
+          lidsForPhonesPersisted: jest.fn(
+            () =>
+              new Promise<Record<string, string[]>>(res => {
+                releaseLookup = () => res({ '628111000111': ['111'] });
+              }),
+          ),
+        } as never);
+        const Ctor = EventsGateway as unknown as new (...args: unknown[]) => EventsGateway;
+        const gw = new Ctor(authService, auditService, asConfig(), slowScope);
+        const { server } = makeCapturingServer();
+        (gw as unknown as { server: unknown }).server = server;
+        const restrictedSock = makeCookieSock('ws-r', {});
+        restrictedSock.data.apiKey = {
+          id: 'k-r',
+          name: 'r',
+          role: 'viewer',
+          allowedSessions: null,
+          allowedChats: ['628111000111@c.us'],
+        };
+        (gw as unknown as { socketsByKeyId: Map<string, Set<Socket>> }).socketsByKeyId.set(
+          'k-r',
+          new Set([asSocket(restrictedSock)]),
+        );
+
+        // Emit 1026 unique chats: item 0 is shifted immediately by the active drain,
+        // leaving 1024 queued items when item 1025 arrives and triggers the session cap.
+        for (let i = 0; i < 1026; i++) {
+          gw.emitMessage('sess-cap', { chatId: `628111${String(i).padStart(6, '0')}@c.us`, id: `m-${i}` });
+        }
+
+        expect(warnSpy).toHaveBeenCalledWith(
+          'Dropped oldest queued WebSocket chat delivery at per-session depth cap',
+          expect.objectContaining({
+            scope: 'session',
+            maxQueued: 1024,
+          }),
+        );
+
+        await gw.onModuleDestroy();
+        releaseLookup?.();
+        await new Promise(resolve => setImmediate(resolve));
+      } finally {
+        warnSpy.mockRestore();
+        if (savedRedis === undefined) delete process.env.REDIS_ENABLED;
+        else process.env.REDIS_ENABLED = savedRedis;
+      }
+    });
+
+    it('guards against late emits and prevents drainChatDeliveries restart after onModuleDestroy()', async () => {
+      const savedRedis = process.env.REDIS_ENABLED;
+      process.env.REDIS_ENABLED = 'true';
+      try {
+        let releaseLookup!: () => void;
+        const lidsForPhonesPersisted = jest.fn(
+          () =>
+            new Promise<Record<string, string[]>>(res => {
+              releaseLookup = () => res({ '628111000111': ['111'] });
+            }),
+        );
+        const slowScope = new ChatScopeService({
+          phonesForLidsPersisted: jest.fn().mockResolvedValue({}),
+          lidsForPhonesPersisted,
+        } as never);
+        const Ctor = EventsGateway as unknown as new (...args: unknown[]) => EventsGateway;
+        const gw = new Ctor(authService, auditService, asConfig(), slowScope);
+        const { server, emit } = makeCapturingServer();
+        (gw as unknown as { server: unknown }).server = server;
+        const restrictedSock = makeCookieSock('ws-r', {});
+        restrictedSock.data.apiKey = {
+          id: 'k-r',
+          name: 'r',
+          role: 'viewer',
+          allowedSessions: null,
+          allowedChats: ['628111000111@c.us'],
+        };
+        (gw as unknown as { socketsByKeyId: Map<string, Set<Socket>> }).socketsByKeyId.set(
+          'k-r',
+          new Set([asSocket(restrictedSock)]),
+        );
+
+        gw.emitMessage('sess-destroy', { chatId: '628111000111@c.us', id: 'm-inflight' });
+        emit.mockClear();
+        await gw.onModuleDestroy();
+
+        // Simulate queued leftovers appearing concurrently before in-flight lookup resolves.
+        const deliveries = (gw as unknown as { chatDeliveries: Map<string, unknown[]> }).chatDeliveries;
+        deliveries.set('sess-destroy', [
+          { chatId: 'x', sessionId: 'sess-destroy', event: 'message', eventMessage: {} },
+        ]);
+
+        releaseLookup?.();
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Post-destroy emits must be ignored and in-flight drains must not emit or restart.
+        gw.emitMessage('sess-destroy', { chatId: '628111000111@c.us', id: 'm-after' });
+        expect(lidsForPhonesPersisted).toHaveBeenCalledTimes(1);
+        expect(emit).not.toHaveBeenCalled();
+        expect(deliveries.size).toBe(0);
+        expect((gw as unknown as { chatDeliveryActive: Set<string> }).chatDeliveryActive.size).toBe(0);
+      } finally {
+        if (savedRedis === undefined) delete process.env.REDIS_ENABLED;
+        else process.env.REDIS_ENABLED = savedRedis;
+      }
     });
   });
 });

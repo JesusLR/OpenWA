@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, type RefObject } from 'react';
+import { useState, useEffect, useMemo, useRef, useContext, type RefObject } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import {
   useTable,
@@ -35,6 +35,8 @@ import { PageHeader } from '../components/PageHeader';
 import { Modal } from '../components/Modal';
 import { SessionScopePicker } from '../components/SessionScopePicker';
 import { useToast } from '../hooks/useToast';
+import { RoleContext } from '../hooks/useRole';
+import { getActiveApiKeyId } from '../utils/authLifecycle';
 import { copyToClipboard } from '../utils/clipboard';
 import { captionLength } from '../utils/bulkMedia';
 import {
@@ -58,11 +60,8 @@ const roleNames = ['admin', 'operator', 'viewer'] as const;
 
 const emptyKeyForm = { name: '', role: 'operator', allowedSessions: [] as string[], ips: '', chats: '', expires: '' };
 
-// The key this dashboard signed in with: the list only carries each key's prefix, which is the first
-// 12 characters of the raw key.
-function isSignedInKey(apiKey: ApiKey): boolean {
-  return !!apiKey.keyPrefix && !!sessionStorage.getItem('openwa_api_key')?.startsWith(apiKey.keyPrefix);
-}
+// What the gateway lists for the key seeded from API_MASTER_KEY: its first characters are secret, so none is shown.
+const MASTER_KEY_PREFIX = '(master key)';
 
 // The first IP or chat line the gateway would refuse, so the form can name it instead of the bare
 // "Bad Request" a production gateway answers with. On an edit, a list left as stored is not sent (see
@@ -127,6 +126,7 @@ function KeyLimitFields({
   // A datetime-local with a blank segment reports value '', like an empty field, so only badInput says
   // there are leftover segments to clear.
   const [partialExpiry, setPartialExpiry] = useState(false);
+  const lidHintId = normalizeChatScope(chats).some(entry => /@lid$/i.test(entry)) ? `${idPrefix}-chats-lid` : undefined;
   return (
     <>
       <label htmlFor={`${idPrefix}-ips`}>{t('apiKeys.ips.label')}</label>
@@ -153,6 +153,7 @@ function KeyLimitFields({
             spellCheck={false}
             value={chats}
             disabled={disabled}
+            aria-describedby={lidHintId}
             onChange={e => onChange({ chats: e.target.value })}
           />
           {errors.chat !== null && (
@@ -166,6 +167,11 @@ function KeyLimitFields({
             </span>
           )}
           <span className="key-field-hint">{t('apiKeys.chats.hint')}</span>
+          {lidHintId && (
+            <span id={lidHintId} className="key-field-hint">
+              {t('apiKeys.chats.lidHint')}
+            </span>
+          )}
         </>
       )}
       <label htmlFor={`${idPrefix}-expires`}>{t('apiKeys.expiry.label')}</label>
@@ -244,6 +250,11 @@ export function ApiKeys() {
     null,
   );
 
+  const confirmKey = confirmAction ? apiKeys.find(key => key.id === confirmAction.id) : undefined;
+  const roleContext = useContext(RoleContext);
+  const signedInApiKeyId = roleContext?.apiKeyId !== undefined ? roleContext.apiKeyId : getActiveApiKeyId();
+  const isSignedInKey = (apiKey: ApiKey): boolean => Boolean(signedInApiKeyId && apiKey.id === signedInApiKeyId);
+
   const windowWidth = useWindowSize();
   const isMobile = windowWidth <= 768;
   const isSmall = windowWidth < 640;
@@ -257,6 +268,8 @@ export function ApiKeys() {
     setShowModal(false);
     setCreatedKey(null);
     setNewKey(emptyKeyForm);
+    // The answer holds the plaintext key too; drop it with the dialog.
+    createMutation.reset();
   };
 
   // A datetime-local with a blank segment reports an empty value, the same as no expiry at all, and
@@ -291,18 +304,23 @@ export function ApiKeys() {
     }
   };
 
+  const editVisit = useRef<object | null>(null);
+
   const openEdit = (apiKey: ApiKey) => {
+    editVisit.current = {};
     setEditingKey(apiKey);
     setEditDraft(apiKeyDraft(apiKey));
   };
 
   const closeEdit = () => {
+    editVisit.current = null;
     setEditingKey(null);
     setEditDraft(null);
   };
 
   const handleSave = async () => {
     if (!editingKey || !editDraft || !canSave) return;
+    const visit = editVisit.current;
     // A stored expiry left as it is is not sent (see apiKeyPatch), so one past this browser's max (set
     // from another time zone or through the API) does not block an unrelated change.
     const expiryUntouched = editDraft.expires !== '' && editDraft.expires === toDateTimeLocal(editingKey.expiresAt);
@@ -318,7 +336,7 @@ export function ApiKeys() {
         return;
       }
       await updateMutation.mutateAsync({ id: editingKey.id, data });
-      closeEdit();
+      if (editVisit.current === visit) closeEdit();
     } catch (err) {
       console.error('Failed to update key:', err);
       toast.error(t('apiKeys.edit.title'), err instanceof Error ? err.message : t('common.unknownError'));
@@ -372,7 +390,7 @@ export function ApiKeys() {
     if (await copyToClipboard(text)) {
       setCopied(id);
       setTimeout(() => setCopied(null), 2000);
-    }
+    } else toast.error(t('common.copyFailed'));
   };
 
   const columns = useMemo(
@@ -388,13 +406,19 @@ export function ApiKeys() {
           // The list carries only the prefix: the full key exists once, in the post-creation modal.
           cell: info => (
             <span className="key-cell">
-              <code>{info.getValue()}****</code>
+              {/* The bootstrap key seeded from API_MASTER_KEY carries a marker, not a prefix: nothing to mask. */}
+              <code>{info.getValue() === MASTER_KEY_PREFIX ? info.getValue() : `${info.getValue()}****`}</code>
             </span>
           ),
         }),
         columnHelper.accessor('role', {
           header: () => t('apiKeys.columns.role'),
-          cell: info => <span className="permission-badge">{info.getValue()}</span>,
+          // The list keys on the API value; the badge names it as the role selects below do.
+          cell: info => (
+            <span className="permission-badge">
+              {t(`apiKeys.roles.${info.getValue()}`, { defaultValue: info.getValue() })}
+            </span>
+          ),
         }),
         columnHelper.accessor('allowedSessions', {
           id: 'sessions',
@@ -549,13 +573,18 @@ export function ApiKeys() {
         <Modal
           open
           // The key exists once the request lands, and its secret is shown only here, so the modal
-          // cannot be dismissed until the request settles.
-          onClose={createMutation.isPending ? () => {} : closeCreateModal}
-          hideCloseButton={createMutation.isPending}
+          // cannot be dismissed until the request settles. Once shown, an Escape or a click beside the
+          // dialog must not lose it either: it closes only on its own Close button.
+          onClose={createMutation.isPending || createdKey ? () => {} : closeCreateModal}
+          hideCloseButton={createMutation.isPending || !!createdKey}
           title={createdKey ? t('apiKeys.createdTitle') : t('apiKeys.modalTitle')}
           closeLabel={t('common.close')}
           footer={
-            !createdKey ? (
+            createdKey ? (
+              <button className="btn-primary" onClick={closeCreateModal}>
+                {t('common.close')}
+              </button>
+            ) : (
               <>
                 <button className="btn-secondary" onClick={closeCreateModal} disabled={createMutation.isPending}>
                   {t('common.cancel')}
@@ -564,7 +593,7 @@ export function ApiKeys() {
                   {createMutation.isPending ? <Loader2 className="animate-spin" size={16} /> : t('common.create')}
                 </button>
               </>
-            ) : undefined
+            )
           }
         >
           {createdKey ? (
@@ -575,14 +604,19 @@ export function ApiKeys() {
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    background: 'var(--bg-secondary)',
+                    background: 'var(--bg-light)',
                     borderRadius: '6px',
                     wordBreak: 'break-all',
                   }}
                 >
                   {createdKey}
                 </code>
-                <button className="btn-primary" onClick={() => void handleCopy(createdKey, 'modal')}>
+                <button
+                  className="btn-primary"
+                  onClick={() => void handleCopy(createdKey, 'modal')}
+                  aria-label={t('apiKeys.copyKey')}
+                  title={t('apiKeys.copyKey')}
+                >
                   {copied === 'modal' ? <Check size={16} /> : <Copy size={16} />}
                 </button>
               </div>
@@ -799,15 +833,20 @@ export function ApiKeys() {
               i18nKey={
                 confirmAction.type === 'delete' ? 'apiKeys.confirm.deleteMessage' : 'apiKeys.confirm.revokeMessage'
               }
-              values={{ name: confirmAction.name }}
-              components={{ strong: <strong /> }}
-              // The key's name is free text. Without escaping, a name carrying markup became elements of the
-              // message: a styled tag handed React a string for `style`, which throws and took the whole page
-              // down. Escaped on interpolation and unescaped for display, it stays the text it was typed as.
-              tOptions={{ interpolation: { escapeValue: true } }}
-              shouldUnescape
+              // The key's name is free text, so it is a child of the message and not a value interpolated into it:
+              // as a value it was interpolated a second time (a name that held braces came back inside itself) and,
+              // unescaped, markup in it became elements of the message. As a child it is always the text it was
+              // typed as.
+              components={{ name: <strong>{confirmAction.name}</strong> }}
             />
           </p>
+          {/* Revoking or deleting the key this dashboard is signed in with ends the session at its next request. */}
+          {confirmKey && isSignedInKey(confirmKey) && (
+            <p className="key-signed-in-warning" role="note">
+              <AlertTriangle size={16} />
+              {t('apiKeys.confirm.signedIn')}
+            </p>
+          )}
         </Modal>
       )}
     </div>

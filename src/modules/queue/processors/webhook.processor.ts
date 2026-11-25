@@ -37,6 +37,9 @@ export interface WebhookJobResult {
  */
 const STALL_EXHAUSTION_MESSAGE = 'job stalled more than allowable limit';
 
+/** Upper bound on in-memory degraded-receiver tracking so churned webhook ids cannot grow memory without bound. */
+export const FAILING_WEBHOOKS_MAX = 10_000;
+
 /** Per-attempt delivery context threaded through the process() pipeline stages (was closure state). */
 interface WebhookDeliveryContext {
   job: Job<WebhookJobData>;
@@ -191,10 +194,20 @@ export class WebhookProcessor extends WorkerHost {
         responseTime,
       };
     } catch (error) {
-      this.failingWebhooks.add(webhookId);
+      this.markFailingWebhook(webhookId);
       await this.recordDeliveryFailure(ctx, error);
       // Re-throw to trigger BullMQ retry
       throw error;
+    }
+  }
+
+  private markFailingWebhook(webhookId: string): void {
+    this.failingWebhooks.delete(webhookId);
+    this.failingWebhooks.add(webhookId);
+    while (this.failingWebhooks.size > FAILING_WEBHOOKS_MAX) {
+      const oldest = this.failingWebhooks.values().next().value;
+      if (oldest === undefined) break;
+      this.failingWebhooks.delete(oldest);
     }
   }
 
@@ -336,13 +349,20 @@ export class WebhookProcessor extends WorkerHost {
         lastStatusCode: statusCodeFromError(errorMessage),
         lastError: clientError,
         // The producer attaches the pre-hook event data only while payload retention is on.
-        ...(this.configService.get<number>('webhook.failurePayloadRetentionHours', 0) > 0 && job.data.replayData
-          ? { payload: job.data.replayData }
-          : {}),
+        ...this.failurePayload(job.data.replayData),
       });
       if (recorded !== false) incrementWebhookDeliveryFailures();
       if (recorded !== null) await this.outbox.close(webhookId, payload.idempotencyKey, 'dispatched');
     }
+  }
+
+  /** The event data a terminal failure row keeps for a redrive, with the window it is kept for. */
+  private failurePayload(replayData: WebhookJobData['replayData']): {
+    payload?: Record<string, unknown>;
+    payloadRetentionHours?: number;
+  } {
+    const hours = this.configService.get<number>('webhook.failurePayloadRetentionHours', 0);
+    return hours > 0 && replayData ? { payload: replayData, payloadRetentionHours: hours } : {};
   }
 
   /**
@@ -357,7 +377,9 @@ export class WebhookProcessor extends WorkerHost {
    */
   @OnWorkerEvent('failed')
   async onWorkerFailed(job: Job<WebhookJobData> | undefined, error: Error): Promise<void> {
-    if (!job || error.message !== STALL_EXHAUSTION_MESSAGE) {
+    // The sentinel text alone is not proof: a failed attempt whose error reads the same is retried and is not
+    // this. BullMQ marks a job it fails for stalling by storing the reason as its deferred failure.
+    if (!job || job.deferredFailure !== STALL_EXHAUSTION_MESSAGE || error.message !== STALL_EXHAUSTION_MESSAGE) {
       return;
     }
 
@@ -371,6 +393,8 @@ export class WebhookProcessor extends WorkerHost {
     try {
       const current = await this.loadDeliverableWebhook(webhookId, event, sessionId);
       if (!current) {
+        this.failingWebhooks.delete(webhookId);
+        await this.outbox.close(webhookId, payload.idempotencyKey, 'dispatched');
         return;
       }
       url = current.url;
@@ -413,9 +437,7 @@ export class WebhookProcessor extends WorkerHost {
       attempts: Math.max(1, job.attemptsMade),
       lastStatusCode: null, // no HTTP exchange completed on the stalled attempts
       lastError: error.message,
-      ...(this.configService.get<number>('webhook.failurePayloadRetentionHours', 0) > 0 && job.data.replayData
-        ? { payload: job.data.replayData }
-        : {}),
+      ...this.failurePayload(job.data.replayData),
     });
     if (recorded !== false) incrementWebhookDeliveryFailures();
     if (recorded !== null) await this.outbox.close(webhookId, payload.idempotencyKey, 'dispatched');

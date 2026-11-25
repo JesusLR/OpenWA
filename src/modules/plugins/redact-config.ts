@@ -12,18 +12,18 @@ const isPlainObject = (v: unknown): v is Record<string, unknown> =>
 /**
  * Redact one value against its field. Recurses into nested objects and into each row of an
  * array-of-rows so a `secret`-flagged field at any depth is masked. An empty/absent secret is left
- * as-is so the mask never implies a secret that isn't set.
+ * as-is so the mask never implies a secret that isn't set, unless `maskAbsent` masks it too.
  */
-function redactValue(value: unknown, field: PluginConfigField): unknown {
+function redactValue(value: unknown, field: PluginConfigField, maskAbsent = false): unknown {
   // Mask a `secret` field BEFORE descending into its structure: a whole object/array marked secret
   // (e.g. a credentials object or a list of keys) must be masked as one unit, not recursed into —
   // otherwise its non-secret children leak verbatim. Scalar secrets are masked here too.
-  if (field.secret && isMeaningful(value)) return SECRET_SENTINEL;
+  if (field.secret && (maskAbsent || isMeaningful(value))) return SECRET_SENTINEL;
   if (field.type === 'object' && field.properties && isPlainObject(value)) {
-    return redactObject(value, field.properties);
+    return redactObject(value, field.properties, maskAbsent);
   }
   if (field.type === 'array' && field.items && Array.isArray(value)) {
-    return value.map(item => redactValue(item, field.items as PluginConfigField));
+    return value.map(item => redactValue(item, field.items as PluginConfigField, maskAbsent));
   }
   return value;
 }
@@ -31,10 +31,11 @@ function redactValue(value: unknown, field: PluginConfigField): unknown {
 function redactObject(
   config: Record<string, unknown>,
   properties: Record<string, PluginConfigField>,
+  maskAbsent = false,
 ): Record<string, unknown> {
   const out = { ...config };
   for (const [key, field] of Object.entries(properties)) {
-    if (key in out) out[key] = redactValue(out[key], field);
+    if (key in out || (maskAbsent && field.secret)) out[key] = redactValue(out[key], field, maskAbsent);
   }
   return out;
 }
@@ -87,6 +88,25 @@ function elementSignature(value: unknown, field: PluginConfigField): string {
   return stableStringify(redactValue(value, field));
 }
 
+/**
+ * An array element's content with every secret set aside, even one the element leaves out: a row whose secret was
+ * cleared, typed over or left out still has the content of the stored row it came from.
+ */
+function contentSignature(value: unknown, field: PluginConfigField): string {
+  return stableStringify(redactValue(value, field, true));
+}
+
+function groupBy(rows: unknown[], key: (row: unknown) => string): Map<string, unknown[]> {
+  const groups = new Map<string, unknown[]>();
+  for (const row of rows) {
+    const k = key(row);
+    const group = groups.get(k);
+    if (group) group.push(row);
+    else groups.set(k, [row]);
+  }
+  return groups;
+}
+
 /** Restore one value against its field. `keep:false` means drop the key (sentinel with nothing stored). */
 function restoreValue(
   incoming: unknown,
@@ -98,6 +118,8 @@ function restoreValue(
   // as-is. Without this, a composite secret (object/array) would recurse and its masked children
   // would clobber the stored secret instead of restoring it.
   if (field.secret) {
+    // The removal of a secret that is a list element; restoreObject takes a property sent as null first.
+    if (incoming === null) return { keep: false };
     if (incoming === SECRET_SENTINEL || !isMeaningful(incoming)) {
       return isMeaningful(existing) ? { keep: true, value: existing } : { keep: false };
     }
@@ -117,15 +139,20 @@ function restoreValue(
     // then can't bind a sentinel to a different row's secret. Only an unambiguous match (exactly one
     // stored element with that signature) restores; otherwise the sentinel is treated as "nothing
     // stored" (dropped), so a secret may be lost on an ambiguous edit but is never mis-targeted.
-    const bySig = new Map<string, unknown[]>();
-    for (const ex of existingArr) {
-      const s = elementSignature(ex, itemField);
-      const group = bySig.get(s);
-      if (group) group.push(ex);
-      else bySig.set(s, [ex]);
-    }
+    const bySig = groupBy(existingArr, ex => elementSignature(ex, itemField));
+    const byContent = groupBy(existingArr, ex => contentSignature(ex, itemField));
     const sameLength = incoming.length === existingArr.length;
     const sigs = incoming.map(item => elementSignature(item, itemField));
+    // A row that sits where none of the stored rows it can be sits shows that rows were added or removed before it,
+    // so the stored row at an index no longer says which row this save put there (see the positional twin below).
+    // The stored rows a row can be are those with its signature, or, when none has it, those with its content once
+    // secrets are set aside: a row whose secret was cleared or left out is still that row.
+    const shifted =
+      sameLength &&
+      incoming.some((item, i) => {
+        const group = bySig.get(sigs[i]) ?? byContent.get(contentSignature(item, itemField));
+        return group !== undefined && !group.includes(existingArr[i]);
+      });
     // Only an element that still carries a mask needs a stored counterpart; one whose secrets were all
     // typed in is stored as provided, so it must not count toward, or take the slot of, a stored row.
     const masked = incoming.map(
@@ -135,6 +162,13 @@ function restoreValue(
     const inCount = new Map<string, number>();
     sigs.forEach((s, i) => {
       if (masked[i]) inCount.set(s, (inCount.get(s) ?? 0) + 1);
+    });
+    // Several masked rows can carry the signature of a single stored row: its secret goes to the one at its own
+    // position if there is one, else to the first. The others have no stored row of their own.
+    const owner = new Map<string, number>();
+    sigs.forEach((s, i) => {
+      const group = bySig.get(s);
+      if (masked[i] && group?.length === 1 && (!owner.has(s) || group[0] === existingArr[i])) owner.set(s, i);
     });
     const seen = new Map<string, number>();
     return {
@@ -160,25 +194,26 @@ function restoreValue(
             }
             return unbound;
           }
-          // Resolution order: (1) an unambiguous content match keeps a row's secret across
-          // reorder/insert/removal; (2) on an unchanged length, fall back to the positional twin (an
-          // in-place edit — position i is the same logical row, incl. a non-secret-field rename); (3) on a
-          // length change that kept every stored element with this signature, bind the k-th masked incoming
-          // one to the k-th stored one, since a removal before or between them shifts their positions; (4)
-          // otherwise bind the positional twin ONLY when its masked signature still equals this element's,
-          // so an append keeps each surviving sentinel's stored secret while a genuinely-new or
-          // signature-changed row at that position is never grafted with a stored secret.
+          // Resolution order: (1) an unambiguous content match keeps a row's secret across reorder/insert/removal;
+          // when several masked rows carry the signature of that one stored row, it goes to the one at its own
+          // position, else the first, so a stored secret never sits on two rows; (2) on an unchanged length, fall
+          // back to the positional twin (an in-place edit: position i is the same logical row, incl. a
+          // non-secret-field rename); (3) when every stored element with this signature is still in the save as a
+          // masked row, bind the k-th masked incoming one to the k-th stored one, since a removal before or between
+          // them shifts their positions; (4) on a length change, bind the positional twin ONLY when its masked
+          // signature still equals this element's, so an append keeps each surviving sentinel's stored secret while
+          // a genuinely-new or signature-changed row at that position is never grafted with a stored secret.
+          // The twin of (2) is withheld once a row has moved (see `shifted`): the stored secret at that position
+          // then belongs to a row removed or moved, and the payload cannot say which. A row renamed in place in the
+          // same save loses its secret with it; the operator enters it again. A row that has stored rows with its
+          // signature takes the twin only when it is one of them, so a secret never moves to a row with other content.
           const twin = existingArr[i];
-          const match =
-            storedCount === 1
-              ? group[0]
-              : sameLength
-                ? twin
-                : inCount.get(s) === storedCount
-                  ? group[k]
-                  : twin !== undefined && elementSignature(twin, itemField) === s
-                    ? twin
-                    : undefined;
+          const ownTwin = group.includes(twin) ? twin : undefined;
+          let match: unknown;
+          if (storedCount === 1) match = masked[i] && owner.get(s) !== i ? undefined : group[0];
+          else if (inCount.get(s) === storedCount) match = group[k];
+          else if (sameLength) match = shifted ? undefined : storedCount === 0 ? twin : ownTwin;
+          else match = ownTwin;
           return restoreValue(item, match, itemField);
         })
         // Honor keep:false like restoreObject does (drop the element) rather than emitting `.value`
@@ -194,10 +229,21 @@ function restoreObject(
   incoming: Record<string, unknown>,
   existing: Record<string, unknown> | undefined,
   properties: Record<string, PluginConfigField>,
+  mergedOverStored = false,
 ): Record<string, unknown> {
   const out = { ...incoming };
   for (const [key, field] of Object.entries(properties)) {
     if (!(key in out)) continue;
+    // An explicit null is how a stored secret is removed: every other empty form (the mask, an empty
+    // string, an absent key) keeps it, so a client that echoes a blank for a secret it does not hold
+    // leaves the stored one alone. The key is dropped, which removes the secret wherever the result
+    // replaces what was stored (a nested object, a row of a list, a per-session slice, an instance
+    // config). Only a top-level key of a result that is merged OVER the stored config stays as the null,
+    // since an omitted key would leave the stored value in place.
+    if (field.secret && out[key] === null) {
+      if (!mergedOverStored || !isMeaningful(existing?.[key])) delete out[key];
+      continue;
+    }
     const r = restoreValue(out[key], existing?.[key], field);
     if (r.keep) out[key] = r.value;
     else delete out[key];
@@ -208,12 +254,16 @@ function restoreObject(
 /**
  * On write (PUT /plugins/:id/config), the dashboard sends the whole config back — including masked
  * secrets at any depth. Treat a sentinel/empty secret as "keep existing": restore the stored value,
- * or drop the key when there's nothing stored. A genuinely-new value is stored as provided.
+ * or drop the key when there's nothing stored. A genuinely-new value is stored as provided, and an
+ * explicit `null` removes the stored secret. `mergedOverStored` is for a caller that merges the result
+ * over the stored config instead of replacing it: a top-level secret removed with `null` then stays in
+ * the result as `null`, so the merge does not put the stored value back.
  */
 export function restoreSecretConfig(
   incoming: Record<string, unknown>,
   existing: Record<string, unknown> | undefined,
   schema?: PluginConfigSchema,
+  options: { mergedOverStored?: boolean } = {},
 ): Record<string, unknown> {
   // Symmetric fail-closed restore for the schemaless case: redactSecretConfig masks EVERY value to the
   // sentinel, so on write treat any sentinel value as "keep existing" (restore the stored value, or drop
@@ -229,5 +279,5 @@ export function restoreSecretConfig(
     }
     return out;
   }
-  return restoreObject(incoming, existing, schema.properties);
+  return restoreObject(incoming, existing, schema.properties, options.mergedOverStored);
 }

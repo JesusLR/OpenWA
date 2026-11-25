@@ -4,8 +4,13 @@ import "net/url"
 
 // ChatSummary is a chat-list entry.
 type ChatSummary struct {
-	ID              string      `json:"id"`
-	Name            string      `json:"name"`
+	ID string `json:"id"`
+	// Name is "" for a Baileys chat held under a privacy id that has no name of its own: title it by Phone, when
+	// present.
+	Name string `json:"name"`
+	// Phone is Baileys only; whatsapp-web.js sends none. The digits of a 1:1 chat WhatsApp holds under a privacy
+	// id, when the session can map it. Absent for a phone-keyed chat and when the mapping is unknown.
+	Phone           string      `json:"phone,omitempty"`
 	IsGroup         bool        `json:"isGroup"`
 	UnreadCount     int         `json:"unreadCount"`
 	LastMessage     string      `json:"lastMessage,omitempty"`
@@ -41,9 +46,9 @@ type SubscribePresenceRequest struct {
 type MarkChatReadRequest struct {
 	ChatID string `json:"chatId"`
 	// MessageIDs are the messages to acknowledge (at most 100; an empty list is refused). Baileys
-	// acknowledges individual messages, so without this only the newest received message the
-	// engine still holds in memory gets a receipt. Ignored by whatsapp-web.js, whose own sendSeen
-	// is chat-level.
+	// acknowledges individual messages, so without this only the newest received message gets a
+	// receipt: the one the engine holds in memory, else the newest received one the gateway
+	// stored. Ignored by whatsapp-web.js, whose own sendSeen is chat-level.
 	//
 	// A POINTER because the three states differ on the wire and a plain slice cannot tell two of
 	// them apart: nil omits the key (acknowledge the newest), &[]string{} sends [] (the server

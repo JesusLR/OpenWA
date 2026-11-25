@@ -1,5 +1,8 @@
+import { randomBytes } from 'node:crypto';
 import { NulFreeTransformer } from '../../common/transformers/nul-free.transformer';
 import { isSafeSessionName } from '../../common/utils/path-safety';
+import { SECRET_SENTINEL } from '../plugins/redact-config';
+import { MAX_SESSION_ID_LENGTH } from '../session/session-id.pipe';
 import { collectFilterErrors } from '../webhook/filters/filter-validation';
 import type {
   MigrationTables,
@@ -70,6 +73,24 @@ function decodeJsonColumn(value: unknown): unknown {
   }
 }
 
+// A restore writes JSON text as it finds it, and TypeORM parses a simple-json column on every entity read of the row,
+// so text that does not parse makes each read throw (one session's config failed GET /sessions for every session).
+// Not applied to the event payloads, whose readers set such a row aside, nor to messages.metadata, which the export
+// carries verbatim, so an instance holding one could not restore its own backup.
+function invalidJsonWarning(label: string, id: string, row: object, columns: readonly string[]): string | null {
+  const invalid = columns.find(column => {
+    const value = (row as Record<string, unknown>)[column];
+    if (typeof value !== 'string') return false;
+    try {
+      JSON.parse(value);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  return invalid === undefined ? null : `Skipped ${label} ${id}: ${invalid} is not valid JSON`;
+}
+
 // The entity columns that drop U+0000 do it in a TypeORM transformer, which raw SQL never runs. An
 // older SQLite backup may still hold one, and PostgreSQL refuses it in a bound parameter, failing the
 // whole restore. Apply the same drop here, to those same free-text columns and to the template and
@@ -77,6 +98,16 @@ function decodeJsonColumn(value: unknown): unknown {
 // exception: no request can look up a name holding NUL, so keeping it would only strand the template.
 function nulFree(value: unknown): unknown {
   return NulFreeTransformer.to(value);
+}
+
+/**
+ * True when an archived plugin instance secret was redacted or omitted and must be regenerated
+ * (with the restored instance forced disabled) rather than stored verbatim or rejected on NOT NULL.
+ */
+export function isRedactedPluginSecret(secret: unknown): boolean {
+  if (typeof secret !== 'string') return true;
+  const trimmed = String(nulFree(secret)).trim();
+  return trimmed.length === 0 || trimmed === SECRET_SENTINEL;
 }
 
 /** Apply the terminal index's keeper order to archives created before that index existed. */
@@ -149,7 +180,12 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       if (!isSafeSessionName(session.id)) {
         return `Skipped session ${JSON.stringify(session.id)}: unsafe id`;
       }
-      if (isSafeSessionName(session.name)) return null;
+      // The session routes refuse a longer id (see SessionIdPipe), so a session restored under one could not be stopped
+      // or deleted. Refused like an unsafe id: a skip guard refuses the whole archive.
+      if (session.id.length > MAX_SESSION_ID_LENGTH) {
+        return `Skipped session ${session.id.slice(0, 40)}...: id longer than ${MAX_SESSION_ID_LENGTH} characters`;
+      }
+      if (isSafeSessionName(session.name)) return invalidJsonWarning('session', session.id, session, ['config']);
       return `Skipped session ${session.id}: unsafe name ${JSON.stringify(session.name)}`;
     },
     map: (session: SessionRow) => [
@@ -158,16 +194,21 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       session.status,
       session.phone,
       nulFree(session.pushName),
-      typeof session.config === 'string' ? session.config : JSON.stringify(session.config || {}),
-      session.proxyUrl,
-      session.proxyType,
+      nulFree(typeof session.config === 'string' ? session.config : JSON.stringify(session.config || {})),
+      nulFree(session.proxyUrl),
+      nulFree(session.proxyType),
       session.connectedAt,
       session.lastActiveAt,
       session.createdAt,
       session.updatedAt,
-      // 'stopped' is the only value the column holds. A backup written before the column existed,
-      // or an unknown value, restores as NULL: eligible for auto-start and takeover, as before.
-      session.desiredState === 'stopped' ? 'stopped' : null,
+      // A failed delete's 'deleting' restores as 'stopped': no delete runs for the restored row. A
+      // backup written before the column existed, or an unknown value, restores as NULL: eligible for
+      // auto-start and takeover, as before.
+      session.desiredState === 'stopped' ||
+      session.desiredState === 'deleting' ||
+      session.desiredState === 'deleting-stopped'
+        ? 'stopped'
+        : null,
     ],
   }),
 
@@ -188,23 +229,21 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
         return `Skipped webhook ${webhook.id}: events is not a list of event names`;
       }
       const filterErrors = collectFilterErrors(decodeJsonColumn(webhook.filters));
-      if (filterErrors.length === 0) return null;
+      if (filterErrors.length === 0) return invalidJsonWarning('webhook', webhook.id, webhook, ['headers']);
       return `Skipped webhook ${webhook.id}: invalid filters (${filterErrors.join('; ')})`;
     },
     map: (webhook: WebhookRow) => [
       webhook.id,
       webhook.sessionId,
-      webhook.url,
-      typeof webhook.events === 'string' ? webhook.events : JSON.stringify(webhook.events || []),
+      nulFree(webhook.url),
+      nulFree(typeof webhook.events === 'string' ? webhook.events : JSON.stringify(webhook.events || [])),
       // Rows exported after credential redaction (and hand-trimmed archives) carry no secret at
       // all — restore those as unsigned rather than failing the row on a missing key.
-      webhook.secret ?? null,
-      typeof webhook.headers === 'string' ? webhook.headers : JSON.stringify(webhook.headers || {}),
+      nulFree(webhook.secret ?? null),
+      nulFree(typeof webhook.headers === 'string' ? webhook.headers : JSON.stringify(webhook.headers || {})),
       webhook.filters == null
         ? null
-        : typeof webhook.filters === 'string'
-          ? webhook.filters
-          : JSON.stringify(webhook.filters),
+        : nulFree(typeof webhook.filters === 'string' ? webhook.filters : JSON.stringify(webhook.filters)),
       webhook.active,
       webhook.retryCount,
       webhook.lastTriggeredAt,
@@ -235,13 +274,15 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       msg.type,
       msg.direction,
       msg.timestamp ?? null,
-      msg.metadata == null ? null : typeof msg.metadata === 'string' ? msg.metadata : JSON.stringify(msg.metadata),
+      msg.metadata == null
+        ? null
+        : nulFree(typeof msg.metadata === 'string' ? msg.metadata : JSON.stringify(msg.metadata)),
       msg.status,
       msg.createdAt,
       // Archives predating the chat-media columns restore to NULL, same as author above. Carrying
       // them matters because the media FILES ride along in the storage export: restoring the rows
       // without their pointers would turn every archived file into an orphan the sweep then reaps.
-      msg.mediaPath ?? null,
+      nulFree(msg.mediaPath ?? null),
       nulFree(msg.mediaMimetype ?? null),
     ],
   }),
@@ -253,19 +294,23 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
     sql: `INSERT INTO message_batches (id, batch_id, session_id, status, messages, options, progress, results, current_index, created_at, updated_at, started_at, completed_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
     id: (batch: MessageBatchRow) => batch.id,
+    skip: (batch: MessageBatchRow) =>
+      invalidJsonWarning('message batch', batch.id, batch, ['messages', 'options', 'progress', 'results']),
     map: (batch: MessageBatchRow) => [
       batch.id,
       batch.batch_id,
       batch.session_id,
       batch.status,
-      typeof batch.messages === 'string' ? batch.messages : JSON.stringify(batch.messages ?? []),
-      batch.options == null ? null : typeof batch.options === 'string' ? batch.options : JSON.stringify(batch.options),
+      nulFree(typeof batch.messages === 'string' ? batch.messages : JSON.stringify(batch.messages ?? [])),
+      batch.options == null
+        ? null
+        : nulFree(typeof batch.options === 'string' ? batch.options : JSON.stringify(batch.options)),
       batch.progress == null
         ? null
-        : typeof batch.progress === 'string'
-          ? batch.progress
-          : JSON.stringify(batch.progress),
-      batch.results == null ? null : typeof batch.results === 'string' ? batch.results : JSON.stringify(batch.results),
+        : nulFree(typeof batch.progress === 'string' ? batch.progress : JSON.stringify(batch.progress)),
+      batch.results == null
+        ? null
+        : nulFree(typeof batch.results === 'string' ? batch.results : JSON.stringify(batch.results)),
       batch.current_index,
       batch.created_at,
       batch.updated_at,
@@ -313,7 +358,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       bsm.id,
       bsm.sessionId,
       bsm.waMessageId,
-      bsm.serializedMessage,
+      nulFree(bsm.serializedMessage),
       bsm.createdAt,
     ],
   }),
@@ -322,16 +367,22 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
   defineTableImporter({
     key: 'lidMappings',
     label: 'lid mapping',
-    sql: `INSERT INTO lid_mappings (lid, phone, "sessionId", "updatedAt") VALUES ($1, $2, $3, $4)`,
+    sql: `INSERT INTO lid_mappings (lid, phone, "sessionId", "updatedAt", "isReported") VALUES ($1, $2, $3, $4, $5)`,
     id: (lm: LidMappingRow) => lm.lid,
-    map: (lm: LidMappingRow) => [lm.lid, lm.phone ?? null, lm.sessionId ?? null, lm.updatedAt],
+    map: (lm: LidMappingRow) => [
+      lm.lid,
+      lm.phone ?? null,
+      lm.sessionId ?? null,
+      lm.updatedAt,
+      lm.isReported === true || lm.isReported === 1,
+    ],
   }),
 
   // Import chat states (optional; not a FK, restored as a standalone per-session cache table)
   defineTableImporter({
     key: 'chatStates',
     label: 'chat state',
-    sql: `INSERT INTO chat_states ("sessionId", "chatId", "muteEndTime", archived, pinned, observed, "updatedAt") VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    sql: `INSERT INTO chat_states ("sessionId", "chatId", "muteEndTime", archived, pinned, observed, "deletedAt", "updatedAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     id: (cs: ChatStateRow) => `${cs.sessionId}/${cs.chatId}`,
     map: (cs: ChatStateRow) => [
       cs.sessionId,
@@ -340,6 +391,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       cs.archived,
       cs.pinned,
       cs.observed ?? null,
+      cs.deletedAt ?? null,
       cs.updatedAt,
     ],
   }),
@@ -351,18 +403,29 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
     sql: `INSERT INTO plugin_instances (id, "pluginId", "instanceId", "sessionScope", secret, "verifyToken", config, enabled, "createdAt", "updatedAt")
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
     id: (pi: PluginInstanceRow) => pi.id,
-    map: (pi: PluginInstanceRow) => [
-      pi.id,
-      pi.pluginId,
-      pi.instanceId,
-      pi.sessionScope,
-      pi.secret,
-      pi.verifyToken,
-      pi.config == null ? null : typeof pi.config === 'string' ? pi.config : JSON.stringify(pi.config),
-      pi.enabled,
-      pi.createdAt,
-      pi.updatedAt,
-    ],
+    skip: (pi: PluginInstanceRow) => invalidJsonWarning('plugin instance', pi.id, pi, ['config']),
+    map: (pi: PluginInstanceRow) => {
+      const redactedSecret = isRedactedPluginSecret(pi.secret);
+      const secret = redactedSecret ? randomBytes(32).toString('hex') : nulFree(pi.secret);
+      const cleanedVerifyToken = pi.verifyToken == null ? null : nulFree(pi.verifyToken);
+      const verifyToken =
+        cleanedVerifyToken == null ||
+        (typeof cleanedVerifyToken === 'string' && cleanedVerifyToken.trim() === SECRET_SENTINEL)
+          ? null
+          : cleanedVerifyToken;
+      return [
+        pi.id,
+        pi.pluginId,
+        pi.instanceId,
+        pi.sessionScope,
+        secret,
+        verifyToken,
+        pi.config == null ? null : nulFree(typeof pi.config === 'string' ? pi.config : JSON.stringify(pi.config)),
+        redactedSecret ? false : pi.enabled,
+        pi.createdAt,
+        pi.updatedAt,
+      ];
+    },
   }),
 
   // Import conversation mappings (handover state; sessionId is non-FK provenance)
@@ -372,6 +435,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
     sql: `INSERT INTO conversation_mappings (id, "sessionId", "chatId", "pluginId", "instanceId", "providerConversationId", "handoverState", metadata, "updatedAt")
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     id: (cm: ConversationMappingRow) => cm.id,
+    skip: (cm: ConversationMappingRow) => invalidJsonWarning('conversation mapping', cm.id, cm, ['metadata']),
     map: (cm: ConversationMappingRow) => [
       cm.id,
       cm.sessionId,
@@ -380,7 +444,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       cm.instanceId,
       cm.providerConversationId,
       cm.handoverState,
-      cm.metadata == null ? null : typeof cm.metadata === 'string' ? cm.metadata : JSON.stringify(cm.metadata),
+      cm.metadata == null ? null : nulFree(typeof cm.metadata === 'string' ? cm.metadata : JSON.stringify(cm.metadata)),
       cm.updatedAt,
     ],
   }),
@@ -404,7 +468,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       ie.route,
       // A retired (NULL) payload must stay NULL — re-materializing it as '{}' would make a
       // slimmed dedup row read as a pending event with an empty body.
-      ie.payload == null ? null : typeof ie.payload === 'string' ? ie.payload : JSON.stringify(ie.payload),
+      ie.payload == null ? null : nulFree(typeof ie.payload === 'string' ? ie.payload : JSON.stringify(ie.payload)),
       ie.payloadHash ?? null,
       ie.sessionId,
       ie.dispatchState ?? null,
@@ -426,7 +490,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       wf.webhookId,
       wf.sessionId,
       wf.event,
-      wf.url,
+      nulFree(wf.url),
       wf.idempotencyKey,
       wf.deliveryId,
       wf.attempts,
@@ -452,7 +516,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       row.event,
       row.idempotencyKey,
       row.deliveryId,
-      row.payload == null ? null : typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload),
+      row.payload == null ? null : nulFree(typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload)),
       row.state,
       row.attempts,
       row.lastAttemptAt,
@@ -476,7 +540,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       df.deliveryId,
       df.attempts,
       nulFree(df.lastError),
-      df.payload == null ? null : typeof df.payload === 'string' ? df.payload : JSON.stringify(df.payload),
+      df.payload == null ? null : nulFree(typeof df.payload === 'string' ? df.payload : JSON.stringify(df.payload)),
       df.redriven,
       df.createdAt,
     ],
@@ -498,11 +562,11 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       su.waStatusId,
       su.type,
       nulFree(su.caption ?? null),
-      su.mediaPath ?? null,
+      nulFree(su.mediaPath ?? null),
       nulFree(su.mediaMimetype ?? null),
       su.mediaOmitted ?? false,
-      su.omitReason ?? null,
-      su.backgroundColor ?? null,
+      nulFree(su.omitReason ?? null),
+      nulFree(su.backgroundColor ?? null),
       su.font ?? null,
       su.postedAt,
       su.expiresAt,
@@ -532,9 +596,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       rule.enabled ?? true,
       rule.conditions == null
         ? null
-        : typeof rule.conditions === 'string'
-          ? rule.conditions
-          : JSON.stringify(rule.conditions),
+        : nulFree(typeof rule.conditions === 'string' ? rule.conditions : JSON.stringify(rule.conditions)),
       nulFree(rule.replyText),
       rule.cooldownSeconds ?? 60,
       rule.createdAt,

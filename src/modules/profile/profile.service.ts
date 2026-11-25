@@ -1,7 +1,8 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
+import { clientFacingSsrfError } from '../../common/media/client-facing-ssrf-error';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine, MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
-import { assertBase64WithinMediaCap, stripBase64DataUri } from '../message/media-cap.util';
+import { resolveMediaBody } from '../message/media-cap.util';
 import { SetProfilePictureDto } from './dto/profile.dto';
 
 /**
@@ -25,26 +26,26 @@ export class ProfileService {
     return this.getEngine(sessionId).setProfileStatus(status);
   }
 
-  /** Remove the account's own picture. Idempotent: no picture to remove is a no-op, not an error. */
+  /**
+   * Remove the account's own picture. A repeat sends the same request again and answers what WhatsApp answers: the
+   * removal of an absent picture is observed to succeed for a group, and not yet for an account's own.
+   */
   deleteProfilePicture(sessionId: string) {
     return this.getEngine(sessionId).deleteProfilePicture();
   }
 
   /** Map the JSON media body to a MediaInput exactly like the message module's media sends do. */
   setProfilePicture(sessionId: string, dto: SetProfilePictureDto) {
-    const base64 = stripBase64DataUri(dto.base64);
-    if (!dto.url && !base64) {
-      throw new BadRequestException('Either url or base64 must be provided');
-    }
-    if (base64 && !dto.mimetype) {
-      throw new BadRequestException('mimetype is required when using base64 data');
-    }
-    assertBase64WithinMediaCap(base64);
-    const media: MediaInput = {
-      mimetype: dto.mimetype || 'image/jpeg',
-      // base64 wins over url when both are present (mirrors buildMediaInput, #670).
-      data: base64 || dto.url!,
-    };
-    return this.getEngine(sessionId).setProfilePicture(media);
+    // base64 wins over url when both are present (mirrors buildMediaInput, #670).
+    const media: MediaInput = resolveMediaBody(dto, {
+      fallbackMimetype: 'image/jpeg',
+      requireMimetypeForBase64: true,
+      checkUrl: true,
+    });
+    return this.getEngine(sessionId)
+      .setProfilePicture(media)
+      .catch((error: unknown) => {
+        throw clientFacingSsrfError(error);
+      });
   }
 }

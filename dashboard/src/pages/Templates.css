@@ -19,6 +19,9 @@
 
 .templates-page .templates-session-select {
   min-width: 240px;
+  /* A native select is as wide as its longest option, and a percentage width does not bound the header column
+     it sits in; only max-width does. A longer session name is cut inside the select, not over the title. */
+  max-width: 20rem;
 }
 
 .templates-page .templates-workspace {
@@ -98,7 +101,7 @@
   gap: 0.5rem;
   margin: 1rem;
   padding: 0.625rem 0.75rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   background: var(--bg-white);
   color: var(--text-muted);
@@ -112,11 +115,14 @@
   background: transparent;
   color: var(--text-primary);
   font-size: 0.875rem;
+  unicode-bidi: plaintext;
 }
 
 .templates-page .templates-search:focus-within {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-soft);
+  border-color: var(--focus-ring);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px var(--primary-soft);
 }
 
 .templates-page .template-list {
@@ -174,6 +180,11 @@
   background: var(--primary-soft);
 }
 
+/* The muted gray is 4.17:1 on the selected row's tint. */
+.templates-page .template-list-item.selected .template-list-meta {
+  color: var(--text-secondary);
+}
+
 .templates-page .template-list-title {
   overflow: hidden;
   color: var(--text-primary);
@@ -181,6 +192,12 @@
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* A name and a body are text of their own: under the page direction an Arabic page drew "aviso." as ".aviso".
+     Each box is as wide as its text, so the text stays at the start edge the page puts it (see .chat-item-name in
+     Chats.css) instead of moving to the other side of the row. */
+  width: fit-content;
+  max-width: 100%;
+  unicode-bidi: plaintext;
 }
 
 .templates-page .template-list-body {
@@ -191,6 +208,9 @@
   line-height: 1.45;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+  width: fit-content;
+  max-width: 100%;
+  unicode-bidi: plaintext;
 }
 
 .templates-page .template-list-meta {
@@ -237,6 +257,16 @@
   gap: 0.5rem;
 }
 
+.templates-page .template-form .field-error {
+  color: var(--error-text);
+  font-size: 0.75rem;
+}
+
+/* Kept in the tree empty so a screen reader announces the limit when it appears; it takes no gap meanwhile. */
+.templates-page .template-form .field-error:empty {
+  margin-top: -0.5rem;
+}
+
 .templates-page .template-form label,
 .templates-page .placeholder-list label > span {
   color: var(--text-secondary);
@@ -248,11 +278,14 @@
 .templates-page .template-form textarea,
 .templates-page .placeholder-list input {
   width: 100%;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   background: var(--bg-light);
   color: var(--text-primary);
   font-size: 0.9375rem;
+  /* Typed text reads its direction from its own characters: under the page direction an Arabic page put the full
+     stop of an English sentence on the wrong end of it. */
+  unicode-bidi: plaintext;
 }
 
 .templates-page .template-form input,
@@ -272,9 +305,11 @@
 .templates-page .template-form textarea:focus,
 .templates-page .placeholder-list input:focus {
   outline: none;
-  border-color: var(--primary);
+  border-color: var(--focus-ring);
   background: var(--bg-white);
-  box-shadow: 0 0 0 3px var(--primary-soft);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px var(--primary-soft);
 }
 
 .templates-page .body-field {
@@ -327,6 +362,10 @@
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+  /* index.css draws every pre left to right and flush left, for code. The message is text of its own: this rule wins
+     it on specificity and hands the direction and the alignment back to the characters. */
+  unicode-bidi: plaintext;
+  text-align: start;
 }
 
 .templates-page .template-variable-panel {
@@ -419,7 +458,8 @@
   color: var(--error-text);
 }
 
-@media (max-width: 1280px) {
+/* Three columns need 1286px of viewport with the sidebar open. */
+@media (max-width: 1290px) {
   .templates-page .templates-workspace {
     grid-template-columns: 280px minmax(380px, 1fr);
   }
@@ -441,16 +481,8 @@
   }
 }
 
-@media (max-width: 900px) {
-  .templates-page {
-    padding: 1rem;
-  }
-
-  .templates-page .templates-session-select {
-    min-width: 0;
-    width: 100%;
-  }
-
+/* Stacked below 1000px: two columns need 984px of viewport with the sidebar open. */
+@media (max-width: 1000px) {
   .templates-page .templates-workspace {
     display: flex;
     flex-direction: column;
@@ -474,6 +506,24 @@
   }
 }
 
+@media (max-width: 900px) {
+  .templates-page {
+    padding: 1rem;
+  }
+
+  .templates-page .templates-session-select {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+/* The page header is one column from here, so the select has no title beside it to cover. */
+@media (max-width: 768px) {
+  .templates-page .templates-session-select {
+    max-width: none;
+  }
+}
+
 @media (max-width: 640px) {
   .templates-page .templates-library-header,
   .templates-page .template-editor-header,
@@ -490,5 +540,16 @@
   .templates-page .template-preview-message,
   .templates-page .template-variable-panel {
     padding: 1rem;
+  }
+}
+
+/* Forced colours drop fills and shadows: the search box draws an outline on focus, the open template a heavy frame. */
+@media (forced-colors: active) {
+  .templates-page .templates-search:focus-within {
+    outline: 2px solid var(--focus-ring);
+  }
+
+  .templates-page .template-list-item.selected {
+    border: 3px solid CanvasText;
   }
 }

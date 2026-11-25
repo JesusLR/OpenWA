@@ -5,7 +5,15 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { auditUnavailable, collectAdvisories, evaluate, unavailableOutcome } from './check-audit.mjs';
+import {
+  ALLOWLIST,
+  allowlistFor,
+  auditUnavailable,
+  collectAdvisories,
+  evaluate,
+  treeOf,
+  unavailableOutcome,
+} from './check-audit.mjs';
 
 /**
  * The report shape is taken from a real `npm audit --json` run, not invented: one advisory
@@ -110,10 +118,16 @@ test('a clean report with an empty allowlist passes', () => {
   assert.deepEqual(evaluate({ vulnerabilities: {} }, []), []);
 });
 
-// npm omits the key entirely when nothing is found; treating that as a crash would fail every
-// green build, and treating a crash as "clean" would fail open. It must simply be empty.
-test('a report with no vulnerabilities key is clean, not a crash', () => {
-  assert.deepEqual(evaluate({}, []), []);
+// npm 7 and later write `vulnerabilities` and `metadata` into every audit result, a clean one included, so a
+// payload without them is not one: npm 6's `advisories` map, or a format this gate does not read, would list a
+// HIGH where the gate never looks and pass as a clean tree.
+test('a report without vulnerabilities and metadata is audit-unavailable, not clean', () => {
+  assert.equal(auditUnavailable({}), true);
+  assert.equal(auditUnavailable({ vulnerabilities: {} }), true);
+  assert.equal(
+    auditUnavailable({ advisories: { 1179: { severity: 'high' } }, metadata: { vulnerabilities: {} } }),
+    true,
+  );
   assert.equal(collectAdvisories(undefined).size, 0);
 });
 
@@ -127,9 +141,47 @@ test('an { error } payload reads as audit-unavailable, not clean', () => {
 });
 
 test('a clean or vulnerable report is not audit-unavailable', () => {
-  assert.equal(auditUnavailable({}), false);
-  assert.equal(auditUnavailable({ vulnerabilities: {} }), false);
-  assert.equal(auditUnavailable(puppeteerReport), false);
+  assert.equal(auditUnavailable({ vulnerabilities: {}, metadata: {} }), false);
+  assert.equal(auditUnavailable({ ...puppeteerReport, metadata: {} }), false);
+});
+
+// One list serves three lockfiles. An entry is read only by the trees it names, so excusing an advisory
+// in the root does not excuse it in the dashboard, and the stale rule fires in the tree that lost it.
+test('an entry excuses only the trees it names', () => {
+  const entry = { ...ALLOW[0], trees: ['.', 'dashboard'] };
+  assert.deepEqual(allowlistFor('dashboard', [entry]), [entry]);
+  assert.deepEqual(evaluate(puppeteerReport, allowlistFor('dashboard', [entry])), []);
+  assert.deepEqual(allowlistFor('sdk/javascript', [entry]), []);
+  assert.match(evaluate(puppeteerReport, allowlistFor('sdk/javascript', [entry]))[0], /GHSA-jmr9-qjv8-65gv/);
+  assert.match(evaluate({ vulnerabilities: {} }, allowlistFor('.', [entry]))[0], /Stale allowlist entry/);
+  assert.deepEqual(evaluate({ vulnerabilities: {} }, allowlistFor('sdk/javascript', [entry])), []);
+});
+
+const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+
+test('the tree is the working directory as a repository path', () => {
+  assert.equal(treeOf(repoRoot), '.');
+  assert.equal(treeOf(join(repoRoot, 'dashboard')), 'dashboard');
+  assert.equal(treeOf(join(repoRoot, 'sdk', 'javascript')), 'sdk/javascript');
+});
+
+// An entry with a tree no lockfile sits in excuses nothing and is never reported stale.
+test('every entry names its advisory, trees that hold a lockfile, a reason and what removes it', () => {
+  const trees = spawnSync('git', ['ls-files', '--', '*package-lock.json'], { cwd: repoRoot, encoding: 'utf8' })
+    .stdout.split('\n')
+    .filter(Boolean)
+    .map(file => file.replace(/\/?package-lock\.json$/, '') || '.');
+  assert.ok(trees.includes('.') && trees.includes('dashboard') && trees.includes('sdk/javascript'), trees.join());
+  for (const entry of ALLOWLIST) {
+    assert.match(entry.id, /^GHSA(-[0-9a-z]{4}){3}$/);
+    assert.ok(entry.package && entry.reason && entry.removeWhen, entry.id);
+    assert.ok(entry.trees.length > 0, entry.id);
+    assert.deepEqual(
+      entry.trees.filter(tree => !trees.includes(tree)),
+      [],
+      entry.id,
+    );
+  }
 });
 
 // PR CI keeps the skip so an npm outage does not block every merge, but it must show on the run as a
@@ -170,25 +222,31 @@ test(
   () => {
     const bin = mkdtempSync(join(tmpdir(), 'check-audit-'));
     try {
-      writeFileSync(join(bin, 'npm'), '#!/bin/sh\necho \'{"error":{"summary":"endpoint down"}}\'\nexit 1\n');
-      chmodSync(join(bin, 'npm'), 0o755);
-      const script = fileURLToPath(new URL('./check-audit.mjs', import.meta.url));
-      const run = extra =>
-        spawnSync(process.execPath, [script], {
-          encoding: 'utf8',
-          env: {
-            ...process.env,
-            GITHUB_ACTIONS: '',
-            CHECK_AUDIT_REQUIRED: '',
-            ...extra,
-            PATH: `${bin}${delimiter}${process.env.PATH}`,
-          },
-        });
-      const skipped = run({});
-      assert.equal(skipped.status, 0, skipped.stderr);
-      assert.match(skipped.stdout, /check:audit SKIPPED/);
-      const required = run({ CHECK_AUDIT_REQUIRED: '1' });
-      assert.equal(required.status, 1);
+      // A down endpoint, and a report in npm 6's shape, whose HIGH sits under a key the gate does not read.
+      for (const payload of [
+        '{"error":{"summary":"endpoint down"}}',
+        '{"advisories":{"1179":{"severity":"high"}},"metadata":{"vulnerabilities":{"high":1}}}',
+      ]) {
+        writeFileSync(join(bin, 'npm'), `#!/bin/sh\necho '${payload}'\nexit 1\n`);
+        chmodSync(join(bin, 'npm'), 0o755);
+        const script = fileURLToPath(new URL('./check-audit.mjs', import.meta.url));
+        const run = extra =>
+          spawnSync(process.execPath, [script], {
+            encoding: 'utf8',
+            env: {
+              ...process.env,
+              GITHUB_ACTIONS: '',
+              CHECK_AUDIT_REQUIRED: '',
+              ...extra,
+              PATH: `${bin}${delimiter}${process.env.PATH}`,
+            },
+          });
+        const skipped = run({});
+        assert.equal(skipped.status, 0, skipped.stderr);
+        assert.match(skipped.stdout, /check:audit SKIPPED/, payload);
+        const required = run({ CHECK_AUDIT_REQUIRED: '1' });
+        assert.equal(required.status, 1, payload);
+      }
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }

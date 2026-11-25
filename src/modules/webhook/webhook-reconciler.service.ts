@@ -1,8 +1,9 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { MoreThan, Repository } from 'typeorm';
 import { Webhook } from './entities/webhook.entity';
+import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
 import { WebhookOutboxService } from './webhook-outbox.service';
 import {
   DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS,
@@ -77,6 +78,9 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
     private readonly outbox: WebhookOutboxService,
     private readonly delivery: WebhookDeliveryService,
     private readonly configService: ConfigService,
+    @Optional()
+    @InjectRepository(WebhookDeliveryFailure, 'data')
+    private readonly deliveryFailures?: Repository<WebhookDeliveryFailure>,
   ) {}
 
   onModuleInit(): void {
@@ -136,17 +140,28 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
       // The last id the page covered, which can lie beyond its last readable row: a row whose stored
       // payload is unreadable is skipped, and the cursor must pass it or a page of them is read forever.
       let scannedThrough: string | undefined;
-      const onScanned = (id: string): void => {
+      let covered = 0;
+      const onScanned = (id: string, count: number): void => {
         scannedThrough = id;
+        covered = count;
       };
       let rows = await this.outbox.findStale(cutoff, opts.batchSize, this.cursor, onScanned);
       if (rows.length === 0 && !scannedThrough && this.cursor) {
         this.cursor = undefined;
         rows = await this.outbox.findStale(cutoff, opts.batchSize, undefined, onScanned);
       }
-      // Live jobs may occupy a whole page. Advance past them without spending their replay budget.
-      this.cursor = scannedThrough ?? rows.at(-1)?.id;
+      // Live jobs may occupy a whole page. Advance past them without spending their replay budget. A page that did not
+      // fill its batch has reached the end of the stale rows, so the next pass starts at the oldest again: a row left
+      // behind the cursor, whose job was live when it was read and is lost since, would otherwise wait for as long as
+      // newer stale rows keep arriving.
+      const pageFull = Math.max(covered, rows.length) >= opts.batchSize;
+      this.cursor = pageFull ? (scannedThrough ?? rows.at(-1)?.id) : undefined;
       stats.scanned = rows.length;
+      // Webhooks whose replay did not deliver in this pass. Direct mode replays one row at a time with
+      // the full retry schedule, so a receiver that never answers would cost that schedule per stranded
+      // row and hold every webhook behind it. The first failure has shown it is down: its further rows
+      // make one attempt each, and the next sweep is their retry.
+      const failedWebhooks = new Set<string>();
       for (const row of rows) {
         if (this.stop.signal.aborted) break;
         if (this.delivery.isLocallyPending(row.idempotencyKey)) {
@@ -177,6 +192,17 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
           stats.skipped++;
           continue;
         }
+        if (row.state === 'queued' && this.deliveryFailures) {
+          const terminalFailure = await this.deliveryFailures.findOne({
+            select: { id: true },
+            where: { webhookId: row.webhookId, idempotencyKey: row.idempotencyKey, attempts: MoreThan(0) },
+          });
+          if (terminalFailure) {
+            await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
+            stats.skipped++;
+            continue;
+          }
+        }
         if (row.attempts >= opts.maxAttempts) {
           // A database fault may have prevented every terminal failure write. Keep the outbox
           // payload until this handoff succeeds, without sending beyond the replay budget.
@@ -205,11 +231,12 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
             row.event,
             row.idempotencyKey,
             row.payload,
-            { signal: this.stop.signal },
+            { signal: this.stop.signal, oneDirectAttempt: failedWebhooks.has(row.webhookId) },
           );
           if (outcome === 'failed' || outcome === 'unrecorded') {
             // Left 'pending' on purpose: the next sweep retries it until the budget is spent.
             this.logger.warn(`Replay of ${row.event} to webhook ${row.webhookId} did not deliver`);
+            failedWebhooks.add(row.webhookId);
             stats.failed++;
             continue;
           }

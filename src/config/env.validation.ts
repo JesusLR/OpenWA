@@ -1,7 +1,11 @@
 import { resolve } from 'path';
 import { normalizeS3KeyPrefix } from '../common/storage/s3-key-prefix';
+import { webVersionPinConfigError } from '../engine/wa-web-version';
+import { MAX_BROWSER_SESSION_TTL_MS, MIN_BROWSER_SESSION_TTL_MS } from '../modules/auth/browser-session.util';
+import { namesBundledContainer } from '../modules/docker/bundled-host';
 import { resolveBodyLimit } from './bootstrap-security';
 import { parseBodyLimitBytes } from './inflight-body-budget';
+import { puppeteerArgsError } from './puppeteer-args';
 
 type EnvConfig = Record<string, unknown>;
 
@@ -59,6 +63,65 @@ export function postgresSchemaError(schema: string): string | null {
   return null;
 }
 
+const REDIS_CONSUMER_FLAGS = ['REDIS_ENABLED', 'QUEUE_ENABLED', 'CACHE_ENABLED'];
+
+/** The one way to keep TLS or a named user: an external server, which the Infrastructure page selects too. */
+const EXTERNAL_REDIS_WAY_OUT =
+  'or use an external Redis (REDIS_BUILTIN=false with its REDIS_HOST, also on the Infrastructure page)';
+
+/** The bundled Redis is the one this deployment connects to: it is selected, in use, and named as the host. */
+function usesBundledRedis(config: EnvConfig): boolean {
+  const host = typeof config.REDIS_HOST === 'string' ? config.REDIS_HOST : undefined;
+  return (
+    REDIS_CONSUMER_FLAGS.some(key => config[key] === 'true') &&
+    config.REDIS_BUILTIN === 'true' &&
+    namesBundledContainer('redis', host)
+  );
+}
+
+/** The bundled Redis listens in plaintext; a TLS handshake against it fails on every connect. */
+export function builtinRedisTlsError(config: EnvConfig): string | null {
+  if (!usesBundledRedis(config) || config.REDIS_TLS !== 'true') return null;
+  return (
+    'REDIS_TLS=true cannot reach the built-in Redis container, which runs without TLS; set REDIS_TLS=false in the ' +
+    `environment, ./.env or data/.env.generated, ${EXTERNAL_REDIS_WAY_OUT}`
+  );
+}
+
+/** The bundled Redis has only its default user; ioredis authenticates as any other name and is refused. */
+export function builtinRedisUsernameError(config: EnvConfig): string | null {
+  const username = typeof config.REDIS_USERNAME === 'string' ? config.REDIS_USERNAME : undefined;
+  if (!usesBundledRedis(config) || !username || username === 'default') return null;
+  return (
+    'REDIS_USERNAME must be unset or default for the built-in Redis container; remove the named username in the ' +
+    `environment, ./.env or data/.env.generated, ${EXTERNAL_REDIS_WAY_OUT}`
+  );
+}
+
+/**
+ * The S3 client builds every request from S3_ENDPOINT. A value without a scheme (`minio:9000`) does not stop the
+ * client from being built: each call then fails as "Invalid URL" and media goes to the local fallback directory.
+ * That deployment runs today, so validateEnv leaves it alone and the boot reports this message at ERROR level; the
+ * Infrastructure save refuses it, so the page never stores one. Only checked while S3 is the selected storage, and
+ * the value is not echoed, as it may hold keys.
+ */
+export function s3EndpointError(config: EnvConfig): string | null {
+  const raw = config.S3_ENDPOINT;
+  const endpoint = typeof raw === 'string' ? raw.trim() : '';
+  if (!endpoint || config.STORAGE_TYPE !== 's3') return null;
+  let protocol: string | undefined;
+  try {
+    protocol = new URL(endpoint).protocol;
+  } catch {
+    protocol = undefined;
+  }
+  if (protocol === 'http:' || protocol === 'https:') return null;
+  return (
+    'S3_ENDPOINT must be an absolute http(s) URL such as "http://minio:9000"; set it in the environment, ./.env or ' +
+    'data/.env.generated, or on the Infrastructure page'
+  );
+}
+
 /**
  * Fail-fast environment validation. Wired as ConfigModule's `validate`
  * callback so a misconfigured deployment is rejected at BOOT instead of silently
@@ -101,6 +164,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   checkEnum('ENGINE_TYPE', ['whatsapp-web.js', 'baileys']);
   checkEnum('STORAGE_TYPE', ['local', 's3']);
   checkEnum('MESSAGE_INLINE_MEDIA', ['inline', 'archive']);
+  checkEnum('SQLITE_JOURNAL_MODE', ['WAL', 'DELETE']);
   // 'archive' drops the inline copy only after the archiver stored the file; with the archiver off
   // nothing is ever stored, so the mode would silently do nothing. Refuse that rather than let an
   // operator believe the inline copies are being reclaimed.
@@ -114,6 +178,14 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   if (s3KeyPrefix !== undefined && normalizeS3KeyPrefix(s3KeyPrefix) === null) {
     errors.push(
       `S3_KEY_PREFIX must be a relative key prefix such as "staging/" with no empty, "." or ".." segment (got ${JSON.stringify(s3KeyPrefix)})`,
+    );
+  }
+  // The BullMQ key prefix is joined to the queue name with a colon in every Redis key, so a colon or
+  // whitespace in it builds keys that tooling cannot split back apart.
+  const queuePrefix = str('QUEUE_PREFIX');
+  if (queuePrefix !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(queuePrefix)) {
+    errors.push(
+      `QUEUE_PREFIX must be 1 to 64 letters, digits, dots, underscores or hyphens, starting with a letter or digit (got ${JSON.stringify(queuePrefix)})`,
     );
   }
   // Every production hardening in the repo gates on the exact string 'production', so an
@@ -157,14 +229,28 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // POSTGRES_SCHEMA is optional (defaults to 'public' in configuration.ts). When set, validate it
     // is a legal, non-reserved Postgres identifier so a typo / injection-ish value fails fast at boot
     // rather than reaching CREATE TABLE "<schema>"."..." (or a search_path SET) at migration time.
-    // Lower case only: the search_path startup option is unquoted, so Postgres folds it to lower
-    // case, while TypeORM quotes the schema. A mixed-case name would split DDL and queries across
-    // two schemas. The raw value is checked, untrimmed: the app and the migration CLI both use it
-    // as set, so a padded (or whitespace-only) value must fail here as it fails in the CLI.
+    // Lower case only: the search_path the app sets with set_config on connect is unquoted, so Postgres
+    // folds it to lower case, while TypeORM quotes the schema. A mixed-case name would split DDL and
+    // queries across two schemas. The raw value is checked, untrimmed: the app and the migration CLI both
+    // use it as set, so a padded (or whitespace-only) value must fail here as it fails in the CLI.
     const pgSchema = config.POSTGRES_SCHEMA;
     const pgSchemaError = typeof pgSchema === 'string' && pgSchema !== '' ? postgresSchemaError(pgSchema) : null;
     if (pgSchemaError) {
       errors.push(pgSchemaError);
+    }
+    // The bundled PostgreSQL container runs without TLS (DockerService.getContainerSpec sets none up), so the built-in
+    // database with DATABASE_SSL=true retries its connection until the boot gives up, and the dashboard that could undo
+    // it stays down. Both flags are read raw, as configuration.ts and the boot guard compare them.
+    const dbHost = str('DATABASE_HOST');
+    if (
+      config.POSTGRES_BUILTIN === 'true' &&
+      config.DATABASE_SSL === 'true' &&
+      namesBundledContainer('postgres', dbHost)
+    ) {
+      errors.push(
+        `DATABASE_SSL=true cannot reach the built-in PostgreSQL container (POSTGRES_BUILTIN=true, DATABASE_HOST=${dbHost}), ` +
+          'which runs without TLS: set DATABASE_SSL=false where it is set (data/.env.generated, the project .env or the environment)',
+      );
     }
   } else {
     // SQLite (explicit or default): DATABASE_NAME is a file path for the 'data' connection. It must
@@ -190,6 +276,11 @@ export function validateEnv(config: EnvConfig): EnvConfig {
       );
     }
   }
+
+  const redisTlsError = builtinRedisTlsError(config);
+  if (redisTlsError) errors.push(redisTlsError);
+  const redisUsernameError = builtinRedisUsernameError(config);
+  if (redisUsernameError) errors.push(redisUsernameError);
 
   // Plain decimal digits only: these numeric knobs are read downstream with parseInt(raw, 10),
   // which silently truncates spellings Number() would accept (`1e6` → 1, `0x100` → 0) — the boot
@@ -241,6 +332,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS', // 0 = failure rows keep no payload (no redrive)
     'EXPORT_INLINE_MEDIA_BUDGET_BYTES', // 0 = a data export carries no inline media at all
     'MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES', // 0 = a message list carries no inline media at all
+    'MCP_MAX_RESULT_BYTES', // default 100000 bytes (100 KB); explicit 0 disables the cap
     'CHAT_MEDIA_ARCHIVE_TTL_DAYS', // 0 = keep archived chat media forever
     'INGRESS_RETRY_DELAY_MS', // 0 = retry without backoff
     'REDIS_CACHE_DB',
@@ -255,6 +347,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'MESSAGE_REAPER_GRACE_MS',
     'WEBHOOK_RECONCILE_GRACE_MS',
     'INGRESS_RECONCILE_GRACE_MS',
+    'BAILEYS_GROUP_METADATA_CACHE_TTL_MS', // 0 = no cache; every group send then queries the participant list
   ]) {
     checkNonNegativeInt(key);
   }
@@ -428,7 +521,6 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'STORAGE_IMPORT_MAX_BYTES',
     'STORAGE_IMPORT_MAX_ENTRIES',
     'STORAGE_IMPORT_MAX_TOTAL_BYTES',
-    'STORAGE_LIST_MAX_FILES',
     'BAILEYS_MESSAGE_STORE_LIMIT',
     // Each read fell back to its default on 0 or garbage, or passed a negative or fractional value on
     // (SEARCH_LIMIT_MAX reached plugin search providers as-is).
@@ -436,8 +528,21 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'INGRESS_MAX_ATTEMPTS',
     'WEBHOOK_WORKER_CONCURRENCY',
     'INGRESS_WORKER_CONCURRENCY',
+    'DASHBOARD_SESSION_TTL_MS',
   ]) {
     checkPositiveInt(key);
+  }
+
+  // Browser session TTL bounds match resolveBrowserSessionTtlMs so an out-of-range setting fails
+  // fast at boot instead of silently clamping to 5 minutes or 30 days.
+  const dashboardSessionTtlRaw = str('DASHBOARD_SESSION_TTL_MS');
+  if (dashboardSessionTtlRaw !== undefined && DECIMAL_INTEGER.test(dashboardSessionTtlRaw)) {
+    const n = Number(dashboardSessionTtlRaw);
+    if (n >= 1 && (n < MIN_BROWSER_SESSION_TTL_MS || n > MAX_BROWSER_SESSION_TTL_MS)) {
+      errors.push(
+        `DASHBOARD_SESSION_TTL_MS must be between ${MIN_BROWSER_SESSION_TTL_MS} and ${MAX_BROWSER_SESSION_TTL_MS} ms (got "${dashboardSessionTtlRaw}")`,
+      );
+    }
   }
 
   // The body cap takes a unit string. A spelling the parser does not know (`50M`, `50MiB`) silently
@@ -561,6 +666,20 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     }
   }
 
+  // Shared HMAC secret for inter-node forwarded hops (opt-in). Blank ('') stays legal so a
+  // compose `${SESSION_PROXY_SECRET:-}` forward behaves as unset, while whitespace-only or
+  // trivially short values fail fast at boot without echoing the secret.
+  const rawProxySecret = config.SESSION_PROXY_SECRET;
+  if (rawProxySecret !== undefined && rawProxySecret !== '') {
+    if (typeof rawProxySecret !== 'string') {
+      errors.push('SESSION_PROXY_SECRET must be a string');
+    } else if (rawProxySecret.trim().length === 0) {
+      errors.push('SESSION_PROXY_SECRET must not be whitespace-only; leave it unset or set at least 16 characters');
+    } else if (rawProxySecret.trim().length < 16) {
+      errors.push('SESSION_PROXY_SECRET must be at least 16 characters long');
+    }
+  }
+
   // Boolean feature flags read at module-eval time (app.module.ts) with a bare `=== 'true'` /
   // `!== 'false'` comparison: a typo (`True`, `1`, `yes`) or trailing whitespace/CR silently
   // (dis)ables the feature. Validate the RAW value — NOT a trimmed one — so `'true '` / `'true\r'`
@@ -589,6 +708,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'RESOLVE_LID_TO_PHONE',
     'SIMULATE_TYPING',
     'SEARCH_ENABLED',
+    'SEARCH_CONTAINS_ENABLED',
     // Read at boot by the throttler factory (app.module.ts) and CacheService with `=== 'true'`: a
     // typo like `ture` silently downgrades rate-limit storage + cache to per-process in-memory.
     'REDIS_ENABLED',
@@ -617,6 +737,8 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // `=== 'true'`: a typo keeps the main connection on its migrations, so an operator who meant to
     // opt into synchronize for api_keys/audit_logs silently does not get it.
     'MAIN_DATABASE_SYNCHRONIZE',
+    // Same for the data connection: on SQLite a typo silently runs the migration chain instead.
+    'DATABASE_SYNCHRONIZE',
     // Read with `=== 'true'` by the plugin ingress gate: a typo turns an intentional
     // `ALLOW_UNSIGNED_INGRESS=true` back off, and a route the operator meant to open stops loading.
     'ALLOW_UNSIGNED_INGRESS',
@@ -643,6 +765,10 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'POSTGRES_BUILTIN',
     'REDIS_BUILTIN',
     'MINIO_BUILTIN',
+    // Explicit opt-in for connecting to the local Unix Docker socket (/var/run/docker.sock or unix://).
+    'DOCKER_ALLOW_LOCAL_SOCKET',
+    // Explicit opt-in to load remote WhatsApp Web HTML without a WWEBJS_WEB_VERSION_SHA256 digest.
+    'WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED',
     // Perf/observability only, but same silent-typo class.
     'CACHE_ENABLED',
     'DATABASE_LOGGING',
@@ -653,6 +779,9 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'ENABLE_SWAGGER',
     'VALIDATION_ERROR_DETAIL',
     'PLUGIN_INSTALL_REQUIRE_PIN',
+    // Pre-egress hook fail-closed toggle and browser session cookie Secure override.
+    'HOOK_PRE_EGRESS_FAIL_CLOSED',
+    'DASHBOARD_SESSION_COOKIE_SECURE',
     // `=== 'true'` in the SSRF guard: a typo keeps redirects refused when the operator allowed them.
     'WEBHOOK_SSRF_REDIRECTS',
     // DELIBERATELY NOT LISTED. `MCP_READONLY` is read `!== 'false'` and mcp.server.spec.ts asserts
@@ -713,6 +842,21 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     errors.push(
       `LOG_LEVEL must be one of ${LOG_LEVEL_VALUES.map(v => `"${v}"`).join(', ')} (got ${JSON.stringify(rawLogLevel)})`,
     );
+  }
+
+  // PUPPETEER_ARGS: restrict Chromium launch flags to the vetted allowlist (fail-closed) so
+  // command-execution, extension-loading, debugging, or proxy-bypass switches are refused at boot.
+  const rawPuppeteerArgs = config.PUPPETEER_ARGS;
+  if (typeof rawPuppeteerArgs === 'string' && rawPuppeteerArgs !== '') {
+    const argsErr = puppeteerArgsError(rawPuppeteerArgs);
+    if (argsErr) errors.push(argsErr);
+  }
+
+  // WWEBJS_WEB_VERSION integrity policy: remote WhatsApp Web HTML is off by default; opting in
+  // requires either an exact build with WWEBJS_WEB_VERSION_SHA256 or WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED=true.
+  const webVersionError = webVersionPinConfigError(config);
+  if (webVersionError) {
+    errors.push(webVersionError);
   }
 
   if (errors.length > 0) {

@@ -4,19 +4,34 @@ import {
   BadRequestException,
   ConflictException,
   HttpException,
+  InternalServerErrorException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { PluginLoaderService, PluginStatus, PluginType, resolvePluginEntryPath } from '../../core/plugins';
+import {
+  PluginLoaderService,
+  PluginRegistryWriteError,
+  PluginStatus,
+  PluginType,
+  resolvePluginEntryPath,
+} from '../../core/plugins';
 import { pluginUpdateBackupDirName, pluginUpdateStagingDirName } from '../../core/plugins';
 import type { PluginConfigSchema } from '../../core/plugins';
 import { PluginDto } from './dto/plugin.dto';
 import { redactSecretConfig, restoreSecretConfig } from './redact-config';
-import { parsePluginPackage } from './plugin-installer';
+import { restorableConfig } from '../../core/plugins/plugin-activation';
+import { assertWritePathNoSymlinks, lstatIfPresent } from '../../core/plugins/plugin-paths';
+import {
+  getBuiltInBaseConfig,
+  PluginInstanceSanitizationError,
+  updatePluginConfigDurable,
+} from '../../core/plugins/plugin-lifecycle';
+import { PluginUninstallingError } from '../../core/plugins/plugin-uninstaller';
+import { DEFAULT_PACKAGE_LIMITS, parsePluginPackage, type ParsedPackage } from './plugin-installer';
 import { assertDownloadSha256, assertPluginInstallUrl, fetchSafeBuffer } from './plugin-download';
-import { annotateCatalog, CatalogEntry, CatalogPlugin } from './catalog';
+import { annotateCatalog, CatalogEntry, CatalogPlugin, isCatalogEntry } from './catalog';
 import { redactSsrfError } from '../../common/security/ssrf-guard';
 import { createLogger } from '../../common/services/logger.service';
 
@@ -29,6 +44,19 @@ const CATALOG_MAX_BYTES = 1 * 1024 * 1024;
  * around the download calls).
  */
 const logger = createLogger('PluginsService');
+
+/** A change the plugin registry could not store is answered as not applied, like any other refused change. */
+/** The topmost directory of `target`'s path that does not exist yet, which is the first one a recursive mkdir creates. */
+function firstMissingDir(target: string): string | null {
+  let missing: string | null = null;
+  for (let current = target; !fs.existsSync(current); current = path.dirname(current)) missing = current;
+  return missing;
+}
+
+function notApplied(error: unknown): { success: boolean; message: string } {
+  if (error instanceof PluginRegistryWriteError) return { success: false, message: error.message };
+  throw error;
+}
 
 /** A plugin can host provisioned instances iff it declares an ingress route AND the webhook:ingress
  *  permission — mirrors IntegrationInstanceController.assertIngressCapable. */
@@ -49,6 +77,13 @@ export class PluginsService {
   private readonly opChains = new Map<string, Promise<unknown>>();
 
   private serialize<T>(id: string, op: () => Promise<T>): Promise<T> {
+    // A boot restore that outlasted the boot wait enables plugins in the background, outside this chain, so a
+    // change to a plugin it has not finished with would interleave with its enable (see isRestorePending).
+    if (this.pluginLoader.isRestorePending(id)) {
+      return Promise.reject(
+        new ConflictException(`Plugin ${id} is still being restored after startup. Retry in a moment.`),
+      );
+    }
     const prior = this.opChains.get(id) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(op);
     this.opChains.set(id, next);
@@ -119,7 +154,7 @@ export class PluginsService {
   }
 
   enable(id: string): Promise<{ success: boolean; message: string }> {
-    return this.serialize(id, () => this.enableInner(id));
+    return this.serialize(id, () => this.enableInner(id).catch(notApplied));
   }
 
   private async enableInner(id: string): Promise<{ success: boolean; message: string }> {
@@ -143,6 +178,8 @@ export class PluginsService {
       this.pluginLoader.setOperatorEnabled(id, true);
       return { success: true, message: `Plugin ${id} enabled successfully` };
     } catch (error) {
+      // Running, but the decision could not be stored: stop it again, or it would run now and not after a restart.
+      if (error instanceof PluginRegistryWriteError) await this.pluginLoader.disablePlugin(id).catch(() => undefined);
       return {
         success: false,
         message: error instanceof Error ? error.message : String(error),
@@ -151,7 +188,7 @@ export class PluginsService {
   }
 
   disable(id: string): Promise<{ success: boolean; message: string }> {
-    return this.serialize(id, () => this.disableInner(id));
+    return this.serialize(id, () => this.disableInner(id).catch(notApplied));
   }
 
   private async disableInner(id: string): Promise<{ success: boolean; message: string }> {
@@ -187,16 +224,18 @@ export class PluginsService {
       };
     }
 
-    if (plugin.status !== PluginStatus.ENABLED) {
-      // Clear the decision here too: a plugin sitting in ERROR after a failed restore is not ENABLED,
-      // and disabling it must stop the gateway retrying it on every boot.
+    if (plugin.status !== PluginStatus.ENABLED && plugin.status !== PluginStatus.ERROR) {
+      // Clear the decision here too so disabling an installed/disabled plugin stops the gateway
+      // from retrying it on boot if an older registry entry kept enabledByOperator set.
       this.pluginLoader.setOperatorEnabled(id, false);
       return { success: true, message: `Plugin ${id} is not enabled` };
     }
 
+    // The decision is stored before the plugin stops: one that cannot be stored refuses the disable (see
+    // notApplied) with the plugin still running, as the answer says. A failed stop keeps the stored decision.
+    this.pluginLoader.setOperatorEnabled(id, false);
     try {
       await this.pluginLoader.disablePlugin(id);
-      this.pluginLoader.setOperatorEnabled(id, false);
       return { success: true, message: `Plugin ${id} disabled successfully` };
     } catch (error) {
       return {
@@ -215,14 +254,16 @@ export class PluginsService {
     // is fenced with @RequireUnscopedKey, so only an unrestricted key can reach this — a scoped key
     // must never be allowed to delete another tenant's activation by sending [] or its own session.
     try {
-      this.pluginLoader.setPluginSessions(id, sessions);
+      this.pluginLoader.setPluginSessions(id, sessions, { mustPersist: true });
     } catch (error) {
+      if (error instanceof PluginRegistryWriteError) throw new InternalServerErrorException(error.message);
+      if (error instanceof PluginUninstallingError) throw new ConflictException(error.message);
       throw new BadRequestException(error instanceof Error ? error.message : String(error));
     }
     return this.findOne(id);
   }
 
-  updateConfig(id: string, config: Record<string, unknown>): { success: boolean; message: string } {
+  async updateConfig(id: string, config: Record<string, unknown>): Promise<{ success: boolean; message: string }> {
     const plugin = this.pluginLoader.getPlugin(id);
 
     if (!plugin) {
@@ -231,11 +272,27 @@ export class PluginsService {
 
     try {
       // The dashboard PUTs the whole (redacted) config back, so a sentinel secret means "unchanged":
-      // restore the stored value instead of overwriting the real secret with the mask.
-      const merged = restoreSecretConfig(config, plugin.config, plugin.manifest.configSchema);
-      this.pluginLoader.updatePluginConfig(id, merged);
+      // restore the stored value instead of overwriting the real secret with the mask. From the stored
+      // config, not the runtime one: a built-in's runtime config carries its env-derived settings, and
+      // restoring a mask from those would store them over every later .env change. A write that points
+      // an allowConfigHosts key at another origin gets no stored secret back.
+      const stored = this.pluginLoader.getRegistryEntry(id)?.config ?? {};
+      const base = getBuiltInBaseConfig(plugin);
+      const merged = restoreSecretConfig(
+        config,
+        restorableConfig(stored, config, plugin.manifest, base, { nullRevertsToBeneath: Boolean(base) }),
+        plugin.manifest.configSchema,
+        { mergedOverStored: true },
+      );
+      if (!(await updatePluginConfigDurable(plugin, merged, { mustPersist: true }))) {
+        this.pluginLoader.updatePluginConfig(id, merged, { mustPersist: true });
+      }
       return { success: true, message: `Plugin ${id} configuration updated` };
     } catch (error) {
+      if (error instanceof PluginUninstallingError) throw new ConflictException(error.message);
+      if (error instanceof PluginInstanceSanitizationError) {
+        throw new InternalServerErrorException(error.message);
+      }
       return {
         success: false,
         message: error instanceof Error ? error.message : String(error),
@@ -265,10 +322,15 @@ export class PluginsService {
 
     try {
       const existing = plugin.sessionConfig?.[sessionId];
-      const merged = restoreSecretConfig(config, existing, plugin.manifest.configSchema);
-      this.pluginLoader.setPluginSessionConfig(id, sessionId, merged);
+      const merged = restoreSecretConfig(
+        config,
+        restorableConfig(existing, config, plugin.manifest, plugin.config),
+        plugin.manifest.configSchema,
+      );
+      this.pluginLoader.setPluginSessionConfig(id, sessionId, merged, { mustPersist: true });
       return { success: true, message: `Plugin ${id} configuration for session ${sessionId} updated` };
     } catch (error) {
+      if (error instanceof PluginUninstallingError) throw new ConflictException(error.message);
       return {
         success: false,
         message: error instanceof Error ? error.message : String(error),
@@ -326,13 +388,24 @@ export class PluginsService {
     return fs.readFileSync(real, 'utf-8');
   }
 
+  /**
+   * parsePluginPackage under this host's ingress policy: install, the id peek of installPackage and an update all
+   * refuse at parse time what the loader would refuse at load, so a package it would refuse is never written and
+   * never replaces a running plugin.
+   */
+  private parsePackage(buffer: Buffer): ParsedPackage {
+    return parsePluginPackage(buffer, DEFAULT_PACKAGE_LIMITS, {
+      allowUnsignedIngress: this.configService.get<boolean>('ingress.allowUnsigned', false),
+    });
+  }
+
   /** Install a plugin from an uploaded .zip: validate the package, write it to the plugins dir, and load it. */
   install(file?: { buffer?: Buffer }): PluginDto {
     if (!file?.buffer?.length) {
       throw new BadRequestException('No plugin file uploaded');
     }
 
-    const { manifest, entries } = parsePluginPackage(file.buffer);
+    const { manifest, entries } = this.parsePackage(file.buffer);
 
     if (this.pluginLoader.getPlugin(manifest.id)) {
       throw new ConflictException(`Plugin "${manifest.id}" is already installed`);
@@ -350,39 +423,85 @@ export class PluginsService {
         throw new ConflictException(`A plugin directory "${manifest.id}" already exists`);
       }
       // `existsSync` answers for the link's TARGET, so narrowing the guard above must not also
-      // narrow containment: a link planted at this path would send every write below — and the
-      // rollback's delete — wherever it points.
-      if (fs.realpathSync(dir) !== path.join(fs.realpathSync(pluginsDir), manifest.id)) {
+      // narrow containment: a link planted at this path, or anywhere along an archive entry's path,
+      // would send every write below, and the rollback's delete, wherever it points.
+      const dirStat = lstatIfPresent(dir);
+      if (dirStat?.isSymbolicLink() || fs.realpathSync(dir) !== path.join(fs.realpathSync(pluginsDir), manifest.id)) {
         throw new ConflictException(`A plugin directory "${manifest.id}" already exists`);
       }
       // Merging into a pre-existing directory means an entry path can already be occupied by a
-      // directory. Refusing here keeps that a conflict; writing into it fails with EISDIR, which
-      // the rollback below cannot clean up either.
+      // directory or symlink. Refusing here keeps that a conflict; writing into a directory fails
+      // with EISDIR and writing into a symlink (including a dangling one) escapes containment.
       for (const entry of entries) {
+        assertWritePathNoSymlinks(
+          dir,
+          entry.relPath,
+          detail => new ConflictException(`Cannot install "${manifest.id}": "${entry.relPath}" ${detail}`),
+        );
         const dest = path.join(dir, entry.relPath);
-        if (fs.existsSync(dest) && fs.statSync(dest).isDirectory()) {
+        const destStat = lstatIfPresent(dest);
+        if (destStat && destStat.isDirectory()) {
           throw new ConflictException(`Cannot install "${manifest.id}": "${entry.relPath}" is a directory`);
         }
       }
     }
 
     // Write the validated entries then load; roll back on any failure so a bad package never leaves
-    // a half-installed plugin behind. Into a pre-existing directory the rollback removes only the
-    // files this install actually wrote: the directory holds the operator's stored data, and
-    // deleting it to undo a failed reinstall would destroy exactly what the reinstall promised to
-    // keep.
-    const written: string[] = [];
+    // a half-installed plugin behind. Into a pre-existing directory the rollback touches only the
+    // files this install reached: the directory holds the operator's stored data, and deleting it to
+    // undo a failed reinstall would destroy exactly what the reinstall promised to keep. A file the
+    // install created is removed; one it replaced (an entry named like a stored file) gets its bytes
+    // back, and a directory it created goes too, so a failed reinstall leaves the directory as it found it.
+    const written: Array<{ dest: string; previous: Buffer | null }> = [];
+    // The first directory each mkdir is to create: nothing below it existed before, so all of it is this install's.
+    // Recorded before the call, since a mkdir that fails part-way (a name past the filesystem limit) leaves what it made.
+    const createdDirs: string[] = [];
     try {
       for (const entry of entries) {
         const dest = path.join(dir, entry.relPath);
+        const firstMissing = firstMissingDir(path.dirname(dest));
+        if (firstMissing) createdDirs.push(firstMissing);
         fs.mkdirSync(path.dirname(dest), { recursive: true });
-        fs.writeFileSync(dest, entry.data);
-        written.push(dest);
+        const previous = fs.existsSync(dest) ? fs.readFileSync(dest) : null;
+        // A file this install replaces is recorded before the write, because a write that fails midway leaves it
+        // truncated. One it creates is recorded after, so a write that failed at open (a name too long for the
+        // filesystem) leaves nothing to undo, unless the write failed after the file came to exist.
+        if (previous !== null) written.push({ dest, previous });
+        try {
+          fs.writeFileSync(dest, entry.data);
+        } catch (writeError) {
+          if (previous === null && fs.existsSync(dest)) written.push({ dest, previous });
+          throw writeError;
+        }
+        if (previous === null) written.push({ dest, previous });
       }
       this.pluginLoader.loadPlugin(dir);
     } catch (error) {
       if (dirExisted) {
-        for (const dest of written) fs.rmSync(dest, { force: true });
+        for (const { dest, previous } of written) {
+          // One file that cannot be put back must not stop the others or hide why the install failed.
+          try {
+            if (previous === null) fs.rmSync(dest, { force: true });
+            else fs.writeFileSync(dest, previous);
+          } catch (undoError) {
+            logger.warn(`Could not undo the write of ${dest} after a failed install of ${manifest.id}`, {
+              pluginId: manifest.id,
+              action: 'plugin_install_undo_failed',
+              error: undoError instanceof Error ? undoError.message : String(undoError),
+            });
+          }
+        }
+        for (const created of createdDirs.reverse()) {
+          try {
+            fs.rmSync(created, { recursive: true, force: true });
+          } catch (undoError) {
+            logger.warn(`Could not remove ${created} after a failed install of ${manifest.id}`, {
+              pluginId: manifest.id,
+              action: 'plugin_install_undo_failed',
+              error: undoError instanceof Error ? undoError.message : String(undoError),
+            });
+          }
+        }
       } else {
         fs.rmSync(dir, { recursive: true, force: true });
       }
@@ -405,11 +524,21 @@ export class PluginsService {
    * means the package was substituted in transit and the install fails closed.
    */
   async installFromUrl(url: string): Promise<PluginDto> {
-    const buffer = await this.downloadPackage(url);
-    // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
-    // directory — is serialized against any concurrent uninstall/update of the same id.
-    const { manifest } = parsePluginPackage(buffer);
-    return this.serialize(manifest.id, () => Promise.resolve(this.install({ buffer })));
+    // The SSRF download stays outside the lock; the install itself takes it.
+    return this.installPackage({ buffer: await this.downloadPackage(url) });
+  }
+
+  /**
+   * {@link install} under the same per-id lock as uninstall and update. The id is peeked from the package
+   * first, so an install (which writes the plugin directory) cannot interleave with a teardown of that
+   * plugin that is still awaiting its takeovers, and then remove the files the install just wrote.
+   */
+  async installPackage(file?: { buffer?: Buffer }): Promise<PluginDto> {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('No plugin file uploaded');
+    }
+    const { manifest } = this.parsePackage(file.buffer);
+    return this.serialize(manifest.id, () => Promise.resolve(this.install(file)));
   }
 
   /**
@@ -465,10 +594,10 @@ export class PluginsService {
     try {
       const parsed: unknown = JSON.parse(raw.toString('utf8'));
       if (!Array.isArray(parsed)) throw new Error('catalog is not a JSON array');
-      if (!parsed.every(e => typeof e === 'object' && e !== null && !Array.isArray(e))) {
-        throw new Error('catalog entries must be JSON objects');
+      if (!parsed.every(isCatalogEntry)) {
+        throw new Error('catalog entries must be JSON objects with a string id, name and version');
       }
-      entries = parsed as CatalogEntry[];
+      entries = parsed;
     } catch (error) {
       throw new BadRequestException(
         `Invalid plugin catalog JSON: ${error instanceof Error ? error.message : String(error)}`,
@@ -508,7 +637,7 @@ export class PluginsService {
     }
 
     // Validate the new package BEFORE touching the running plugin. An update must be the same plugin.
-    const { manifest, entries } = parsePluginPackage(buffer);
+    const { manifest, entries } = this.parsePackage(buffer);
     if (manifest.id !== id) {
       throw new BadRequestException(`Package id "${manifest.id}" does not match the plugin being updated ("${id}")`);
     }
@@ -577,6 +706,28 @@ export class PluginsService {
           action: 'plugin_update_backup_restored',
         });
       }
+      // ctx.storage files share the package directory under shipped defaults. Carry them into the staged
+      // tree before the swap, so the live directory is complete the moment it takes the name: a crash after
+      // the swap must not leave state only in a backup that boot recovery drops once a live directory exists.
+      // Everything is carried unless the new package explicitly supplied that exact path: encoded key-* files
+      // and the legacy <key>.json files the storage service still reads (every top-level *.json except the
+      // package's manifest.json/package.json). Copy (rather than move) so the rollback below still has a
+      // complete original directory.
+      const packagePaths = new Set(entries.map(entry => entry.relPath));
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (
+          !entry.isFile() ||
+          !entry.name.endsWith('.json') ||
+          entry.name === 'manifest.json' ||
+          entry.name === 'package.json' ||
+          packagePaths.has(entry.name)
+        ) {
+          continue;
+        }
+        const stateFile = path.join(staging, entry.name);
+        fs.copyFileSync(path.join(dir, entry.name), stateFile);
+        fs.chmodSync(stateFile, 0o600);
+      }
       fs.rmSync(backup, { recursive: true, force: true });
       fs.renameSync(dir, backup);
       fs.renameSync(staging, dir);
@@ -603,26 +754,6 @@ export class PluginsService {
     });
 
     try {
-      // ctx.storage files share the package directory under shipped defaults. Restore state from the
-      // backup unless the new package explicitly supplied that exact path: encoded key-* files and the
-      // legacy <key>.json files the storage service still reads (every top-level *.json except the
-      // package's manifest.json/package.json). Copy (rather than move) so the rollback below still has
-      // a complete original directory.
-      const packagePaths = new Set(entries.map(entry => entry.relPath));
-      for (const entry of fs.readdirSync(backup, { withFileTypes: true })) {
-        if (
-          !entry.isFile() ||
-          !entry.name.endsWith('.json') ||
-          entry.name === 'manifest.json' ||
-          entry.name === 'package.json' ||
-          packagePaths.has(entry.name)
-        ) {
-          continue;
-        }
-        const stateFile = path.join(dir, entry.name);
-        fs.copyFileSync(path.join(backup, entry.name), stateFile);
-        fs.chmodSync(stateFile, 0o600);
-      }
       this.pluginLoader.loadPlugin(dir);
       // Shutdown may have begun while the old version was being stopped: roll back below rather than
       // keep the new version untested with its backup deleted.
@@ -685,10 +816,27 @@ export class PluginsService {
     }
 
     try {
-      await this.pluginLoader.uninstallPlugin(id);
+      const { registryEntryKept } = await this.pluginLoader.uninstallPlugin(id);
+      if (registryEntryKept) {
+        // The plugin has no card left on the Plugins page, so the answer names the call that removes the entry.
+        return {
+          success: true,
+          message:
+            `Plugin ${id} uninstalled, but the plugin registry could not be written: registry.json keeps its entry, ` +
+            'emptied of config, sessions and the enable decision, reported at startup as a plugin with no code ' +
+            `until DELETE /api/plugins/${id} is repeated once the registry is writable`,
+        };
+      }
       return { success: true, message: `Plugin ${id} uninstalled successfully` };
     } catch (error) {
-      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      // Raised only by the write that empties the entry, before anything is removed, so nothing was applied.
+      if (error instanceof PluginRegistryWriteError) throw new InternalServerErrorException(error.message);
+      // The cause tells the controller whether the failure came after the entry was emptied (it audits that one).
+      // With options, Nest drops the body's `error` field unless the description is passed too.
+      throw new BadRequestException(error instanceof Error ? error.message : String(error), {
+        cause: error,
+        description: 'Bad Request',
+      });
     }
   }
 

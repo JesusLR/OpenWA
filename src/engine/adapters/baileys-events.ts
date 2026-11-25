@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
 import type * as BaileysLib from '@whiskeysockets/baileys';
 import type { WACallEvent, WAMessage, WAMessageKey, WASocket } from '@whiskeysockets/baileys';
 import {
@@ -10,9 +12,12 @@ import {
   InboundReceipt,
   InboundTicket,
   ParticipantPresence,
+  PollVoteEvent,
   PresenceState,
   CallOutcome,
   IncomingMessage,
+  MessageReceiptEvent,
+  MessageReceiptStatus,
   MessageType,
   ReactionEvent,
   RevokedMessage,
@@ -21,22 +26,34 @@ import {
   BAILEYS_NON_CONTENT_TYPES,
   baileysChatJid,
   buildIncomingMessageFromBaileys,
+  contentTypeOf,
   extractBaileysBody,
   extractBaileysButtonReply,
   extractBaileysButtons,
   extractBaileysCommerce,
   extractBaileysPoll,
+  extractBaileysRawPoll,
   extractBaileysContext,
   extractBaileysLocation,
   isBaileysCatalogShare,
+  isNoiseOnly,
+  isNonContent,
   keyParticipant,
   mapBaileysEventResponseType,
   mapBaileysStatus,
   setBaileysText,
+  withoutFastRatchetDistribution,
 } from './baileys-message-mapper';
-import { buildEditedMessage } from './message-mapper';
+import { boundPollOptions, boundPollText, buildEditedMessage } from './message-mapper';
 import { toUnixSeconds } from './baileys-history';
-import { bytesOf, decryptSecretPayload, messageSecretOf, senderForms, withoutDevice } from './baileys-secret-payload';
+import {
+  bytesOf,
+  decryptSecretPayload,
+  hasSecretPayloadBounds,
+  messageSecretOf,
+  senderForms,
+  withoutDevice,
+} from './baileys-secret-payload';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import {
@@ -45,6 +62,7 @@ import {
   coerceDeclaredSize,
   inboundMediaMaxBytes,
   inboundMediaTimeoutMs,
+  isDroppedEphemeral,
   isMediaDownloadEnabled,
   runUnderGlobalMediaGate,
   withInboundDownloadTimeout,
@@ -54,7 +72,8 @@ import type { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter'
 import { type createLogger } from '../../common/services/logger.service';
 import { createSilentLogger } from './baileys-logger';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
-import { parseWaId, userPart } from '../identity/wa-id';
+import { GroupAckAggregator } from './baileys-group-ack';
+import { chatKind, parseWaId, userPart, type ChatKind } from '../identity/wa-id';
 
 /**
  * Inbound event handling extracted from BaileysAdapter: the socket event handlers
@@ -95,23 +114,24 @@ const PRESENCE_STATES: ReadonlySet<PresenceState> = new Set<PresenceState>([
 ]);
 
 /**
- * Top-level Message keys that carry no user content. A live message made only of these is dropped;
- * messageContextInfo rides along on real content too, so on its own it is not enough to drop.
+ * The chats a per-recipient receipt is reported for: the two Baileys raises message-receipt.update for, and the
+ * only ones message.receipt is documented for. A 1:1 chat reports through messages.update instead.
  */
-const PROTOCOL_NOISE_KEYS: ReadonlySet<string> = new Set([
-  'senderKeyDistributionMessage',
-  'fastRatchetKeySenderKeyDistributionMessage',
-  'messageContextInfo',
-  'messageHistoryNotice',
-  'messageHistoryBundle',
-]);
+const RECEIPT_CHAT_KINDS: ReadonlySet<ChatKind> = new Set<ChatKind>(['group', 'status']);
+
+/** Wire value of `proto.WebMessageInfo.StubType.CIPHERTEXT`, set when part of a stanza failed to decrypt. */
+const CIPHERTEXT_STUB_TYPE = 2 as BaileysLib.proto.WebMessageInfo.StubType;
 
 /**
- * Whether two ids provably name different chats or people. Each side is a jid plus the other-dialect
- * twin WhatsApp may send beside it (`remoteJidAlt`, `participantAlt`), compared neutralised, so a lid
- * the session can resolve matches its phone number. A lid it cannot resolve may still be the phone
- * number on the other side, so that pair is never called different, and neither is a side with no id:
- * a caller that drops on a mismatch fails open.
+ * Whether two ids provably name different chats or people. Each side is a jid plus the other-dialect twin WhatsApp may
+ * send beside it (`remoteJidAlt`, `participantAlt`), compared as `toNeutralJid` writes them, so a lid that function
+ * resolves matches its phone number. The adapter's own resolves only the account's lid. A side that carries a phone
+ * number of its own is compared by it: a lid sent with its sender's number differs from another number exactly as that
+ * number would, so a contact whose number changed, sending its lid and the new number against a message kept under the
+ * old number only, reads as somebody else, as the same change sent by number does. A lid with no number beside it that
+ * `toNeutralJid` cannot resolve may still be the phone number on the other side, so that pair is never called
+ * different, and neither is a side with no id: a caller that drops on a mismatch fails open there, which still lets a
+ * sender known only by such a lid through.
  */
 export function differentWaIds(
   a: ReadonlyArray<string | null | undefined>,
@@ -122,8 +142,24 @@ export function differentWaIds(
   const y = b.filter((j): j is string => !!j).map(toNeutralJid);
   if (!x.length || !y.length || x.some(j => y.includes(j))) return false;
   const lidGap = (p: string[], q: string[]): boolean =>
-    p.some(j => j.endsWith('@lid')) && !q.some(j => j.endsWith('@lid')) && q.some(j => j.endsWith('@c.us'));
+    p.some(j => j.endsWith('@lid')) &&
+    !p.some(j => j.endsWith('@c.us')) &&
+    !q.some(j => j.endsWith('@lid')) &&
+    q.some(j => j.endsWith('@c.us'));
   return !lidGap(x, y) && !lidGap(y, x);
+}
+
+/**
+ * The ids a message key names its chat by, for {@link differentWaIds}. On a key of the account's own
+ * message Baileys fills `remoteJidAlt` from the sender's addressing, which is the account itself rather
+ * than the chat, so it is left out there (as mayChange and recordKeyLidMappings leave it out).
+ */
+export function keyChatIds(key: {
+  remoteJid?: string | null;
+  remoteJidAlt?: string | null;
+  fromMe?: boolean | null;
+}): Array<string | null | undefined> {
+  return [key.remoteJid, key.fromMe === true ? undefined : key.remoteJidAlt];
 }
 
 /**
@@ -193,6 +229,12 @@ function mediaSubMessage(normalized: NonNullable<WAMessage['message']>) {
   );
 }
 
+/** A group member as the roster shows them: every id form they are listed under, and whether they are an admin. */
+export interface GroupMember {
+  ids: string[];
+  admin: boolean;
+}
+
 export interface BaileysEventsHost {
   /** Live socket handle for media re-upload requests (inbound media download). */
   getSocket(): WASocket;
@@ -208,11 +250,25 @@ export interface BaileysEventsHost {
   /** The adapter's inbound media download gate (shared so the bound holds across all inbound paths). */
   readonly inboundLimiter: ConcurrencyLimiter;
   /** Learn any lid->pn pair a message key carries (also writes through to the persistent table). */
-  recordKeyLidMappings(key: Pick<WAMessageKey, 'remoteJid' | 'remoteJidAlt' | 'participant' | 'participantAlt'>): void;
-  /** Seed the chat's last-message preview + sort time from an inbound message. */
-  recordMessage(msg: WAMessage, type?: MessageType): void;
-  /** Apply a message edit to the stored body. */
-  recordMessageEdit(chatId: string, messageId: string, text: string, type?: MessageType): void;
+  recordKeyLidMappings(
+    key: Pick<WAMessageKey, 'remoteJid' | 'remoteJidAlt' | 'participant' | 'participantAlt' | 'fromMe'>,
+  ): void;
+  /**
+   * Seed the chat's last-message preview + sort time from an inbound message. `withhold` keeps its text out of the
+   * preview, for a message the session drops (see isDroppedEphemeral): its key, time and place in the order still count.
+   */
+  recordMessage(msg: WAMessage, type?: MessageType, order?: number, withhold?: boolean): void;
+  /** Reserve a message's place in the observed order on arrival, ahead of any limiter, store or media wait. */
+  nextMessageOrder?(): number;
+  /** Apply a message edit to the chat preview, when `accept` (if given) accepts the key the preview holds. */
+  recordMessageEdit(
+    chatId: string,
+    messageId: string,
+    text: string,
+    type?: MessageType,
+    accept?: (key: WAMessageKey) => boolean,
+  ): void;
+  findPersistedLidPhone?(jid: string): Promise<string | null>;
   /** Persist an inbound message to the store; undefined when no store is configured. */
   putStoredMessage(msg: WAMessage): Promise<void> | undefined;
   /** Rewrite a stored message in place (see BaileysMessageStore.update); undefined without a store. */
@@ -242,10 +298,34 @@ export interface BaileysEventsHost {
   getOnMessageReaction(): EngineEventCallbacks['onMessageReaction'];
   /** The currently-registered onMessageAck callback, if any (assigned at initialize()). */
   getOnMessageAck(): EngineEventCallbacks['onMessageAck'];
+  /** The currently-registered onMessageReceipt callback, if any (assigned at initialize()). */
+  getOnMessageReceipt(): EngineEventCallbacks['onMessageReceipt'];
+  /**
+   * The members of a group, one list per member holding every id form the roster gives them (`id`, `lid`,
+   * `phoneNumber`), from the cached metadata when it is fresh. Null when the roster cannot be read. Without it
+   * a group message keeps no aggregate ack.
+   */
+  readGroupRoster?(groupId: string): Promise<string[][] | null>;
+  /**
+   * The same members, each with whether the roster shows them an admin. Null when the roster cannot be read; a group
+   * delete of someone else's message is then applied as an admin's.
+   */
+  readGroupMembers?(groupId: string): Promise<GroupMember[] | null>;
+  /**
+   * The same members from the cached group metadata alone: never a query, so it answers at once, and null when the
+   * cache holds none (nothing read yet, expired, or switched off by `BAILEYS_GROUP_METADATA_CACHE_TTL_MS=0`).
+   */
+  peekGroupMembers?(groupId: string): GroupMember[] | null;
+  /** The phone user part the session knows for a lid, or null; no network read. */
+  resolvePhone?(jid: string): string | null;
+  /** The lid jid the session knows for a phone jid or lid, or null; no network read. */
+  lidOf?(jid: string): string | null;
   /** The currently-registered onGroupEvent callback, if any (assigned at initialize()). */
   getOnGroupEvent(): EngineEventCallbacks['onGroupEvent'];
   /** The currently-registered onEventResponse callback, if any (assigned at initialize()). */
   getOnEventResponse(): EngineEventCallbacks['onEventResponse'];
+  /** The currently-registered onPollVote callback, if any (assigned at initialize()). */
+  getOnPollVote(): EngineEventCallbacks['onPollVote'];
   /** A contact from the session's own store, by any id dialect; no network read. */
   findContact(contactId: string): Contact | null;
   /** The currently-registered onCall callback, if any (assigned at initialize()). */
@@ -258,7 +338,7 @@ export interface BaileysEventsHost {
 
 /** The subset of a Baileys `messages.update` entry this adapter reads. */
 interface BaileysMessageUpdate {
-  key?: { id?: string | null; remoteJid?: string | null };
+  key?: { id?: string | null; remoteJid?: string | null; fromMe?: boolean | null };
   update?: { status?: number | null; eventResponses?: BaileysEventResponse[] | null };
 }
 
@@ -273,6 +353,14 @@ interface BaileysEventResponse {
   } | null;
 }
 
+interface LiveCallHandle {
+  callFrom: string;
+  expiresAt: number;
+  from: string;
+  isVideo: boolean;
+  isGroup: boolean;
+}
+
 /** Every teardown clears the live-call map; counting those clears lets a reject in flight tell that its
  *  connection was torn down meanwhile. */
 class LiveCallMap<V> extends Map<string, V> {
@@ -284,6 +372,14 @@ class LiveCallMap<V> extends Map<string, V> {
   }
 }
 
+/** A rejection awaiting WhatsApp: the handle it took out of the live calls, and the teardowns seen when it began. */
+interface CallRejection {
+  entry: LiveCallHandle;
+  clears: number;
+  /** A `terminate` for the call arrived meanwhile: the call is over, whatever the attempt turns out to be. */
+  ended: boolean;
+}
+
 export class BaileysEvents {
   /** How long a received call's handle stays rejectable. Calls ring for roughly a minute, so
    *  two minutes covers the ringing window with margin without pinning dead calls for long. */
@@ -292,13 +388,16 @@ export class BaileysEvents {
   /** Live incoming calls by call id, holding the raw `from` JID sock.rejectCall() needs — the
    *  call event is long gone by the time a reject arrives, so it must be cached at event time.
    *  Readonly reference, owned here; the adapter's lifecycle clears it on teardown. */
-  readonly liveCalls = new LiveCallMap<{
-    callFrom: string;
-    expiresAt: number;
-    from: string;
-    isVideo: boolean;
-    isGroup: boolean;
-  }>();
+  readonly liveCalls = new LiveCallMap<LiveCallHandle>();
+
+  /**
+   * Calls whose rejection is pending. The handle is out of liveCalls meanwhile, so it cannot be rejected
+   * twice, yet a signal that ends the call still finds it here and publishes its outcome. A signal that
+   * publishes an outcome of its own (accept, reject, timeout), a ring of another call under the id and a
+   * teardown make the rejection stale. A `terminate`, or another tag of the same call, does not: WhatsApp may
+   * send the terminate that follows our own rejection before it acknowledges it.
+   */
+  private readonly rejections = new Map<string, CallRejection>();
 
   /** How many ids the record of deletes for everyone keeps before it forgets the oldest. */
   static readonly DELETED_FOR_EVERYONE_LIMIT = 5_000;
@@ -310,7 +409,7 @@ export class BaileysEvents {
    */
   private readonly inboundInFlight = new Map<
     string,
-    { key: WAMessageKey; message: WAMessage['message']; done: Promise<void> }
+    { key: WAMessageKey; message: WAMessage['message']; done: Promise<void>; timestamp: number; order: number }
   >();
 
   /**
@@ -326,10 +425,14 @@ export class BaileysEvents {
    * The latest edit of a message still being processed, by id, with the key it was sent under. The
    * edit is announced first and finds no row or preview to change, and a repeat delivery can be stored
    * after the edit was applied, so the original is stored and announced with this text instead, and
-   * a quote or forward meanwhile carries it too (see pendingEditOf). Dropped once the message's
-   * processing settles, and bounded like deletedForEveryone, which wins over it.
+   * a quote or forward meanwhile carries it too (see pendingEditOf). `afterOtherText` says an earlier
+   * edit had another text, so one of them changed the text even if this one restores it. Dropped once
+   * the message's processing settles, and bounded like deletedForEveryone, which wins over it.
    */
-  private readonly editedWhileInFlight = new Map<string, { envelope: WAMessageKey; body: string }>();
+  private readonly editedWhileInFlight = new Map<
+    string,
+    { envelope: WAMessageKey; body: string; afterOtherText: boolean; resolve?: (jid: string) => string | null }
+  >();
 
   /**
    * The deliveries of an id handed to onMessage that have no outcome yet, by id: how many, and a promise
@@ -340,10 +443,42 @@ export class BaileysEvents {
    * handed on. A change that arrives while the delivery is still being processed (limiter wait, repeat
    * check, media download) waits for that processing to end first.
    */
-  private readonly outcomesPending = new Map<string, { count: number; ended: Promise<void>; free: () => void }>();
+  private readonly outcomesPending = new Map<
+    string,
+    { count: number; ended: Promise<void>; free: () => void; timers: Set<ReturnType<typeof setTimeout>> }
+  >();
+
+  /**
+   * Reactions, edits and deletes that reached a message still being processed where nothing is admitted before
+   * the emit (SQLite), by its id, in the order they arrived, with the timer that lets them go if the message is
+   * never handed on. The session holds no entry for such a message until it is emitted, so a reaction announced
+   * earlier is stored nowhere and an edit leaves no marker: they are announced right after the emit instead (see
+   * announceWhenHandedOn).
+   */
+  private readonly changesAwaitingEmit = new Map<
+    string,
+    { announce: Array<() => void>; timer: ReturnType<typeof setTimeout>; generation: number }
+  >();
 
   /** How many changes wait for a delivery or its outcome (see parkUntil); the rest are judged at once. */
   private changesParked = 0;
+
+  /**
+   * How many changes wait in changesAwaitingEmit; the rest are announced at once. Counted apart from the parks,
+   * so changes waiting for their message cannot make a change that has to wait for an outcome be dropped.
+   */
+  private changesAwaiting = 0;
+
+  /** Up to 64 preparations keep per-message order across directory reads; later arrivals wait for room. */
+  private readonly messageChanges = new KeyedMutationQueue();
+  private changesPreparing = 0;
+  private preparationRoom?: { ready: Promise<void>; release: () => void };
+  /**
+   * What fenceStoredWrites runs to end the preparations still under way, one entry per preparation until it has
+   * ended. Each settles the promises that preparation waits on itself: racing them against a promise the adapter
+   * keeps for good would leave a reaction on it for every change, for as long as the account stays linked.
+   */
+  private readonly preparationRetirements = new Set<() => void>();
 
   private static readonly CHANGES_PARKED_LIMIT = 64;
 
@@ -366,11 +501,56 @@ export class BaileysEvents {
    */
   private storeGeneration = 0;
 
+  /**
+   * Turns the per-member receipts of a group message into the `delivered` and `read` acks Baileys never raises
+   * for one (its 1:1 status update does not fire for a group).
+   */
+  private readonly groupAcks = new GroupAckAggregator({
+    readRoster: groupId => this.readMemberRoster(groupId),
+    resolvePhone: jid => this.host.resolvePhone?.(jid) ?? null,
+    report: (messageId, status, chatId) => this.host.getOnMessageAck()?.(messageId, status, chatId),
+    warn: (message, context) => this.host.logger.warn(message, context),
+  });
+
   constructor(private readonly host: BaileysEventsHost) {}
+
+  /**
+   * The members of a group other than this account, or null when the roster is unavailable. A row is this
+   * account's when any of its ids is, or when a lid in it is one the session knows the account's phone number
+   * for ({@link selfMatcher} matches a lid only against the credentials' own `user.lid`, so credentials without
+   * one leave a lid-only row with nothing else to be recognised by).
+   */
+  private async readMemberRoster(groupId: string): Promise<string[][] | null> {
+    const roster = await this.host.readGroupRoster?.(groupId);
+    if (!roster) return null;
+    const isSelf = this.selfMatcher();
+    const ownPhone = userPart(this.host.normalizedSelfJid());
+    const isOwnLid = (jid: string): boolean =>
+      ownPhone !== '' && parseWaId(jid).kind === 'lid' && this.host.resolvePhone?.(jid) === ownPhone;
+    return roster.filter(forms => !forms.some(jid => isSelf(jid) || isOwnLid(jid)));
+  }
+
+  getStoredWriteGeneration(): number {
+    return this.storeGeneration;
+  }
 
   /** Drop the store writes of every message that arrived before now; call before wiping the store. */
   fenceStoredWrites(): void {
     this.storeGeneration++;
+    for (const waiting of this.changesAwaitingEmit.values()) clearTimeout(waiting.timer);
+    this.changesAwaitingEmit.clear();
+    this.changesAwaiting = 0;
+    const pendingOutcomes = [...this.outcomesPending.values()];
+    this.outcomesPending.clear();
+    for (const entry of pendingOutcomes) {
+      for (const timer of entry.timers) clearTimeout(timer);
+      entry.timers.clear();
+      entry.free();
+    }
+    const retirements = [...this.preparationRetirements];
+    this.preparationRetirements.clear();
+    for (const retire of retirements) retire();
+    this.wakePreparationWaiters();
   }
 
   /** Whether a delete for everyone of this message was accepted (see deletedForEveryone). */
@@ -385,7 +565,7 @@ export class BaileysEvents {
    */
   pendingEditOf(messageId: string, target: WAMessageKey): string | undefined {
     const edit = this.inboundInFlight.has(messageId) ? this.editedWhileInFlight.get(messageId) : undefined;
-    return edit && this.mayChange(target, edit.envelope, false) ? edit.body : undefined;
+    return edit && this.mayChange(target, edit.envelope, false, edit.resolve) ? edit.body : undefined;
   }
 
   /** Record an accepted delete for everyone of this message (see deletedForEveryone). */
@@ -397,26 +577,61 @@ export class BaileysEvents {
     }
   }
 
-  /** Apply a history delete to the raw cache without announcing a live message event. */
+  /**
+   * Apply a history delete to the raw cache without announcing a live message event. A group delete of someone
+   * else's message is applied as an admin's without reading the roster: it says who is an admin now, not when a
+   * delete synced from history was made, and refusing a former admin's delete would keep the withdrawn text.
+   */
   async applyHistoryRevoke(target: WAMessageKey, envelope: WAMessageKey): Promise<WAMessageKey | undefined> {
     if (!target.id) return undefined;
     const generation = this.storeGeneration;
     const found = await this.readTarget(target.id, 'checking what a history revoke targets');
     if (generation !== this.storeGeneration) return undefined;
     const original = found?.key ?? target;
-    if (!this.mayChange(original, envelope, true)) return undefined;
+    const resolve = await this.reportedPhones(original, envelope);
+    if (generation !== this.storeGeneration) return undefined;
+    if (!this.mayChange(original, envelope, true, resolve)) return undefined;
     if (found) this.markDeletedForEveryone(target.id);
     this.changeStoredMessage(target.id, copy =>
-      this.mayChange(copy.key, envelope, true) ? { ...copy, message: null } : null,
+      this.mayChange(copy.key, envelope, true, resolve) ? { ...copy, message: null } : null,
     );
     return original;
   }
 
+  /**
+   * Marks a `status@broadcast` delivery posted by this account as `fromMe: true` on a shallow copy when
+   * Baileys left `fromMe` off (its broadcast decoder compares `participant` only against the phone jid,
+   * not the account's lid). Recognises `selfMatcher()` (`user.id` and `user.lid`) plus a lid whose phone
+   * number the session already resolved; on `status@broadcast` Baileys also writes the sender's alternate
+   * dialect to `remoteJidAlt`. Never mutates Baileys' message or key.
+   */
+  private withOwnStatusDirection(msg: WAMessage): WAMessage {
+    if (msg.key.fromMe === true || msg.key.remoteJid !== 'status@broadcast') return msg;
+    const isSelf = this.selfMatcher();
+    const ownPhone = userPart(this.host.normalizedSelfJid());
+    const isOwn = (jid: string | null | undefined): boolean =>
+      !!jid &&
+      (isSelf(jid) || (ownPhone !== '' && parseWaId(jid).kind === 'lid' && this.host.resolvePhone?.(jid) === ownPhone));
+    if (![msg.key.participant, msg.key.participantAlt, msg.key.remoteJidAlt].some(isOwn)) return msg;
+    return { ...msg, key: { ...msg.key, fromMe: true } };
+  }
+
   handleMessagesUpsert(event: { messages: WAMessage[]; type: string }): void {
-    for (const msg of event.messages) {
-      if (!msg.message || !msg.key?.remoteJid) {
+    for (const rawMsg of event.messages) {
+      if (!rawMsg.message || !rawMsg.key?.remoteJid) {
         continue; // protocol/empty messages carry no neutral content
       }
+      const msg = this.withOwnStatusDirection(rawMsg);
+      // A receipt that arrives while this message's own upsert is still in Baileys' event buffer is merged
+      // into the upsert and raised as no message-receipt.update, which the echo skip below would then drop
+      // with the rest of the echo.
+      if (msg.userReceipt?.length) {
+        this.handleMessageReceiptUpdate(msg.userReceipt.map(receipt => ({ key: msg.key, receipt })));
+      }
+      // The same buffer merges a 1:1 delivery or read ack, or a rejection by the server, into the upsert as
+      // `status` and raises no messages.update. What a message carries before any ack (PENDING on an echo,
+      // SERVER_ACK on one the phone typed) maps to pending or sent and is not one.
+      const mergedAck = this.mergedAck(msg);
       // Baileys echoes every message this session sends through the API back through this same
       // path, tagged 'append', and sendContent() already emits onMessageCreate for those via
       // emitOwnSendEcho(). WhatsApp replays what the account typed on its phone while the gateway
@@ -439,6 +654,9 @@ export class BaileysEvents {
       // insert oracle both absorb; a loss is not recoverable, because Baileys acks the node before
       // it emits the upsert.
       if (msg.key.fromMe === true && this.host.consumeOwnSend(msg.key.id)) {
+        // The send returned about 100 ms ago (the buffer holds the upsert that long), so the message
+        // already has its row, or its entry in the projector.
+        if (mergedAck) this.handleMessagesUpdate([mergedAck]);
         this.host.logger.debug('Skipping the echo of a message this session sent', {
           msgId: msg.key.id ?? 'unknown',
           type: event.type,
@@ -459,22 +677,23 @@ export class BaileysEvents {
       // Throttle through the limiter so a burst of media messages can't run unbounded parallel
       // downloads (each a full decrypted buffer in heap). Ordering stays correct — the message store
       // keeps the newest by timestamp. The queue is unbounded, so a burst parks rather than shedding
-      // and the message keeps its media either way. The catch below is the teardown path: the
-      // limiter rejects only when it has been closed, since processInboundMessage handles its own
-      // failures (a media download that fails emits the omitted marker rather than throwing).
+      // and the message keeps its media either way. Nothing rejects here today: the limiter is never
+      // closed, and processInboundMessage handles its own failures (a media download that fails emits
+      // the omitted marker rather than throwing). The catch below is a net for the day something does,
+      // a closed or bounded limiter, so the message is still emitted rather than lost to an unhandled
+      // rejection.
       const generation = this.storeGeneration;
+      const order = this.host.nextMessageOrder?.();
       // Where the session holds a message until its row is written (PostgreSQL), admit it now, in
       // arrival order: its chat's order, and a slot of the session's room when it downloads media.
       const ticket = this.admitInbound(msg);
       const processed = this.host.inboundLimiter
-        .run(yieldSlot => this.processInboundMessage(msg, { generation, ticket, yieldSlot }))
+        .run(yieldSlot => this.processInboundMessage(msg, { generation, order, ticket, yieldSlot }))
         .catch((error: unknown) => {
-          // Only one failure can actually land here today: the limiter closing, an orderly teardown.
-          // Its queue is unbounded so it never sheds, and processInboundMessage swallows its own
-          // errors, so nothing else rejects. The other arm is defence in depth against a rejection
-          // shape that does not exist yet, and it names the error rather than calling it
-          // "saturated", which used to send operators to look at concurrency settings for a problem
-          // that was never there. The retry below cannot reject either, for the same reason.
+          if (generation !== this.storeGeneration) return;
+          // Names the failure rather than calling it "saturated", which used to send operators to look
+          // at concurrency settings for a problem that was never there. The retry below skips the
+          // limiter and processInboundMessage handles its own errors, so it cannot reject.
           const closed = error instanceof Error && error.message.startsWith('ConcurrencyLimiter closed');
           this.host.logger.warn(
             closed
@@ -482,11 +701,14 @@ export class BaileysEvents {
               : 'Inbound media download failed; emitting message without media',
             { msgId: msg.key?.id ?? 'unknown', ...(closed ? {} : { error: String(error) }) },
           );
-          return this.processInboundMessage(msg, { generation, skipMedia: true, ticket });
+          return this.processInboundMessage(msg, { generation, order, skipMedia: true, ticket });
         });
       // The room stays held until the processing settles too, and a message never emitted drops its turn.
       ticket?.holdUntil(processed);
       void processed.finally(() => ticket?.drop());
+      // A message the phone typed is created by that processing, and an ack that reached the projector
+      // first would find nothing to advance, so it waits until the message was handed on.
+      if (mergedAck) void processed.then(() => this.handleMessagesUpdate([mergedAck]));
       const id = msg.key.id;
       if (id) {
         // A repeat delivery can arrive while the first is still downloading and finish before it, so
@@ -495,6 +717,8 @@ export class BaileysEvents {
           key: msg.key,
           message: msg.message,
           done: Promise.all([this.inboundInFlight.get(id)?.done, processed]).then(() => undefined),
+          timestamp: toUnixSeconds(msg.messageTimestamp),
+          order: order ?? 0,
         };
         this.inboundInFlight.set(id, tracked);
         void tracked.done.finally(() => {
@@ -502,9 +726,44 @@ export class BaileysEvents {
           this.inboundInFlight.delete(id);
           // The edit's store write was chained behind this, so the store carries it (or a newer one) now.
           this.editedWhileInFlight.delete(id);
+          // A change that came in after the message was handed on, while it still counted as in flight.
+          this.handOverChanges(id);
         });
       }
     }
+  }
+
+  /**
+   * The messages the account received that this session is still processing (a download, the queue for a slot) and
+   * Baileys has counted as unread already, which it does when the message arrives and not once it is recorded: where
+   * each belongs, and its place in the order observed. What Baileys takes for no message (a reaction, an edit sent as
+   * a protocol message) is not listed, nor what this session drops as no message of its own (see
+   * isNonContent), which would otherwise keep a chat unread until the next read.
+   */
+  receivedInFlight(): Array<{ chatJid: string; id: string; timestamp: number; order: number }> {
+    const b = this.host.getLoadedLib?.();
+    const received = [];
+    for (const [id, { key, message, timestamp, order }] of this.inboundInFlight) {
+      if (key.fromMe === true || !key.remoteJid) continue;
+      if (b) {
+        const content = b.normalizeMessageContent(message ?? undefined) ?? message ?? undefined;
+        if (!b.isRealMessage({ key, message }) || isNonContent(content, b.getContentType)) continue;
+      }
+      received.push({ chatJid: baileysChatJid(key.remoteJid, key.participant, false), id, timestamp, order });
+    }
+    return received;
+  }
+
+  /** The ack Baileys' event buffer merged into the upsert of a message the account sent, as an update. */
+  private mergedAck(msg: WAMessage): BaileysMessageUpdate | undefined {
+    if (msg.key.fromMe !== true) return undefined;
+    const status = mapBaileysStatus(msg.status);
+    // A delivery or read ack is a 1:1 event (groups and statuses report receipts instead); the server
+    // rejecting a message is reported for every kind of chat.
+    const reported =
+      status === 'failed' ||
+      ((status === 'delivered' || status === 'read') && chatKind(msg.key.remoteJid!) === 'individual');
+    return reported ? { key: msg.key, update: { status: msg.status } } : undefined;
   }
 
   /**
@@ -516,7 +775,7 @@ export class BaileysEvents {
     const neutral = (jid: string): string => this.host.toNeutralJid(jid);
     return (
       (first.fromMe === true) !== (key.fromMe === true) ||
-      differentWaIds([first.remoteJid, first.remoteJidAlt], [key.remoteJid, key.remoteJidAlt], neutral) ||
+      differentWaIds(keyChatIds(first), keyChatIds(key), neutral) ||
       (key.fromMe !== true &&
         differentWaIds([first.participant, first.participantAlt], [key.participant, key.participantAlt], neutral))
     );
@@ -550,6 +809,15 @@ export class BaileysEvents {
     );
   }
 
+  /** Whether the session drops `msg` under STORE_EPHEMERAL_MESSAGES=false, by the timer its content carries. */
+  private dropsAsEphemeral(msg: WAMessage, ephemeralDuration: number | undefined): boolean {
+    return isDroppedEphemeral({
+      ephemeralDuration,
+      fromMe: msg.key.fromMe === true,
+      isStatusBroadcast: msg.key.remoteJid === 'status@broadcast',
+    });
+  }
+
   /**
    * Whether processing `msg` downloads its media: the gates of {@link resolveInboundMedia}, read before
    * the processing starts. True when the module is not loaded yet, which cannot happen once a socket
@@ -560,8 +828,9 @@ export class BaileysEvents {
     const ownStatusPost = msg.key.fromMe === true && msg.key.remoteJid === 'status@broadcast';
     const normalized = b.normalizeMessageContent(msg.message ?? undefined) ?? msg.message ?? undefined;
     return (
-      isBaileysMediaType(b.getContentType(normalized)) &&
+      isBaileysMediaType(contentTypeOf(normalized, b.getContentType)) &&
       !ownStatusPost &&
+      !this.dropsAsEphemeral(msg, extractBaileysContext(normalized ?? {}).ephemeralDuration) &&
       isMediaDownloadEnabled() &&
       coerceDeclaredSize(mediaSubMessage(normalized ?? {})?.fileLength) <= inboundMediaMaxBytes()
     );
@@ -590,10 +859,93 @@ export class BaileysEvents {
     });
   }
 
+  private async recordPreviewChange(
+    chatId: string,
+    messageId: string,
+    body: string,
+    type: MessageType | undefined,
+    generation: number,
+    envelope: WAMessageKey,
+    isDelete: boolean,
+    resolveStored: (jid: string) => string | null,
+    storedChatId?: string,
+  ): Promise<void> {
+    if (generation !== this.storeGeneration) return;
+    const pendingLids = new Set<string>();
+    const acceptFor = (
+      targetChatId: string,
+      resolve: (jid: string) => string | null,
+    ): ((key: WAMessageKey) => boolean) => {
+      const baseAccept = this.previewAuthor(envelope, isDelete, resolve);
+      const targetNeutral = this.host.toNeutralJid(targetChatId);
+      const targetKind = parseWaId(targetChatId).kind;
+      return key => {
+        if (targetKind === 'user' && key.remoteJid && parseWaId(key.remoteJid).kind === 'lid') {
+          const phone = resolve(key.remoteJid);
+          if (!phone) {
+            pendingLids.add(key.remoteJid);
+            return false;
+          }
+          if (`${phone}@c.us` !== targetNeutral) return false;
+        }
+        return baseAccept(key);
+      };
+    };
+    this.host.recordMessageEdit(chatId, messageId, body, type, acceptFor(chatId, resolveStored));
+    if (storedChatId && storedChatId !== chatId) {
+      this.host.recordMessageEdit(storedChatId, messageId, body, type, acceptFor(storedChatId, resolveStored));
+    }
+    if (parseWaId(chatId).kind === 'lid') {
+      const phone = await this.host.findPersistedLidPhone?.(chatId).catch(() => null);
+      if (generation !== this.storeGeneration) return;
+      if (phone) {
+        const phoneChatId = `${phone}@s.whatsapp.net`;
+        this.host.recordMessageEdit(phoneChatId, messageId, body, type, acceptFor(phoneChatId, resolveStored));
+      }
+    } else if (pendingLids.size > 0) {
+      const targetPhone = userPart(this.host.toNeutralJid(chatId));
+      for (const lidChatId of pendingLids) {
+        const phone = await this.host.findPersistedLidPhone?.(lidChatId).catch(() => null);
+        if (generation !== this.storeGeneration) return;
+        if (phone && phone === targetPhone) {
+          const resolveWithLid = (jid: string): string | null =>
+            userPart(jid) === userPart(lidChatId) ? phone : resolveStored(jid);
+          this.host.recordMessageEdit(lidChatId, messageId, body, type, acceptFor(lidChatId, resolveWithLid));
+        }
+      }
+    }
+  }
+
+  /**
+   * Whether an edit or delete sent under `envelope` may change the chat preview of the message keyed
+   * `key`. The preview is that chat's own, so only the author is judged: the account's message changes
+   * only by the account, a group member's only by that member, and a group delete (`isDelete`) comes from
+   * anyone, as an admin may delete, unless the roster shows its sender is no admin (see judgeGroupDelete),
+   * where the caller passes `isDelete` false. The change may name a message the store does not hold (a
+   * history-synced or an evicted one), which targetsForeignMessage then lets through for the session to
+   * judge; the preview is judged here instead. Ids that cannot be compared (a lid nothing resolves, against a
+   * phone) are not called different, as in readsAsForeign.
+   */
+  private previewAuthor(
+    envelope: WAMessageKey,
+    isDelete: boolean,
+    resolve: (jid: string) => string | null,
+  ): (key: WAMessageKey) => boolean {
+    return key => {
+      if (isDelete && parseWaId(key.remoteJid ?? '').kind === 'group') return true;
+      if ((key.fromMe === true) !== (envelope.fromMe === true)) return false;
+      if (key.fromMe === true || !key.participant) return true;
+      const authors = [key.participant, key.participantAlt];
+      const senders = [envelope.participant, envelope.participantAlt];
+      return !differentWaIds(authors, senders, this.authorNeutral(authors, senders, resolve));
+    };
+  }
+
   private async processInboundMessage(
     msg: WAMessage,
     opts: {
       generation: number;
+      order?: number;
       skipMedia?: boolean;
       ticket?: InboundTicket;
       yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
@@ -601,6 +953,7 @@ export class BaileysEvents {
   ): Promise<void> {
     try {
       const b = await this.host.loadLib();
+      if (opts.generation !== this.storeGeneration) return;
       const remoteJid = msg.key.remoteJid!;
       // The chat the events below report: a received broadcast-list message belongs to its sender's
       // chat. Store lookups and the foreign-message checks keep the raw key, which is what is stored.
@@ -615,136 +968,51 @@ export class BaileysEvents {
       // type drives routing here AND mapMessage. The protocol and reaction branches below read the
       // normalized content too: a client wraps an edit in `editedMessage`, and `ephemeralMessage` can hold
       // a revoke or a reaction just as well, so the raw root does not always carry them.
-      let normalizedRoot = b.normalizeMessageContent(msg.message ?? undefined) ?? msg.message ?? undefined;
-      let contentType = b.getContentType(normalizedRoot);
+      const normalizedRoot = b.normalizeMessageContent(msg.message ?? undefined) ?? msg.message ?? undefined;
+      const contentType = contentTypeOf(normalizedRoot, b.getContentType);
       // A contact's edit, and a reaction in some chats, arrive encrypted under the secret of the message
-      // they change. Read with the stored original's secret, they are handled below as the plain
-      // protocol or reaction message they stand for; one that cannot be read stays dropped as non-content.
+      // they change. Read with the stored original's secret, they are handled as the plain protocol or
+      // reaction message they stand for; one that cannot be read stays dropped as non-content. The read of
+      // the original is made in the queue of the message it changes, as every other change reads, so changes
+      // of one message are applied in the order they arrived in, whatever order the store answers the reads in.
       if (contentType === 'secretEncryptedMessage' || contentType === 'encReactionMessage') {
-        const revealed = await this.revealEncryptedModification(b, msg, normalizedRoot, contentType);
-        if (revealed) {
-          normalizedRoot = revealed.content;
-          contentType = revealed.contentType;
-        }
+        const encrypted =
+          contentType === 'secretEncryptedMessage'
+            ? normalizedRoot?.secretEncryptedMessage
+            : normalizedRoot?.encReactionMessage;
+        let handled = false;
+        await this.prepareMessageChange(
+          encrypted?.targetMessageKey?.id,
+          opts,
+          async (releasePreparation, yieldSlot) => {
+            const revealed = await this.revealEncryptedModification(
+              b,
+              msg,
+              normalizedRoot,
+              contentType,
+              opts.generation,
+            );
+            if (!revealed || opts.generation !== this.storeGeneration) return;
+            handled = true;
+            await this.processMessageChange(b, msg, revealed.content, revealed.contentType, {
+              ...opts,
+              yieldSlot,
+              releasePreparation,
+            });
+          },
+        );
+        if (handled) return;
       }
 
-      // --- protocolMessage REVOKE: don't emit onMessage ---
-      if (contentType === 'protocolMessage') {
-        const pm = normalizedRoot?.protocolMessage;
-        if (pm?.type === b.proto.Message.ProtocolMessage.Type.REVOKE) {
-          // A group admin may revoke anyone's message, so only the chat is checked there.
-          if (await this.targetsForeignMessage(pm.key?.id, msg.key, !remoteJid.endsWith('@g.us'), undefined, opts)) {
-            return;
-          }
-          const from = msg.key.fromMe === true ? this.host.normalizedSelfJid() : chatJid;
-          const to = msg.key.fromMe === true ? chatJid : this.host.normalizedSelfJid();
-          const revoked: RevokedMessage = {
-            id: pm.key?.id ?? '',
-            // The REVOKE protocolMessage's key points at the ORIGINAL deleted message,
-            // so `id` already IS the original here. Mirror it into `revokedId` so that
-            // field is the reliable cross-engine handle (wwebjs sets it separately).
-            revokedId: pm.key?.id ?? undefined,
-            chatId: this.host.toNeutralJid(chatJid),
-            from: this.host.toNeutralJid(from),
-            to: this.host.toNeutralJid(to),
-            type: 'revoked',
-            body: '',
-            timestamp: toUnixSeconds(msg.messageTimestamp),
-          };
-          this.host.recordMessageEdit(chatJid, revoked.id, '', 'revoked');
-          // While the target is still being processed, the store change waits for it and lands after
-          // this delete is announced, and a repeat delivery may already hold the content in the store:
-          // record the delete now, checked against the target's own key.
-          const target = this.inboundInFlight.get(revoked.id);
-          if (target && this.mayChange(target.key, msg.key, true)) {
-            this.markDeletedForEveryone(revoked.id);
-          }
-          // The stored copy keeps its key, so a late re-delivery is still recognised and a delete
-          // for me can still address it, but loses its content, so nothing can quote or resend it.
-          this.changeStoredMessage(pm.key?.id, stored =>
-            this.mayChange(stored.key, msg.key, true) ? { ...stored, message: null } : null,
-          );
-          this.host.getOnMessageRevoked()?.(revoked, { fromMe: msg.key.fromMe === true });
-          return;
-        }
-        if (pm?.type === b.proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
-          if (await this.targetsForeignMessage(pm.key?.id, msg.key, true, undefined, opts)) return;
-          // MESSAGE_EDIT wraps the message's latest content. Normalize that INNER content separately
-          // so captions, type, PTT, media presence and mentions describe the edited value rather than
-          // the outer protocol envelope.
-          const normalizedEdited = b.normalizeMessageContent(pm.editedMessage ?? undefined) ?? pm.editedMessage ?? {};
-          const editedContentType = b.getContentType(normalizedEdited);
-          const editedSubMessage =
-            normalizedEdited.extendedTextMessage ??
-            normalizedEdited.imageMessage ??
-            normalizedEdited.videoMessage ??
-            normalizedEdited.audioMessage ??
-            normalizedEdited.documentMessage ??
-            normalizedEdited.stickerMessage ??
-            normalizedEdited.locationMessage;
-          const contextInfo = editedSubMessage?.contextInfo;
-          const base = buildIncomingMessageFromBaileys(
-            {
-              id: pm.key?.id ?? '',
-              remoteJid,
-              fromMe: msg.key.fromMe === true,
-              participant: keyParticipant(msg.key),
-              body: extractBaileysBody(normalizedEdited),
-              contentType: editedContentType,
-              isPtt: normalizedEdited.audioMessage?.ptt === true,
-              timestamp: this.toEditUnixSeconds(pm.timestampMs, msg.messageTimestamp),
-              selfJid: this.host.normalizedSelfJid(),
-              mentionedJids: contextInfo?.mentionedJid ?? undefined,
-            },
-            jid => this.host.toNeutralJid(jid),
-          );
-          const hasMedia =
-            editedContentType === 'imageMessage' ||
-            editedContentType === 'videoMessage' ||
-            editedContentType === 'audioMessage' ||
-            editedContentType === 'documentMessage' ||
-            editedContentType === 'documentWithCaptionMessage' ||
-            editedContentType === 'stickerMessage';
-          const edited: EditedMessage = buildEditedMessage(base, hasMedia);
-          this.host.recordMessageEdit(chatJid, edited.messageId, edited.body);
-          const target = this.inboundInFlight.get(edited.messageId);
-          if (target && this.mayChange(target.key, msg.key, false)) {
-            this.editedWhileInFlight.delete(edited.messageId); // re-inserted as the newest
-            this.editedWhileInFlight.set(edited.messageId, { envelope: msg.key, body: edited.body });
-            if (this.editedWhileInFlight.size > BaileysEvents.DELETED_FOR_EVERYONE_LIMIT) {
-              const [oldest] = this.editedWhileInFlight.keys();
-              this.editedWhileInFlight.delete(oldest);
-            }
-          }
-          this.changeStoredMessage(edited.messageId, stored => {
-            const content = this.mayChange(stored.key, msg.key, false)
-              ? b.normalizeMessageContent(stored.message ?? undefined)
-              : undefined;
-            return content && setBaileysText(content, edited.body) ? stored : null;
-          });
-          this.host.getOnMessageEdited()?.(edited);
-          return;
-        }
-        // Other protocol messages (ephemeral, history sync, etc.) — skip silently.
-        return;
-      }
-
-      // --- reactionMessage: don't emit onMessage ---
-      if (contentType === 'reactionMessage') {
-        const rm = normalizedRoot?.reactionMessage;
-        if (await this.targetsForeignMessage(rm?.key?.id, msg.key, false, 'reaction', opts)) return;
-        const event: ReactionEvent = {
-          messageId: rm?.key?.id ?? '',
-          chatId: this.host.toNeutralJid(chatJid),
-          reaction: rm?.text ?? '',
-          // A 1:1 key names the chat partner, not the author: for a reaction the account made from
-          // its phone (fromMe) the reactor is the account itself. Group and status keys carry the
-          // author as `participant`, own reactions included, which the edit branch reads the same way.
-          senderId: this.host.toNeutralJid(
-            keyParticipant(msg.key) ?? (msg.key.fromMe === true ? this.host.normalizedSelfJid() : remoteJid),
-          ),
-        };
-        this.host.getOnMessageReaction()?.(event);
+      if (contentType === 'protocolMessage' || contentType === 'reactionMessage') {
+        const targetId = normalizedRoot?.protocolMessage?.key?.id ?? normalizedRoot?.reactionMessage?.key?.id;
+        await this.prepareMessageChange(targetId, opts, (releasePreparation, yieldSlot) =>
+          this.processMessageChange(b, msg, normalizedRoot, contentType, {
+            ...opts,
+            yieldSlot,
+            releasePreparation,
+          }),
+        );
         return;
       }
 
@@ -752,6 +1020,12 @@ export class BaileysEvents {
       // They only point at another message, so mapped they would reach consumers, in either
       // direction, as a bodyless `unknown` message (see BAILEYS_NON_CONTENT_TYPES).
       if (contentType && BAILEYS_NON_CONTENT_TYPES.has(contentType)) {
+        if (contentType === 'pollUpdateMessage') {
+          const pollId = normalizedRoot?.pollUpdateMessage?.pollCreationMessageKey?.id;
+          await this.prepareMessageChange(pollId, opts, () =>
+            this.processPollVote(b, msg, remoteJid, chatJid, normalizedRoot, opts.generation),
+          );
+        }
         this.host.logger.debug('Dropping a message that carries no content of its own', {
           action: 'baileys_drop_non_content',
           msgId: msg.key.id,
@@ -774,18 +1048,26 @@ export class BaileysEvents {
       // messageContextInfo }: nothing records which part the context info came from or that a field was
       // skipped, and a messageContextInfo field such as messageSecret is not proof of content either,
       // since the sending client decides what it carries. It stops once the proto knows the type.
-      const keys = Object.keys(normalizedRoot ?? {});
-      if (keys.every(k => PROTOCOL_NOISE_KEYS.has(k)) && keys.some(k => k !== 'messageContextInfo')) {
+      // A stanza with a CIPHERTEXT stub lost part of its payload to a decryption failure; if what
+      // survived holds only protocol noise (even a lone messageContextInfo), drop it before storing
+      // so a redelivery carrying the real body is not skipped as a duplicate.
+      const ciphertextStub = msg.messageStubType === CIPHERTEXT_STUB_TYPE;
+      if (isNoiseOnly(normalizedRoot, ciphertextStub)) {
         this.host.logger.debug('Dropping contentless protocol message', {
           action: 'baileys_drop_protocol_noise',
           msgId: msg.key.id,
           remoteJid,
-          keys,
+          keys: Object.keys(normalizedRoot ?? {}),
+          ...(ciphertextStub ? { ciphertextStub: true } : {}),
         });
         return;
       }
 
       // --- Normal message: enrich + emit ---
+      // Baileys' own readers of the message (the media download, a quote of it) type it by the first key that
+      // contains `Message`, which a fast-ratchet distribution merged in before the content is. contentType above
+      // passed over it, so the download, the click and the quote get the message without it too.
+      msg = withoutFastRatchetDistribution(msg);
       // A message the store already holds was delivered or sent before: WhatsApp re-delivers a node
       // whose ack was lost on a drop, so the second copy has to stop here. Downstream would not catch
       // it: the own-send path dispatches message.sent whatever its insert did, and the inbound path
@@ -800,6 +1082,7 @@ export class BaileysEvents {
         });
         return;
       }
+      if (opts.generation !== this.storeGeneration) return;
       // The account's own status post reaches the projector and is dropped there: a story is not a
       // conversation, so no `message.sent` is emitted for it. Downloading its media first is work
       // nothing consumes, and a story is a full-size photo or video. Everything else about the path
@@ -810,22 +1093,32 @@ export class BaileysEvents {
         ticket: opts.ticket,
         yieldSlot: opts.yieldSlot,
       });
+      if (opts.generation !== this.storeGeneration) return;
       // Stored before it is announced: whoever hears about this message may act on it at once (a quoted
       // reply, a reaction, a read receipt), and the store holds a read of an id until its write lands.
       // A message deleted for everyone or edited while it was being processed is stored as the change
       // leaves it, and a delete wins over an edit.
       const deleted = storedId !== null && this.deletedForEveryone.has(storedId);
       const edit = storedId !== null && !deleted ? this.editedWhileInFlight.get(storedId) : undefined;
-      const editedBody = edit && this.mayChange(msg.key, edit.envelope, false) ? edit.body : undefined;
+      const editedBody = edit && this.mayChange(msg.key, edit.envelope, false, edit.resolve) ? edit.body : undefined;
       let toStore = deleted ? { ...msg, message: null } : msg;
       if (editedBody !== undefined) {
         // A copy, so the edit reaches neither Baileys' object nor anyone else holding it.
         toStore = JSON.parse(JSON.stringify(msg, b.BufferJSON.replacer), b.BufferJSON.reviver) as WAMessage;
         const content = b.normalizeMessageContent(toStore.message ?? undefined);
         if (content) setBaileysText(content, editedBody);
+        // The session is told of the edit too, with a ticket at once and without one right after the emit, and
+        // compares it with the text the message arrived with. It is told even when the latest edit restored that
+        // text after another one: the message was edited all the same, and edits announced before the emit, past
+        // the changes that wait, left no mark.
+        if (editedBody !== incoming.body || edit?.afterOtherText) incoming.originalBody = incoming.body;
         incoming.body = editedBody;
       }
-      if (opts.generation === this.storeGeneration) {
+      // A message the session drops under STORE_EPHEMERAL_MESSAGES=false is never announced, so no copy of its content is
+      // kept here either, nor its text in the chat preview. What the account sent or typed on its phone is announced
+      // and can be changed, and a status is the status store's: they keep theirs.
+      const dropped = isDroppedEphemeral(incoming);
+      if (opts.generation === this.storeGeneration && !dropped) {
         void this.host.putStoredMessage(toStore)?.catch(err =>
           this.host.logger.warn('Failed to persist message to store', {
             error: err instanceof Error ? err.message : String(err),
@@ -842,9 +1135,9 @@ export class BaileysEvents {
         const emit = msg.key.fromMe === true ? this.host.getOnMessageCreate() : this.host.getOnMessage();
         // The ticket goes along only where one was issued, so elsewhere the call is unchanged.
         const receipt = opts.ticket ? emit?.(incoming, opts.ticket) : emit?.(incoming);
-        this.watchOutcome(msg.key, receipt);
+        this.watchOutcome(msg.key, receipt, opts.generation);
       }
-      this.host.recordMessage(msg, incoming.type);
+      this.host.recordMessage(msg, deleted ? 'revoked' : incoming.type, opts.order, dropped);
       if (deleted) {
         this.host.recordMessageEdit(chatJid, storedId, '', 'revoked');
       } else if (editedBody !== undefined && storedId !== null) {
@@ -855,6 +1148,412 @@ export class BaileysEvents {
         `Unhandled error processing inbound message (id=${msg.key?.id ?? 'unknown'}); dropping`,
         err instanceof Error ? err.message : String(err),
       );
+    } finally {
+      // Emitted by now, or never to be: what waited for this message goes to the session in the same turn, so
+      // it reaches the message before its row is written.
+      this.handOverChanges(msg.key?.id);
+    }
+  }
+
+  /** Preparation runs without a media permit; full-queue waiters provide backpressure without blocking its head. */
+  private async prepareMessageChange(
+    messageId: string | null | undefined,
+    opts: { generation: number; ticket?: InboundTicket; yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R> },
+    work: (releasePreparation: () => void, yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>) => Promise<void>,
+  ): Promise<void> {
+    if (opts.generation !== this.storeGeneration) return;
+    if (!messageId) {
+      if (opts.generation === this.storeGeneration) await work(() => undefined, opts.yieldSlot);
+      return;
+    }
+    opts.ticket?.drop();
+    const run = async (): Promise<void> => {
+      if (opts.generation !== this.storeGeneration) return;
+      while (this.changesPreparing >= BaileysEvents.CHANGES_PARKED_LIMIT) {
+        if (!this.preparationRoom) {
+          let release!: () => void;
+          const ready = new Promise<void>(resolve => {
+            release = resolve;
+          });
+          this.preparationRoom = { ready, release };
+        }
+        await this.preparationRoom.ready;
+        if (opts.generation !== this.storeGeneration) return;
+      }
+      this.changesPreparing++;
+      let retired = false;
+      let finish!: () => void;
+      let fail!: (error: unknown) => void;
+      const done = new Promise<void>((resolve, reject) => {
+        finish = resolve;
+        fail = reject;
+      });
+      let releasePreparation!: () => void;
+      const released = new Promise<void>(resolve => {
+        releasePreparation = resolve;
+      });
+      // Once retired (or fenced), detached work must never invoke opts.yieldSlot after the
+      // surrounding inboundLimiter.run() has already exited, or it would double-release the slot.
+      const gatedYieldSlot = opts.yieldSlot
+        ? <R>(fn: () => Promise<R>): Promise<R> => {
+            if (retired || opts.generation !== this.storeGeneration) return fn();
+            return opts.yieldSlot!(fn);
+          }
+        : undefined;
+      this.messageChanges.enqueue(messageId, async () => {
+        const preparing = (async () => {
+          if (!retired && opts.generation === this.storeGeneration) {
+            await work(releasePreparation, gatedYieldSlot);
+          }
+        })().then(finish, fail);
+        try {
+          await Promise.race([preparing, released]);
+        } finally {
+          this.changesPreparing--;
+          this.wakePreparationWaiters();
+        }
+      });
+      const retire = (): void => {
+        retired = true;
+        releasePreparation();
+        finish();
+      };
+      this.preparationRetirements.add(retire);
+      try {
+        await done;
+      } finally {
+        retired = true;
+        this.preparationRetirements.delete(retire);
+      }
+    };
+    await (opts.yieldSlot ? opts.yieldSlot(run) : run());
+  }
+
+  /** Wake the arrivals waiting for room; each looks again for room, and whether its store was fenced meanwhile. */
+  private wakePreparationWaiters(): void {
+    const room = this.preparationRoom;
+    this.preparationRoom = undefined;
+    room?.release();
+  }
+
+  private async processMessageChange(
+    b: typeof BaileysLib,
+    msg: WAMessage,
+    normalizedRoot: WAMessage['message'],
+    contentType: string,
+    opts: {
+      generation: number;
+      ticket?: InboundTicket;
+      yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
+      releasePreparation: () => void;
+    },
+  ): Promise<void> {
+    const remoteJid = msg.key.remoteJid!;
+    const protocolType = normalizedRoot?.protocolMessage?.type;
+    const reaction = contentType === 'reactionMessage';
+    const revoke = !reaction && protocolType === b.proto.Message.ProtocolMessage.Type.REVOKE;
+    const edit = !reaction && protocolType === b.proto.Message.ProtocolMessage.Type.MESSAGE_EDIT;
+    const targetId = normalizedRoot?.protocolMessage?.key?.id ?? normalizedRoot?.reactionMessage?.key?.id;
+    let parked = false;
+    const inbound = {
+      ...opts,
+      releasePreparation: () => {
+        parked = true;
+        opts.releasePreparation();
+      },
+    };
+    const group = remoteJid.endsWith('@g.us');
+    // A group delete a member sent counts as an admin's unless the roster shows they are none; then it is held to its
+    // author, as a one-to-one delete is, unless every copy of its target this adapter knows reads as theirs.
+    const verdict =
+      revoke && group && msg.key.fromMe !== true
+        ? await this.judgeGroupDelete(remoteJid, targetId, msg.key)
+        : undefined;
+    const admin = verdict?.admin;
+    const own = verdict?.own === true;
+    if (opts.generation !== this.storeGeneration) return;
+    if (
+      (reaction || revoke || edit) &&
+      (await this.targetsForeignMessage(
+        targetId,
+        msg.key,
+        edit || (revoke && (!group || (admin === false && !own))),
+        reaction ? 'reaction' : undefined,
+        inbound,
+      ))
+    )
+      return;
+    if (opts.generation !== this.storeGeneration) return;
+    const apply = () => this.applyMessageChange(b, msg, normalizedRoot, contentType, { ...opts, admin, own });
+    // Waiting for an original must not occupy the preparation queue. Once it answers, take a new
+    // turn before the remaining directory reads, so mixed change kinds still reach callbacks in order.
+    if (parked) await this.prepareMessageChange(targetId, { ...opts, ticket: undefined }, apply);
+    else await apply();
+  }
+
+  private async applyMessageChange(
+    b: typeof BaileysLib,
+    msg: WAMessage,
+    normalizedRoot: WAMessage['message'],
+    contentType: string,
+    opts: {
+      generation: number;
+      ticket?: InboundTicket;
+      yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
+      /** For a group delete a member sent, whether the roster shows them an admin (see judgeGroupDelete). */
+      admin?: boolean;
+      /** Whether every copy of the target this adapter knows reads as the sender's (see judgeGroupDelete). */
+      own?: boolean;
+    },
+  ): Promise<void> {
+    const remoteJid = msg.key.remoteJid!;
+    const chatJid = baileysChatJid(remoteJid, msg.key.participant, msg.key.fromMe === true);
+    // --- protocolMessage REVOKE: don't emit onMessage ---
+    if (contentType === 'protocolMessage') {
+      const pm = normalizedRoot?.protocolMessage;
+      if (pm?.type === b.proto.Message.ProtocolMessage.Type.REVOKE) {
+        const from = msg.key.fromMe === true ? this.host.normalizedSelfJid() : chatJid;
+        const to = msg.key.fromMe === true ? chatJid : this.host.normalizedSelfJid();
+        const revoked: RevokedMessage = {
+          id: pm.key?.id ?? '',
+          // The REVOKE protocolMessage's key points at the ORIGINAL deleted message,
+          // so `id` already IS the original here. Mirror it into `revokedId` so that
+          // field is the reliable cross-engine handle (wwebjs sets it separately).
+          revokedId: pm.key?.id ?? undefined,
+          chatId: this.host.toNeutralJid(chatJid),
+          from: this.host.toNeutralJid(from),
+          to: this.host.toNeutralJid(to),
+          type: 'revoked',
+          body: '',
+          timestamp: toUnixSeconds(msg.messageTimestamp),
+        };
+        // A member the roster shows is no admin deletes only their own message: the group exemption is off for them,
+        // except for copies this adapter reads as theirs, whose ids may not be comparable. The chat preview may hold
+        // another copy (a history-synced message is never stored here), so it follows the roster alone.
+        const anyAuthor = opts.admin !== false || opts.own === true;
+        const previewAny = opts.admin !== false;
+        // While the target is still being processed, the store change waits for it and lands after
+        // this delete is announced, and a repeat delivery may already hold the content in the store:
+        // record the delete now, checked against the target's own key.
+        const target = this.inboundInFlight.get(revoked.id);
+        if (target && this.mayChange(target.key, msg.key, anyAuthor)) {
+          this.markDeletedForEveryone(revoked.id);
+        }
+        // The stored copy keeps its key, so a late re-delivery is still recognised and a delete
+        // for me can still address it, but loses its content, so nothing can quote or resend it.
+        const storedKey = (await this.readTarget(revoked.id, 'reading a delete target'))?.key ?? target?.key;
+        const resolveStored = await this.reportedPhones(storedKey, target?.key, msg.key);
+        if (opts.generation !== this.storeGeneration) return;
+        const currentTarget = this.inboundInFlight.get(revoked.id) ?? target;
+        if (currentTarget && this.mayChange(currentTarget.key, msg.key, anyAuthor, resolveStored)) {
+          this.markDeletedForEveryone(revoked.id);
+        }
+        const storedChatJid =
+          storedKey?.remoteJid && this.mayChange(storedKey, msg.key, anyAuthor, resolveStored)
+            ? baileysChatJid(storedKey.remoteJid, storedKey.participant, storedKey.fromMe === true)
+            : undefined;
+        await this.recordPreviewChange(
+          chatJid,
+          revoked.id,
+          '',
+          'revoked',
+          opts.generation,
+          msg.key,
+          previewAny,
+          resolveStored,
+          storedChatJid,
+        );
+        if (opts.generation !== this.storeGeneration) return;
+        this.changeStoredMessage(pm.key?.id, stored =>
+          this.mayChange(stored.key, msg.key, anyAuthor, resolveStored) ? { ...stored, message: null } : null,
+        );
+        // The payload of a status post's delete names no sender (its chat is the status chat), and the stored copy
+        // judged above may be gone, which lets any delete through: the session holds it to the poster of the story.
+        const sender = remoteJid === 'status@broadcast' ? keyParticipant(msg.key) : undefined;
+        // Who sent a group delete, and what the roster said of them, for the session to judge the row it names.
+        const member =
+          msg.key.fromMe !== true && msg.key.participant && remoteJid.endsWith('@g.us')
+            ? { participant: this.host.toNeutralJid(msg.key.participant), admin: opts.admin }
+            : {};
+        // Behind the reactions and edits of the message that wait for its emit, never for the message itself:
+        // the delete keeps it from being emitted, and they were made before it.
+        this.announceWhenHandedOn(
+          revoked.id,
+          opts.ticket,
+          () =>
+            this.host.getOnMessageRevoked()?.(revoked, {
+              fromMe: msg.key.fromMe === true,
+              ...member,
+              ...(sender ? { participant: this.host.toNeutralJid(sender) } : {}),
+            }),
+          true,
+        );
+        return;
+      }
+      if (pm?.type === b.proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+        // MESSAGE_EDIT wraps the message's latest content. Normalize that INNER content separately
+        // so captions, type, PTT, media presence and mentions describe the edited value rather than
+        // the outer protocol envelope.
+        const normalizedEdited = b.normalizeMessageContent(pm.editedMessage ?? undefined) ?? pm.editedMessage ?? {};
+        const editedContentType = b.getContentType(normalizedEdited);
+        const editedSubMessage =
+          normalizedEdited.extendedTextMessage ??
+          normalizedEdited.imageMessage ??
+          normalizedEdited.videoMessage ??
+          normalizedEdited.audioMessage ??
+          normalizedEdited.documentMessage ??
+          normalizedEdited.stickerMessage ??
+          normalizedEdited.locationMessage;
+        const contextInfo = editedSubMessage?.contextInfo;
+        const base = buildIncomingMessageFromBaileys(
+          {
+            id: pm.key?.id ?? '',
+            remoteJid,
+            fromMe: msg.key.fromMe === true,
+            participant: keyParticipant(msg.key),
+            body: extractBaileysBody(normalizedEdited),
+            contentType: editedContentType,
+            isPtt: normalizedEdited.audioMessage?.ptt === true,
+            timestamp: this.toEditUnixSeconds(pm.timestampMs, msg.messageTimestamp),
+            selfJid: this.host.normalizedSelfJid(),
+            mentionedJids: contextInfo?.mentionedJid ?? undefined,
+          },
+          jid => this.host.toNeutralJid(jid),
+        );
+        const hasMedia =
+          editedContentType === 'imageMessage' ||
+          editedContentType === 'videoMessage' ||
+          editedContentType === 'audioMessage' ||
+          editedContentType === 'documentMessage' ||
+          editedContentType === 'documentWithCaptionMessage' ||
+          editedContentType === 'stickerMessage';
+        const edited: EditedMessage = buildEditedMessage(base, hasMedia);
+        const recordInFlightEdit = (resolve?: (jid: string) => string | null): void => {
+          const earlier = this.editedWhileInFlight.get(edited.messageId);
+          const afterOtherText = !!earlier && (earlier.afterOtherText || earlier.body !== edited.body);
+          this.editedWhileInFlight.delete(edited.messageId); // re-inserted as the newest
+          this.editedWhileInFlight.set(edited.messageId, {
+            envelope: msg.key,
+            body: edited.body,
+            afterOtherText,
+            resolve,
+          });
+          if (this.editedWhileInFlight.size > BaileysEvents.DELETED_FOR_EVERYONE_LIMIT) {
+            const [oldest] = this.editedWhileInFlight.keys();
+            this.editedWhileInFlight.delete(oldest);
+          }
+        };
+        const target = this.inboundInFlight.get(edited.messageId);
+        if (target && this.mayChange(target.key, msg.key, false)) {
+          recordInFlightEdit();
+        }
+        const storedKey = (await this.readTarget(edited.messageId, 'reading an edit target'))?.key ?? target?.key;
+        const resolveStored = await this.reportedPhones(storedKey, target?.key, msg.key);
+        if (opts.generation !== this.storeGeneration) return;
+        const currentTarget = this.inboundInFlight.get(edited.messageId);
+        if (currentTarget && this.mayChange(currentTarget.key, msg.key, false, resolveStored)) {
+          recordInFlightEdit(resolveStored);
+        } else if (this.editedWhileInFlight.get(edited.messageId)?.envelope === msg.key) {
+          this.editedWhileInFlight.delete(edited.messageId);
+        }
+        const storedChatJid =
+          storedKey?.remoteJid && this.mayChange(storedKey, msg.key, false, resolveStored)
+            ? baileysChatJid(storedKey.remoteJid, storedKey.participant, storedKey.fromMe === true)
+            : undefined;
+        await this.recordPreviewChange(
+          chatJid,
+          edited.messageId,
+          edited.body,
+          undefined,
+          opts.generation,
+          msg.key,
+          false,
+          resolveStored,
+          storedChatJid,
+        );
+        if (opts.generation !== this.storeGeneration) return;
+        this.changeStoredMessage(edited.messageId, stored => {
+          const content = this.mayChange(stored.key, msg.key, false, resolveStored)
+            ? b.normalizeMessageContent(stored.message ?? undefined)
+            : undefined;
+          return content && setBaileysText(content, edited.body) ? stored : null;
+        });
+        this.announceWhenHandedOn(edited.messageId, opts.ticket, () => this.host.getOnMessageEdited()?.(edited));
+        return;
+      }
+      // Other protocol messages (ephemeral, history sync, etc.) — skip silently.
+      return;
+    }
+
+    // --- reactionMessage: don't emit onMessage ---
+    if (contentType === 'reactionMessage') {
+      const rm = normalizedRoot?.reactionMessage;
+      if (opts.generation !== this.storeGeneration) return;
+      const event: ReactionEvent = {
+        messageId: rm?.key?.id ?? '',
+        chatId: this.host.toNeutralJid(chatJid),
+        reaction: rm?.text ?? '',
+        // A 1:1 key names the chat partner, not the author: for a reaction the account made from
+        // its phone (fromMe) the reactor is the account itself. Group and status keys carry the
+        // author as `participant`, own reactions included, which the edit branch reads the same way.
+        senderId: this.host.toNeutralJid(
+          keyParticipant(msg.key) ?? (msg.key.fromMe === true ? this.host.normalizedSelfJid() : remoteJid),
+        ),
+      };
+      this.announceWhenHandedOn(rm?.key?.id, opts.ticket, () => this.host.getOnMessageReaction()?.(event));
+      return;
+    }
+  }
+
+  /**
+   * Announce a reaction, an edit or a delete of message `id`. With a ticket the session holds the message from
+   * its arrival and keeps the change for its row, so it is announced at once. Without one the session knows
+   * nothing of a message before its emit, so a change that reaches a message still being processed is announced
+   * right after the emit instead, in the order the changes arrived, when the session holds the message. A delete
+   * (`behindChangesOnly`) never waits for the message: it waits only behind the changes already waiting, so they
+   * are announced in the order they arrived. A change waits at most the three media deadlines a change aimed at a
+   * delivery in flight waits (see targetsForeignMessage), and no more than CHANGES_PARKED_LIMIT wait at once, the
+   * limit of those changes.
+   */
+  private announceWhenHandedOn(
+    messageId: string | null | undefined,
+    ticket: InboundTicket | undefined,
+    announce: () => void,
+    behindChangesOnly = false,
+  ): void {
+    const waiting = messageId && !ticket ? this.changesAwaitingEmit.get(messageId) : undefined;
+    const waits = !!waiting || (!behindChangesOnly && !ticket && !!messageId && this.inboundInFlight.has(messageId));
+    if (!messageId || !waits || this.changesAwaiting >= BaileysEvents.CHANGES_PARKED_LIMIT) {
+      announce();
+      return;
+    }
+    this.changesAwaiting++;
+    if (waiting) {
+      waiting.announce.push(announce);
+      return;
+    }
+    const timer = setTimeout(() => this.handOverChanges(messageId), 3 * inboundMediaTimeoutMs());
+    timer.unref();
+    this.changesAwaitingEmit.set(messageId, { announce: [announce], timer, generation: this.storeGeneration });
+  }
+
+  /** Announce, in order, what waited for message `id` to be handed on (see announceWhenHandedOn). */
+  private handOverChanges(messageId: string | null | undefined): void {
+    const waiting = messageId ? this.changesAwaitingEmit.get(messageId) : undefined;
+    if (!messageId || !waiting) return;
+    this.changesAwaitingEmit.delete(messageId);
+    clearTimeout(waiting.timer);
+    this.changesAwaiting -= waiting.announce.length;
+    if (waiting.generation !== this.storeGeneration) return;
+    for (const announce of waiting.announce) {
+      try {
+        announce();
+      } catch (err) {
+        this.host.logger.warn('Failed to announce a change that waited for its message', {
+          msgId: messageId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -865,14 +1564,19 @@ export class BaileysEvents {
    * later edit, delete or reaction of it is judged. Detached: it never delays inbound handling, and
    * nothing it does can fail it, whatever the callback returns or rejects with.
    */
-  private watchOutcome(key: WAMessageKey, receipt: void | InboundReceipt): void {
+  private watchOutcome(key: WAMessageKey, receipt: void | InboundReceipt, generation = this.storeGeneration): void {
     const id = key.id;
     if (!id || !receipt?.settled) return;
     // The session holds no entry for a status post, so it judges no change aimed at one: only a message
     // it holds can stand in for the stored copy there.
-    const release = key.remoteJid === 'status@broadcast' ? undefined : this.holdOutcome(id);
+    const release =
+      key.remoteJid === 'status@broadcast' || generation !== this.storeGeneration ? undefined : this.holdOutcome(id);
     void Promise.resolve(receipt.settled)
-      .then(result => (result?.conflict === true ? this.dropConflictingCopy(key, id) : undefined))
+      .then(result =>
+        result?.conflict === true && generation === this.storeGeneration
+          ? this.dropConflictingCopy(key, id)
+          : undefined,
+      )
       .catch((err: unknown) =>
         this.host.logger.warn('Could not act on what the session made of a message', {
           msgId: id,
@@ -893,7 +1597,7 @@ export class BaileysEvents {
     if (!hold) {
       let free!: () => void;
       const ended = new Promise<void>(resolve => (free = resolve));
-      hold = { count: 0, ended, free };
+      hold = { count: 0, ended, free, timers: new Set() };
       this.outcomesPending.set(id, hold);
     }
     const entry = hold;
@@ -903,12 +1607,14 @@ export class BaileysEvents {
       if (ended) return;
       ended = true;
       clearTimeout(timer);
+      entry.timers.delete(timer);
       if (--entry.count > 0) return;
-      this.outcomesPending.delete(id);
+      if (this.outcomesPending.get(id) === entry) this.outcomesPending.delete(id);
       entry.free();
     };
     const timer = setTimeout(end, BaileysEvents.OUTCOME_HOLD_MS);
     timer.unref();
+    entry.timers.add(timer);
     return end;
   }
 
@@ -1007,6 +1713,7 @@ export class BaileysEvents {
     msg: WAMessage,
     content: WAMessage['message'],
     contentType: string,
+    generation?: number,
   ): Promise<
     { content: NonNullable<WAMessage['message']>; contentType: 'protocolMessage' | 'reactionMessage' } | undefined
   > {
@@ -1026,6 +1733,7 @@ export class BaileysEvents {
         if (type !== editType && type !== 'MESSAGE_EDIT') return undefined;
       }
       const original = await this.readTarget(targetId, 'reading the message an encrypted edit or reaction targets');
+      if (generation !== undefined && generation !== this.storeGeneration) return undefined;
       const secret = messageSecretOf(original?.message);
       if (!original || !secret) {
         this.host.logger.debug('Cannot read an encrypted edit or reaction: the message it targets is not stored', {
@@ -1035,23 +1743,15 @@ export class BaileysEvents {
         });
         return undefined;
       }
-      const user = this.host.getSocketOrNull()?.user;
-      const own = [user?.id, user?.lid].filter((jid): jid is string => !!jid).map(withoutDevice);
-      // A lid is also tried as the phone number it maps to: a message written under phone addressing can
-      // be edited under lid addressing, and the key names each party the way its own client did.
-      const withPhone = (forms: string[]): string[] =>
-        forms.flatMap(jid => {
-          const neutral = jid.endsWith('@lid') ? this.host.toNeutralJid(jid) : '';
-          return neutral.endsWith('@c.us') ? [jid, `${userPart(neutral)}@s.whatsapp.net`] : [jid];
-        });
+      const own = this.ownBareJids();
       const plaintext = decryptSecretPayload({
         kind: isEdit ? 'edit' : 'reaction',
         secret,
         iv,
         payload,
         targetId,
-        targetAuthors: withPhone(senderForms(original.key, own)),
-        modifiers: withPhone(senderForms(msg.key, own)),
+        targetAuthors: this.decryptionSenderForms(original.key, own),
+        modifiers: this.decryptionSenderForms(msg.key, own),
       });
       if (!plaintext) {
         this.host.logger.debug('An encrypted edit or reaction did not authenticate against its target', {
@@ -1117,7 +1817,12 @@ export class BaileysEvents {
     key: WAMessageKey,
     checkAuthor: boolean,
     kind?: 'reaction',
-    inbound?: { ticket?: InboundTicket; yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R> },
+    inbound?: {
+      generation?: number;
+      ticket?: InboundTicket;
+      yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
+      releasePreparation?: () => void;
+    },
   ): Promise<boolean> {
     if (!targetId) return false;
     // The key a wait was for (the delivery in flight, or the copy the change read as foreign to), and the
@@ -1127,10 +1832,12 @@ export class BaileysEvents {
     let heldUntil: number | undefined;
     let reread = false;
     for (;;) {
+      if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return true;
       const removals = this.removalsOf(targetId);
       // A message still being processed has no stored copy yet, but the projector may already hold it
       // (PostgreSQL), so its own key is checked instead.
       const found = await this.readTarget(targetId, 'checking what an edit, revoke or reaction targets');
+      if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return true;
       // Without a stored copy the key the wait was for stands (a delivery that may never have been stored: no
       // store, a failed write; or a copy gone since), unless a conflicting copy went since the wait for it
       // began: then that delivery was not the message the id names, and nothing says which one is.
@@ -1159,6 +1866,7 @@ export class BaileysEvents {
         waitedFor = { key: original, removals };
         if (await this.parkUntil(processing, 3 * inboundMediaTimeoutMs(), inbound)) continue;
       }
+      if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return true;
       // A conflicting copy went while the store was read, and the read may have returned it: it ends the
       // hold only once removed, so the read is the one that can no longer be told from the real copy. Read
       // again, with the copy gone, rather than drop the real author's change against it.
@@ -1188,12 +1896,19 @@ export class BaileysEvents {
   private async parkUntil(
     until: Promise<void>,
     limitMs: number,
-    inbound?: { ticket?: InboundTicket; yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R> },
+    inbound?: {
+      generation?: number;
+      ticket?: InboundTicket;
+      yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
+      releasePreparation?: () => void;
+    },
   ): Promise<boolean> {
+    if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return false;
     if (this.changesParked >= BaileysEvents.CHANGES_PARKED_LIMIT) return false;
     this.changesParked++;
     try {
-      inbound?.ticket?.drop();
+      inbound?.releasePreparation?.();
+      if (!inbound?.releasePreparation) inbound?.ticket?.drop();
       const wait = (): Promise<void> =>
         new Promise<void>(resolve => {
           let wake: (() => void) | null = resolve;
@@ -1214,23 +1929,52 @@ export class BaileysEvents {
     }
   }
 
-  /** Whether a change arriving under `key` names a message other than the one `original` is. */
-  private readsAsForeign(original: WAMessageKey, key: WAMessageKey, checkAuthor: boolean, kind?: 'reaction'): boolean {
+  /**
+   * How {@link differentWaIds} writes the two ids of one author comparison. `resolve` maps a lid to the phone number the
+   * gateway holds a reported pairing for. A pairing bridges a lid and a phone number, so a lid is resolved only against
+   * a side that carries no lid: with the other side known by a number, a lid that is provably another person's reads as
+   * such. Two lids are compared as they are, whatever the table says of either, because resolving one of them would
+   * turn it into a number that the other, a lid with no number beside it, may still be (see differentWaIds). A lid the
+   * table cannot map stays unresolved, and the comparison fails open on it.
+   */
+  private authorNeutral(
+    a: Array<string | null | undefined>,
+    b: Array<string | null | undefined>,
+    resolve?: (jid: string) => string | null,
+  ): (jid: string) => string {
+    const hasLid = (jids: Array<string | null | undefined>): boolean =>
+      jids.some(jid => !!jid && parseWaId(jid).kind === 'lid');
+    const bridge = resolve && !(hasLid(a) && hasLid(b)) ? resolve : undefined;
+    return jid => {
+      const phone = bridge && parseWaId(jid).kind === 'lid' ? bridge(jid) : null;
+      return phone ? `${phone}@c.us` : this.host.toNeutralJid(jid);
+    };
+  }
+
+  /**
+   * Whether a change arriving under `key` names a message other than the one `original` is. The chats are compared as
+   * the adapter writes them; `resolve` serves the comparison of the authors (see authorNeutral), since a group delete,
+   * the one change judged with it, names a group.
+   */
+  private readsAsForeign(
+    original: WAMessageKey,
+    key: WAMessageKey,
+    checkAuthor: boolean,
+    kind?: 'reaction',
+    resolve?: (jid: string) => string | null,
+  ): boolean {
     const broadcast = kind === 'reaction' && !!original.remoteJid?.endsWith('@broadcast');
     if (broadcast && original.fromMe === true) return false;
-    const originalChats = [original.remoteJid, original.remoteJidAlt];
+    const originalChats = keyChatIds(original);
     if (broadcast && original.remoteJid !== 'status@broadcast') originalChats.push(original.participant);
     const neutral = (jid: string): string => this.host.toNeutralJid(jid);
+    const authors = [original.participant, original.participantAlt];
+    const senders = [key.participant, key.participantAlt];
     return (
-      differentWaIds(originalChats, [key.remoteJid, key.remoteJidAlt], neutral) ||
+      differentWaIds(originalChats, keyChatIds(key), neutral) ||
       (checkAuthor &&
         ((original.fromMe === true) !== (key.fromMe === true) ||
-          (key.fromMe !== true &&
-            differentWaIds(
-              [original.participant, original.participantAlt],
-              [key.participant, key.participantAlt],
-              neutral,
-            ))))
+          (key.fromMe !== true && differentWaIds(authors, senders, this.authorNeutral(authors, senders, resolve)))))
     );
   }
 
@@ -1250,7 +1994,13 @@ export class BaileysEvents {
     change: (stored: WAMessage) => WAMessage | null,
   ): void {
     if (!messageId) return;
-    const apply = async (): Promise<void> => this.host.updateStoredMessage(messageId, change);
+    const generation = this.storeGeneration;
+    const apply = async (): Promise<void> => {
+      if (generation !== this.storeGeneration) return;
+      await this.host.updateStoredMessage(messageId, stored =>
+        generation === this.storeGeneration ? change(stored) : null,
+      );
+    };
     const inFlight = this.inboundInFlight.get(messageId)?.done;
     void (inFlight ? inFlight.then(apply) : apply()).catch(err =>
       this.host.logger.warn('Failed to apply an edit or delete to the message store', {
@@ -1261,29 +2011,136 @@ export class BaileysEvents {
   }
 
   /**
+   * The phone number the gateway holds a reported pairing for, by lid, over the lids that the keys name as their chat or
+   * participant. A pairing it holds only as a display lookup is not reported and maps nothing. Never rejects: a lookup
+   * that fails maps nothing.
+   */
+  private async reportedPhones(...keys: Array<WAMessageKey | undefined>): Promise<(jid: string) => string | null> {
+    const lids = new Set(
+      keys
+        .flatMap(key => [key?.remoteJid, key?.participant])
+        .filter((jid): jid is string => !!jid && parseWaId(jid).kind === 'lid'),
+    );
+    const pairs = new Map<string, string>();
+    await Promise.all(
+      [...lids].map(async lid => {
+        const phone = await this.host.findPersistedLidPhone?.(lid).catch(() => null);
+        if (phone) pairs.set(userPart(lid), phone);
+      }),
+    );
+    return jid => pairs.get(userPart(jid)) ?? null;
+  }
+
+  /**
    * Whether an edit or delete sent under `envelope` may change the stored message `target`. Baileys
    * checks neither the chat nor the sender of either (Utils/process-message.js), so the stored copy
    * changes only for one from the same chat and from the message's author. A group admin may delete
-   * anyone's message, which nothing here can verify, so a group delete skips the author check.
-   * Compared in the neutral dialect, and through each key's alt twin as targetsForeignMessage does, so
-   * a chat or sender seen by lid once and by phone once matches even when the pair is not yet known.
+   * anyone's message, so a group delete (`isDelete`) skips the author check; the caller passes `isDelete`
+   * false for one whose sender the roster shows is no admin, unless every copy it judges reads as the sender's
+   * (see judgeGroupDelete).
+   * Compare raw identities and incoming alt pairs. A stored LID/phone pair matches only through a
+   * reported directory lookup (`resolve`); own-message senderAlt is not proof of the recipient's phone.
    */
-  private mayChange(target: WAMessageKey, envelope: WAMessageKey, isDelete: boolean): boolean {
+  private mayChange(
+    target: WAMessageKey,
+    envelope: WAMessageKey,
+    isDelete: boolean,
+    resolve?: (jid: string) => string | null,
+  ): boolean {
     const neutral = (jids: Array<string | null | undefined>): string[] =>
       jids.filter((jid): jid is string => !!jid).map(jid => this.host.toNeutralJid(jid));
-    const chat = (key: WAMessageKey): string[] => neutral([key.remoteJid, key.remoteJidAlt]);
+    const chat = (key: WAMessageKey): string[] => neutral([key.remoteJid, key.fromMe ? undefined : key.remoteJidAlt]);
     const author = (key: WAMessageKey): string[] =>
       key.fromMe === true ? ['fromMe'] : key.participant ? neutral([key.participant, key.participantAlt]) : chat(key);
-    const overlap = (a: string[], b: string[]): boolean => a.some(jid => b.includes(jid));
+    const overlap = (a: string[], b: string[]): boolean => {
+      if (parseWaId(a[0] ?? '').kind === 'lid' && parseWaId(b[0] ?? '').kind === 'lid' && a[0] !== b[0]) return false;
+      return a.some(left =>
+        b.some(right => {
+          if (left === right) return true;
+          const l = parseWaId(left).kind;
+          const r = parseWaId(right).kind;
+          return (
+            (l === 'lid' && r === 'user' && resolve?.(left) === userPart(right)) ||
+            (r === 'lid' && l === 'user' && resolve?.(right) === userPart(left))
+          );
+        }),
+      );
+    };
     if (!overlap(chat(target), chat(envelope))) return false;
     const inGroup = chat(target).some(jid => parseWaId(jid).kind === 'group');
     return (isDelete && inGroup) || overlap(author(target), author(envelope));
   }
 
+  /**
+   * What this adapter can tell of who sent a group delete. `admin`: whether the group's roster shows them an admin, who
+   * alone may delete someone else's message there, as WhatsApp clients honour it; undefined when it cannot say (no
+   * roster, a failed or late read, a sender it does not list), and the delete then counts as an admin's, as it always
+   * has. `own`: whether every copy of the message the delete names that this adapter knows, stored or being
+   * processed, reads as the sender's. Those copies are then judged without the author check, in ids that cannot be
+   * compared too. It says nothing of the session's row, which may be another member's under a reused id, so the
+   * roster verdict goes on to the session whenever it is read.
+   *
+   * The roster is read only where it decides something: not for a settled message every copy of which reads as the
+   * sender's. A settled message waits for the cached group metadata, or a query within BAILEYS_QUERY_BUDGET_MS. One
+   * still being processed here, or held by the session for its row, whoever's it reads as, can be announced at any
+   * moment, and its delete has to be recorded before that (see markDeletedForEveryone), so it takes the cached
+   * metadata as it stands and never waits: with none (not read yet, expired, or switched off) the roster cannot say.
+   * A delivery that reuses the id of a stored message of another chat or sender does not count as such a message.
+   * A roster that has not seen a promotion yet refuses that admin's delete, and the message is kept.
+   */
+  private async judgeGroupDelete(
+    groupJid: string,
+    targetId: string | null | undefined,
+    envelope: WAMessageKey,
+  ): Promise<{ admin?: boolean; own: boolean } | undefined> {
+    if (!targetId) return undefined;
+    // The copy being processed is taken before the store is read, as readTarget does: one that settles while the read
+    // is out has left the map, and may have been stored after the read began.
+    const before = this.inboundInFlight.get(targetId);
+    const stored = await this.readStoredMessage(targetId, 'checking whose message a group delete names');
+    const after = this.inboundInFlight.get(targetId);
+    const copies = [before?.key, stored?.key, after?.key].filter((key): key is WAMessageKey => !!key);
+    // A sender known by a lid and an author known by a number are taken for one person unless the gateway holds a
+    // reported pairing for the lid that names another number: with one, the copy is not theirs and the roster is read.
+    const resolve = await this.reportedPhones(...copies, envelope);
+    const own = copies.length > 0 && copies.every(key => !this.readsAsForeign(key, envelope, true, undefined, resolve));
+    // A delivery that reuses the id of a stored message of another chat or sender is stopped as a repeat before it
+    // downloads or emits anything (see processInboundMessage), so it does not make that stored message one to judge
+    // from the cache alone.
+    const live = [before, after].filter(entry => entry && !(stored && this.namesAnotherMessage(stored.key, entry.key)));
+    const held = live.length > 0 || this.outcomesPending.has(targetId);
+    if (own && !held) return { own };
+    try {
+      let members: GroupMember[] | null | undefined;
+      if (held) members = this.host.peekGroupMembers?.(groupJid);
+      else {
+        const read = this.host.readGroupMembers?.(groupJid);
+        if (!read) return { own };
+        members = await withQueryDeadline(
+          read,
+          BAILEYS_QUERY_BUDGET_MS,
+          'WhatsApp did not answer the group metadata query in time',
+        );
+      }
+      const neutral = (jid: string): string => this.host.toNeutralJid(jid);
+      const sender = [envelope.participant, envelope.participantAlt].filter((jid): jid is string => !!jid).map(neutral);
+      return { own, admin: members?.find(member => member.ids.some(jid => sender.includes(neutral(jid))))?.admin };
+    } catch (err) {
+      this.host.logger.warn('Could not read the group roster to check a delete; applying it', {
+        groupId: groupJid,
+        msgId: envelope.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { own };
+    }
+  }
+
   handleMessagesUpdate(updates: BaileysMessageUpdate[]): void {
     for (const u of updates) {
       const status = mapBaileysStatus(u.update?.status);
-      if (status && u.key?.id) {
+      // An ack is a receipt of a message the account sent. Baileys also raises a status update, keyed
+      // fromMe: false, when another device of the account reads a message it received (read-self).
+      if (status && u.key?.id && u.key.fromMe !== false) {
         // Canonicalize the update's chat exactly as the inbound mapper does, so an ack's chatId
         // matches the chatId of the message events it accompanies.
         const chatId = u.key.remoteJid ? this.host.toNeutralJid(u.key.remoteJid) : undefined;
@@ -1301,6 +2158,91 @@ export class BaileysEvents {
   }
 
   /**
+   * Baileys `message-receipt.update`: per-participant receipts, which Baileys raises only for group
+   * and status messages (1:1 receipts arrive as `messages.update` instead). Only receipts for
+   * messages this account sent are reported, and only for those two chat kinds whichever way the list
+   * reached this handler; receipts from the account's own linked devices are dropped. The event
+   * buffer can merge several receipts of one participant into one entry, so each timestamp the entry
+   * carries becomes its own event. rc14 files a `played` receipt under `readTimestamp`, so on that
+   * version a voice note that was played reports `read`. A group message's receipts also feed
+   * {@link GroupAckAggregator}, which reports the `delivered` and `read` acks Baileys raises for no group message.
+   */
+  handleMessageReceiptUpdate(
+    updates: Array<{
+      key?: { id?: string | null; remoteJid?: string | null; fromMe?: boolean | null };
+      receipt?: {
+        userJid?: string | null;
+        receiptTimestamp?: number | { toNumber(): number } | null;
+        readTimestamp?: number | { toNumber(): number } | null;
+        playedTimestamp?: number | { toNumber(): number } | null;
+      };
+    }>,
+  ): void {
+    const onReceipt = this.host.getOnMessageReceipt();
+    if (!onReceipt && !this.host.getOnMessageAck()) {
+      return;
+    }
+    const isSelf = this.selfMatcher();
+    for (const { key, receipt } of Array.isArray(updates) ? updates : []) {
+      if (
+        !key?.id ||
+        !key.remoteJid ||
+        key.fromMe !== true ||
+        !RECEIPT_CHAT_KINDS.has(chatKind(key.remoteJid)) ||
+        !receipt?.userJid ||
+        isSelf(receipt.userJid)
+      ) {
+        continue;
+      }
+      const stamps: Array<[MessageReceiptStatus, typeof receipt.receiptTimestamp]> = [
+        ['delivered', receipt.receiptTimestamp],
+        ['read', receipt.readTimestamp],
+        ['played', receipt.playedTimestamp],
+      ];
+      for (const [status, ts] of stamps) {
+        if (ts == null) continue;
+        const event: MessageReceiptEvent = {
+          messageId: key.id,
+          chatId: this.host.toNeutralJid(key.remoteJid),
+          participant: this.host.toNeutralJid(receipt.userJid),
+          status,
+          timestamp: toUnixSeconds(ts),
+        };
+        onReceipt?.(event);
+        void this.groupAcks.record(event).catch(error =>
+          this.host.logger.warn('Following the acks of a group message failed', {
+            messageId: event.messageId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    }
+  }
+
+  /**
+   * Matches any jid of this account, in either dialect and from any of its devices (user parts are
+   * compared). Answers false for everything while the account's own id is unknown. A lid matches only the
+   * credentials' own `user.lid`: identity is not derived from the session's lid mapping, so credentials
+   * without one match no lid, and a caller that must still recognise the account's lid checks the reported
+   * pairs itself (see readMemberRoster).
+   */
+  private selfMatcher(): (jid: string | null | undefined) => boolean {
+    const selfJid = this.host.normalizedSelfJid();
+    if (!selfJid) {
+      return () => false;
+    }
+    const phone = userPart(selfJid);
+    const lid = this.host.getSocketOrNull()?.user?.lid;
+    const lidUser = lid ? userPart(lid) : undefined;
+    return (jid: string | null | undefined): boolean => {
+      if (!jid) return false;
+      const { kind, userPart: user } = parseWaId(jid);
+      if (kind === 'user') return user === phone;
+      return kind === 'lid' && user === lidUser;
+    };
+  }
+
+  /**
    * An RSVP to a WhatsApp event. Baileys decrypts it itself while processing the inbound
    * `encEventResponseMessage` (whose upsert the live path drops as non-content): it reads the event
    * creation message's `messageSecret` through the socket's getMessage, which this adapter backs
@@ -1312,6 +2254,7 @@ export class BaileysEvents {
     const callback = this.host.getOnEventResponse();
     const envelope = rsvp.eventResponseMessageKey;
     if (!callback || !eventKey?.id || !eventKey.remoteJid || !envelope?.id) return;
+    const generation = this.storeGeneration;
     // Learned before any id below is canonicalized, as an inbound message does, so a guest answering
     // for the first time is not reported by lid once and by phone number afterwards.
     this.host.recordKeyLidMappings(envelope);
@@ -1321,14 +2264,8 @@ export class BaileysEvents {
     // revoke or reaction aimed at a message of another chat is. Fails open like those: a store that
     // cannot be read, or ids that cannot be compared, report the RSVP as before.
     const stored = await this.readStoredMessage(eventKey.id, 'reading the event an RSVP answers');
-    if (
-      stored &&
-      differentWaIds(
-        [stored.key.remoteJid, stored.key.remoteJidAlt],
-        [envelope.remoteJid, envelope.remoteJidAlt],
-        jid => this.host.toNeutralJid(jid),
-      )
-    ) {
+    if (generation !== this.storeGeneration) return;
+    if (stored && differentWaIds(keyChatIds(stored.key), keyChatIds(envelope), jid => this.host.toNeutralJid(jid))) {
       this.host.logger.warn('Dropping an event response sent in a chat other than its event', {
         msgId: eventKey.id,
         responseMessageId: envelope.id,
@@ -1369,6 +2306,7 @@ export class BaileysEvents {
     }
     if (stored?.message) {
       const b = await this.host.loadLib();
+      if (generation !== this.storeGeneration) return;
       const name = b.normalizeMessageContent(stored.message)?.eventMessage?.name;
       if (name) event.eventName = name;
     }
@@ -1391,12 +2329,16 @@ export class BaileysEvents {
     if (!kind || !event.id) {
       return;
     }
-    const participantIds = (Array.isArray(event.participants) ? event.participants : [])
+    const entries = Array.isArray(event.participants) ? event.participants : [];
+    const participantIds = entries
       .map(entry => this.toNeutralGroupParticipantId(entry))
       .filter((jid): jid is string => jid !== null);
+    const groupId = this.host.toNeutralJid(event.id);
+    // Before anything that can throw: a roster read under way began before this change and does not show it.
+    this.groupAcks.membershipChanged(groupId);
     const payload: GroupEvent = {
       kind,
-      groupId: this.host.toNeutralJid(event.id),
+      groupId,
       participantIds,
       timestamp: Math.floor(Date.now() / 1000),
     };
@@ -1407,6 +2349,25 @@ export class BaileysEvents {
       payload.actorId = this.host.toNeutralJid(actor);
     }
     this.host.getOnGroupEvent()?.(payload);
+    if (kind === 'leave') this.forgetLeavers(groupId, entries);
+  }
+
+  /**
+   * A member who left is no longer waited for by the group messages whose acks are being followed. Done after
+   * the group event is out, which a failure here must not hold back.
+   */
+  private forgetLeavers(groupId: string, entries: unknown[]): void {
+    try {
+      this.groupAcks.forget(
+        groupId,
+        entries.flatMap(entry => this.groupParticipantForms(entry)),
+      );
+    } catch (error) {
+      this.host.logger.warn('Dropping a departed member from the group acks failed', {
+        groupId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -1425,21 +2386,9 @@ export class BaileysEvents {
     if (!selfJid) {
       return; // no own id to report as the joining participant
     }
-    const phone = userPart(selfJid);
-    const lid = this.host.getSocketOrNull()?.user?.lid;
-    const lidUser = lid ? userPart(lid) : undefined;
-    const isSelf = (jid: string | undefined): boolean => {
-      if (!jid) return false;
-      const { kind, userPart: user } = parseWaId(jid);
-      if (kind === 'user') return user === phone;
-      if (kind !== 'lid') return false;
-      if (lidUser !== undefined) return user === lidUser;
-      // Creds carrying no `user.lid` leave nothing to compare a lid-addressed actor against, and
-      // every such comparison would answer false: a group this session created would then be
-      // reported as a join of itself. Fall back to the session's own lid to phone mapping, which the
-      // store learns from the same traffic.
-      return userPart(this.host.toNeutralJid(jid)) === phone;
-    };
+    // With credentials that carry no `user.lid`, selfMatcher matches no lid, so a group this session
+    // created that names it by lid alone is reported as a join of itself.
+    const isSelf = this.selfMatcher();
     for (const group of Array.isArray(groups) ? groups : []) {
       // Live, whatsapp-web.js emits no group.join when the session created the group, so that entry is
       // skipped. The acting participant alone does not identify it: an invite-link join may name the
@@ -1465,7 +2414,7 @@ export class BaileysEvents {
    * on). Only action 'created' maps to the neutral join_request kind — the wwebjs event has no
    * revoke/reject counterpart, so only the shared signal is surfaced. Upstream scope caveat: rc14
    * emits this event only from the NON_ADMIN_ADD stub (172); the direct self-request stub (144) is
-   * unhandled with an upstream TODO (Utils/process-message.js:569), so an invite-link self-request
+   * unhandled with an upstream TODO (Utils/process-message.js), so an invite-link self-request
    * may produce no event on this engine — the REST list endpoint still sees it. The pn twins are
    * preferred over lids for the same reason as everywhere else. The event carries no timestamp, so
    * it is stamped at receipt.
@@ -1507,7 +2456,7 @@ export class BaileysEvents {
    * the wwebjs adapter, which emits uninterpretable updates the same way rather than dropping them.
    *
    * The same event also carries FULL metadata snapshots: groupFetchAllParticipating() emits its
-   * entire result set through it (Socket/groups.js:56 `sock.ev.emit('groups.update', ...)`), and
+   * entire result set through it (Socket/groups.js `sock.ev.emit('groups.update', ...)`), and
    * this adapter calls that on every connect (hydrateNames) and every REST getGroups(). Real deltas
    * (Utils/process-message.js emitGroupUpdate) carry only `{id, ...oneChangedField, author?}`;
    * snapshots are recognized by their full-metadata markers (participants/creation/subjectTime/
@@ -1579,7 +2528,7 @@ export class BaileysEvents {
         continue;
       }
       // Baileys replays offers for calls missed while disconnected with offline: true
-      // (Socket/messages-recv.js:1458 `offline: !!attrs.offline`; WACallEvent.offline is
+      // (Socket/messages-recv.js `offline: !!attrs.offline`; WACallEvent.offline is
       // non-optional). Those calls are long dead — emitting call.received (and, with
       // autoRejectCalls, rejecting a stale call) would be wrong, so drop them before caching.
       if (call.offline) {
@@ -1604,6 +2553,16 @@ export class BaileysEvents {
         isVideo: call.isVideo === true,
         isGroup: call.isGroup === true,
       };
+      // Offer and offer_notice carry one call id, so another tag of the call being rejected is neither a new
+      // ring nor another call: it must not put the handle back or announce the call a second time. Its caller
+      // may be spelled as a lid on one tag and as a phone number on the next, so the published identity counts too.
+      const rejection = this.rejections.get(call.id);
+      if (
+        this.isPending(call.id, rejection) &&
+        (rejection?.entry.callFrom === call.from || rejection?.entry.from === published.from)
+      ) {
+        continue;
+      }
       if (!this.cacheLiveCall(call.id, call.from, published)) {
         continue;
       }
@@ -1639,17 +2598,22 @@ export class BaileysEvents {
    */
   private reportCallOutcome(call: WACallEvent): void {
     // `terminate` publishes no outcome (see above) but DOES end the call — drop the handle so a
-    // rejectCall arriving afterwards reports not-found instead of acting on a dead call. The other
+    // rejectCall arriving afterwards reports not-found instead of acting on a dead call. A rejection
+    // already pending keeps its right to report its own success (see rejectCall). The other
     // unmapped statuses (ringing/preaccept/transport/relaylatency) are chatter on a call that is
     // still live and must stay rejectable.
     if (call.status === 'terminate') {
+      const rejection = this.rejections.get(call.id);
+      if (rejection) rejection.ended = true;
       this.liveCalls.delete(call.id);
       return;
     }
     const outcome = CALL_OUTCOMES[call.status];
     if (!outcome) return;
 
-    const live = this.liveCalls.get(call.id);
+    const rejection = this.rejections.get(call.id);
+    const live = this.liveCalls.get(call.id) ?? (this.isPending(call.id, rejection) ? rejection?.entry : undefined);
+    this.rejections.delete(call.id);
     this.liveCalls.delete(call.id);
 
     // Offline replay is the same hazard as on the offer path: WhatsApp resends the signalling for
@@ -1737,6 +2701,7 @@ export class BaileysEvents {
       }
     }
     const isNewCall = !this.liveCalls.has(callId);
+    this.rejections.delete(callId);
     // The published identity is cached alongside the raw JID so a rejection issued through the API
     // can report the same shape the engine-observed outcomes do — the call event itself is long
     // gone by then.
@@ -1744,11 +2709,20 @@ export class BaileysEvents {
     return isNewCall;
   }
 
+  /** Whether `rejection` is still the pending one for the call: nothing has ended the call since it began. */
+  private isPending(callId: string, rejection: CallRejection | undefined): boolean {
+    return (
+      rejection !== undefined && this.rejections.get(callId) === rejection && this.liveCalls.clears === rejection.clears
+    );
+  }
+
   /**
-   * Reject a currently-ringing call. The entry is evicted before the attempt, so an outcome that
-   * arrives meanwhile cannot publish a second one, and a rejected call does not become rejectable
-   * again. A failed attempt leaves the call ringing, so its entry is put back for a retry unless the
-   * id rang again or the connection was torn down meanwhile. An unknown id or an expired entry maps to CallNotFoundError (HTTP 404).
+   * Reject a currently-ringing call. The entry is evicted before the attempt, so a rejected call does not
+   * become rejectable again. A signal that publishes its own outcome meanwhile makes this attempt stale; a
+   * stale attempt publishes nothing. Otherwise a success publishes `rejected`, a `terminate` that arrived
+   * first included. A failed attempt leaves the call ringing, so its entry is put back for a retry, unless
+   * something ended the call meanwhile (any signal, a `terminate`, another call under the id, a teardown).
+   * An unknown id or an expired entry maps to CallNotFoundError (HTTP 404).
    * A failure of the library's rejectCall() itself propagates as-is.
    */
   async rejectCall(callId: string): Promise<void> {
@@ -1762,22 +2736,30 @@ export class BaileysEvents {
       throw new EngineNotReadyError('Cannot reject a call before the engine is initialized.');
     }
     this.liveCalls.delete(callId);
-    const clears = this.liveCalls.clears;
+    const rejection: CallRejection = { entry, clears: this.liveCalls.clears, ended: false };
+    this.rejections.set(callId, rejection);
+    let current: boolean;
     try {
       await withQueryDeadline(
         sock.rejectCall(callId, entry.callFrom),
         BAILEYS_QUERY_BUDGET_MS,
         'WhatsApp did not confirm the call rejection in time',
       );
+      current = this.isPending(callId, rejection);
     } catch (err) {
-      // A teardown meanwhile ended the connection and its call handles, so the handle stays gone.
-      // Known limit: an outcome that ended the call during the attempt found no entry and left no
-      // trace, so the handle comes back even then, until its TTL runs out.
-      if (this.liveCalls.clears === clears && !this.liveCalls.has(callId) && entry.expiresAt > Date.now()) {
+      if (
+        !rejection.ended &&
+        this.isPending(callId, rejection) &&
+        !this.liveCalls.has(callId) &&
+        entry.expiresAt > Date.now()
+      ) {
         this.liveCalls.set(callId, entry);
       }
       throw err;
+    } finally {
+      if (this.rejections.get(callId) === rejection) this.rejections.delete(callId);
     }
+    if (!current) return;
     // A rejection made HERE produces no inbound `reject` signal to observe, so without this the
     // one outcome the caller definitely knows about — the one they asked for — was the only one
     // never published. Emitted only after the socket accepted it, and the entry is already evicted,
@@ -1790,6 +2772,14 @@ export class BaileysEvents {
       isGroup: entry.isGroup,
       timestamp: Math.floor(Date.now() / 1000),
     });
+  }
+
+  /** Every id form one `group-participants.update` entry carries (its `id`, `lid` and `phoneNumber`). */
+  private groupParticipantForms(entry: unknown): string[] {
+    if (typeof entry === 'string') return entry ? [entry] : [];
+    if (!entry || typeof entry !== 'object') return [];
+    const e = entry as { phoneNumber?: unknown; id?: unknown; lid?: unknown };
+    return [e.id, e.lid, e.phoneNumber].filter((v): v is string => typeof v === 'string' && v.length > 0);
   }
 
   /**
@@ -1826,6 +2816,11 @@ export class BaileysEvents {
     // Hold the stream handle in the outer scope so the timeout can destroy it. A genuine
     // download/read error still rejects (propagating to the caller's catch as before).
     let stream: (AsyncIterable<Buffer> & { destroy?: () => void }) | undefined;
+    // AbortController cancels the underlying HTTP fetch (via patch-baileys-media-signal) and any
+    // pending reuploadRequest when the deadline fires, the byte cap trips, or reading stops early.
+    const abort = new AbortController();
+    const abortReason = (): Error =>
+      abort.signal.reason instanceof Error ? abort.signal.reason : new Error('inbound media download aborted');
     // The timeout can fire before the stream exists (an expired-media re-upload wait, a slow response):
     // the abandoned download must then stop on its own instead of buffering outside the limiter.
     let timedOut = false;
@@ -1839,7 +2834,7 @@ export class BaileysEvents {
       releaseSlot = () => resolve(Buffer.alloc(0));
     });
     const body = async (): Promise<Buffer | { overflowBytes: number }> => {
-      if (timedOut) {
+      if (timedOut || abort.signal.aborted) {
         return Buffer.alloc(0);
       }
       const b = await this.host.loadLib();
@@ -1857,34 +2852,60 @@ export class BaileysEvents {
       // from the nested `options`; a top-level one is ignored. Read after the socket: once the session
       // is torn down getSocket() throws, and a dispatcher built then would never be closed.
       const dispatcher = this.host.getFetchDispatcher();
-      stream = (await b.downloadMediaMessage(
-        msg,
-        'stream',
-        dispatcher ? { options: { dispatcher } as RequestInit } : {},
-        {
-          logger: createSilentLogger(),
-          reuploadRequest: async m => assertWhatsAppSource(await sock.updateMediaMessage(m)),
-        },
-      )) as AsyncIterable<Buffer> & { destroy?: () => void };
-      if (timedOut) {
-        stream.destroy?.();
-        return Buffer.alloc(0);
-      }
-
-      const chunks: Buffer[] = [];
-      let total = 0;
-      for await (const chunk of stream) {
-        if (timedOut) {
-          break;
-        }
-        total += chunk.length;
-        if (total > maxBytes) {
+      try {
+        stream = (await b.downloadMediaMessage(
+          msg,
+          'stream',
+          { options: { ...(dispatcher ? { dispatcher } : {}), signal: abort.signal } },
+          {
+            logger: createSilentLogger(),
+            reuploadRequest: async m => {
+              if (abort.signal.aborted) {
+                throw abortReason();
+              }
+              let onAbort: (() => void) | undefined;
+              const reupload = Promise.resolve(sock.updateMediaMessage(m));
+              // Attach a no-op rejection handler so a late rejection after abort never goes unhandled.
+              reupload.catch(() => undefined);
+              const updated = await new Promise<WAMessage>((resolve, reject) => {
+                onAbort = () => reject(abortReason());
+                abort.signal.addEventListener('abort', onAbort, { once: true });
+                reupload.then(resolve, reject);
+              }).finally(() => {
+                if (onAbort) abort.signal.removeEventListener('abort', onAbort);
+              });
+              if (abort.signal.aborted) {
+                throw abortReason();
+              }
+              return assertWhatsAppSource(updated);
+            },
+          },
+        )) as AsyncIterable<Buffer> & { destroy?: () => void };
+        if (timedOut || abort.signal.aborted) {
           stream.destroy?.();
-          return { overflowBytes: total };
+          return Buffer.alloc(0);
         }
-        chunks.push(chunk);
+
+        const chunks: Buffer[] = [];
+        let total = 0;
+        for await (const chunk of stream) {
+          if (timedOut || abort.signal.aborted) {
+            break;
+          }
+          total += chunk.length;
+          if (total > maxBytes) {
+            abort.abort(new Error('inbound media download exceeded size cap'));
+            stream.destroy?.();
+            return { overflowBytes: total };
+          }
+          chunks.push(chunk);
+        }
+        return Buffer.concat(chunks);
+      } finally {
+        if (!abort.signal.aborted) {
+          abort.abort();
+        }
       }
-      return Buffer.concat(chunks);
     };
     // The wait for the process-wide gate sits inside the deadline below, so a contended gate cannot
     // hold this session's inbound handler longer than MEDIA_DOWNLOAD_TIMEOUT_MS.
@@ -1896,10 +2917,11 @@ export class BaileysEvents {
     });
 
     // A slow/trickling sender never trips the byte cap, so without a deadline it pins a concurrency
-    // slot (and, on Baileys, the whole inbound handler) indefinitely. On timeout, destroy the stream
-    // and treat it as no usable media.
+    // slot (and, on Baileys, the whole inbound handler) indefinitely. On timeout, abort the signal
+    // before destroying the stream so pre-header fetches and pending re-uploads cancel immediately.
     return withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () => {
       timedOut = true;
+      abort.abort(new Error('inbound media download timed out'));
       stream?.destroy?.();
       releaseSlot();
     });
@@ -2040,10 +3062,13 @@ export class BaileysEvents {
     // Body: text first, then media caption, then WhatsApp Business interactive shapes (#562).
     const body = extractBaileysBody(normalized);
     const location = extractBaileysLocation(normalized, contentType);
-    const media = await this.resolveInboundMedia(msg, contentType, content, b, opts?.skipMediaDownload === true, opts);
     // The quote, the disappearing-messages timer, the mentions and the status styling all come from
     // one region of the content — see BaileysMessageContext.
     const context = extractBaileysContext(normalized);
+    // A message the session drops under STORE_EPHEMERAL_MESSAGES=false is neither stored nor announced, so its media
+    // is not fetched: the marker stands in, as for any download that is skipped.
+    const skipMedia = opts?.skipMediaDownload === true || this.dropsAsEphemeral(msg, context.ephemeralDuration);
+    const media = await this.resolveInboundMedia(msg, contentType, content, b, skipMedia, opts);
     // Commerce ids (order token, product id): the generic path sees an empty body and drops them,
     // and they are the only handle a caller has on the order or the product.
     const commerce = extractBaileysCommerce(normalized, contentType);
@@ -2075,11 +3100,231 @@ export class BaileysEvents {
         isCatalogShare: isBaileysCatalogShare(normalized),
         ephemeralDuration: context.ephemeralDuration,
         mentionedJids: context.mentionedJids,
+        isForwarded: context.isForwarded,
+        forwardingScore: context.forwardingScore,
         backgroundArgb: context.backgroundArgb,
         font: context.font,
       },
       jid => this.host.toNeutralJid(jid),
     );
+  }
+
+  /**
+   * Report a poll vote. The library exports `decryptPollVote` and no longer reads a vote itself, so the
+   * adapter does, with the secret of the stored poll creation message, and names each selected option by
+   * its SHA-256 hash. A vote it cannot read is skipped; the caller drops the message either way.
+   */
+  private async processPollVote(
+    b: typeof BaileysLib,
+    msg: WAMessage,
+    remoteJid: string,
+    chatJid: string,
+    content: WAMessage['message'],
+    generation: number,
+  ): Promise<void> {
+    try {
+      const pollUpdate = content?.pollUpdateMessage;
+      const targetId = pollUpdate?.pollCreationMessageKey?.id;
+      const encPayload = bytesOf(pollUpdate?.vote?.encPayload);
+      const encIv = bytesOf(pollUpdate?.vote?.encIv);
+      if (
+        !targetId ||
+        !encPayload ||
+        !encIv ||
+        !hasSecretPayloadBounds(encIv, encPayload, { allowEmptyPlaintext: true })
+      ) {
+        this.host.logger.debug('Cannot read poll vote: missing creation key or ciphertext', {
+          action: 'baileys_poll_vote_unreadable',
+          msgId: msg.key.id ?? 'unknown',
+          targetId: targetId ?? 'unknown',
+        });
+        return;
+      }
+
+      const original = await this.readTarget(targetId, 'reading the poll a vote targets');
+      if (generation !== this.storeGeneration) return;
+      const secret = messageSecretOf(original?.message);
+      const normalizedPoll = original?.message
+        ? (b.normalizeMessageContent(original.message) ?? original.message)
+        : undefined;
+      const rawPoll = extractBaileysRawPoll(normalizedPoll);
+      if (
+        !original ||
+        !secret ||
+        !hasSecretPayloadBounds(encIv, encPayload, { secret, allowEmptyPlaintext: true }) ||
+        !rawPoll
+      ) {
+        this.host.logger.debug('Cannot read poll vote: target poll is missing, not a poll, or has no secret', {
+          action: 'baileys_poll_vote_unreadable',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      const decrypted = this.decryptPollVoteWithCandidates(
+        b,
+        { encPayload, encIv },
+        { pollMsgId: targetId, pollEncKey: secret },
+        original.key,
+        msg.key,
+      );
+      if (!decrypted) {
+        this.host.logger.debug('A poll vote did not authenticate against its poll', {
+          action: 'baileys_poll_vote_unauthentic',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      // A poll the account sent to a broadcast list is filed under the list, which no chat can match, so
+      // readsAsForeign lets every vote through. Each recipient votes from its 1:1 chat, and only that is exempt.
+      const ownListPoll = original.key.fromMe === true && !!original.key.remoteJid?.endsWith('@broadcast');
+      if (
+        this.readsAsForeign(original.key, msg.key, false, 'reaction') ||
+        (ownListPoll && chatKind(remoteJid) !== 'individual')
+      ) {
+        this.host.logger.warn('Dropping a poll vote sent in a chat other than its poll', {
+          action: 'baileys_poll_vote_cross_chat',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      const selectedOptions = this.resolvePollVoteOptions(rawPoll.options, decrypted.selectedOptions);
+      if (!selectedOptions) {
+        this.host.logger.debug('Skipping poll vote carrying an unrecognized option hash', {
+          action: 'baileys_poll_vote_unknown_option',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+
+      const timestampMs = this.toPollVoteTimestampMs(pollUpdate?.senderTimestampMs, msg.messageTimestamp);
+      const voterRaw = keyParticipant(msg.key) ?? (msg.key.fromMe === true ? this.host.normalizedSelfJid() : remoteJid);
+      const voterId = this.host.toNeutralJid(voterRaw);
+      if (!voterId) {
+        this.host.logger.debug('Skipping poll vote with empty voter id', {
+          action: 'baileys_poll_vote_empty_voter',
+          msgId: msg.key.id ?? 'unknown',
+          targetId,
+        });
+        return;
+      }
+      const pollName = rawPoll.name ? boundPollText(rawPoll.name) : '';
+      const event: PollVoteEvent = {
+        pollMessageId: targetId,
+        chatId: this.host.toNeutralJid(chatJid),
+        voterId,
+        selectedOptions,
+        ...(pollName ? { pollName } : {}),
+        timestamp: Math.floor(timestampMs / 1000),
+        timestampMs,
+      };
+      this.announceWhenHandedOn(targetId, undefined, () => this.host.getOnPollVote()?.(event));
+    } catch (error) {
+      this.host.logger.debug('Could not process poll vote', {
+        action: 'baileys_poll_vote_failed',
+        msgId: msg.key.id ?? 'unknown',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private ownBareJids(): string[] {
+    const user = this.host.getSocketOrNull()?.user;
+    return [user?.id, user?.lid].filter((jid): jid is string => !!jid).map(withoutDevice);
+  }
+
+  /**
+   * The id forms to try for one party of a payload encrypted under a message secret: `senderForms`, with
+   * each lid also tried as its session-known phone number (`toNeutralJid` for the account's own lid or
+   * `host.resolvePhone` for a contact) and each phone form also tried as its session-known lid
+   * (`host.lidOf`). A message written under phone addressing can be edited, reacted to or voted on under
+   * lid addressing (or vice versa), even when the key omits `remoteJidAlt` or `participantAlt`.
+   */
+  private decryptionSenderForms(key: WAMessageKey, own: readonly string[]): string[] {
+    const expanded = senderForms(key, own).flatMap(jid => {
+      const { kind } = parseWaId(jid);
+      if (kind === 'lid') {
+        const neutral = this.host.toNeutralJid(jid);
+        const phone = neutral.endsWith('@c.us') ? userPart(neutral) : this.host.resolvePhone?.(jid);
+        return phone ? [jid, `${userPart(phone)}@s.whatsapp.net`] : [jid];
+      }
+      if (kind === 'user') {
+        const lid = this.host.lidOf?.(jid);
+        return lid ? [jid, `${userPart(lid)}@lid`] : [jid];
+      }
+      return [jid];
+    });
+    return [...new Set(expanded)];
+  }
+
+  private decryptPollVoteWithCandidates(
+    b: typeof BaileysLib,
+    vote: { encPayload: Buffer; encIv: Buffer },
+    ctx: { pollMsgId: string; pollEncKey: Buffer },
+    pollKey: WAMessageKey,
+    voteKey: WAMessageKey,
+  ): BaileysLib.proto.Message.IPollVoteMessage | undefined {
+    const own = this.ownBareJids();
+    const creators = this.decryptionSenderForms(pollKey, own);
+    const voters = this.decryptionSenderForms(voteKey, own);
+    for (const pollCreatorJid of creators) {
+      for (const voterJid of voters) {
+        try {
+          return b.decryptPollVote(vote, { ...ctx, pollCreatorJid, voterJid });
+        } catch {
+          // Not this JID pair or secret: AES-GCM authentication did not verify.
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private resolvePollVoteOptions(
+    rawOptions: readonly string[],
+    selectedHashes: Uint8Array[] | null | undefined,
+  ): string[] | undefined {
+    if (!selectedHashes?.length) return [];
+    const byHash = new Map<string, string>();
+    for (const option of rawOptions) {
+      const digest = createHash('sha256').update(option).digest('hex');
+      if (!byHash.has(digest)) byHash.set(digest, option);
+    }
+    const resolved: string[] = [];
+    const seen = new Set<string>();
+    for (const bytes of selectedHashes) {
+      const hex = Buffer.from(bytes).toString('hex');
+      const matched = byHash.get(hex);
+      if (matched === undefined) return undefined;
+      if (seen.has(hex)) continue;
+      seen.add(hex);
+      resolved.push(matched);
+    }
+    return boundPollOptions(resolved);
+  }
+
+  private toPollVoteTimestampMs(
+    senderTimestampMs: number | string | { toNumber?: () => number } | null | undefined,
+    fallbackSeconds: number | string | { toNumber(): number } | null | undefined,
+  ): number {
+    if (senderTimestampMs != null) {
+      const ms =
+        typeof senderTimestampMs === 'number'
+          ? senderTimestampMs
+          : typeof senderTimestampMs === 'object'
+            ? typeof senderTimestampMs.toNumber === 'function'
+              ? senderTimestampMs.toNumber()
+              : Number.NaN
+            : Number(senderTimestampMs);
+      if (Number.isFinite(ms) && ms > 0) return Math.floor(ms);
+    }
+    const msgSeconds = toUnixSeconds(fallbackSeconds);
+    return msgSeconds > 0 ? msgSeconds * 1000 : Date.now();
   }
 
   /** Protocol-message edit timestamps are milliseconds; the enclosing message timestamp is seconds. */

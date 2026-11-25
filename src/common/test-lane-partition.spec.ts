@@ -13,7 +13,7 @@ import * as yaml from 'js-yaml';
 describe('Test lane partition', () => {
   const repoRoot = join(__dirname, '..', '..');
   const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
-    scripts: { 'test:docs'?: string; 'test:scripts'?: string };
+    scripts: { 'test:docs'?: string; 'test:scripts'?: string; 'test:engine-real'?: string };
     jest?: { testPathIgnorePatterns?: string[]; coveragePathIgnorePatterns?: string[] };
   };
 
@@ -111,23 +111,53 @@ describe('Test lane partition', () => {
   });
 
   /**
+   * `test/engine-real/` is run by `test:engine-real` alone, which hands node:test an explicit list of files, and the
+   * build job of ci.yml and the release workflow run nothing but that script. Jest never looks in that directory, so
+   * a proof written there and left out of the string runs NOWHERE, and a renamed or deleted one still named by it
+   * makes the whole invocation exit non-zero on a file it cannot open. The comparison is against the directory, all
+   * of it: a proof in a subdirectory, or named `*.test.mjs` or `*.spec.js`, is as unrun as a top-level `*.spec.mjs`.
+   * Only the helpers under `support/` are imported rather than run.
+   */
+  it('runs every proof under test/engine-real/ in the test:engine-real lane', () => {
+    const isProof = (path: string): boolean => /\.(mjs|js)$/.test(path) && !path.split('/').includes('support');
+    const onDisk = (readdirSync(join(repoRoot, 'test', 'engine-real'), { recursive: true }) as string[])
+      .map(path => `test/engine-real/${path.split('\\').join('/')}`)
+      .filter(isProof);
+    const named = (pkg.scripts['test:engine-real'] ?? '').split(/\s+/).filter(isProof);
+
+    // Vacuity guard: an empty directory scan or an unparsed script would pass the diff below.
+    expect(onDisk.length).toBeGreaterThanOrEqual(2);
+    expect(named.length).toBeGreaterThanOrEqual(2);
+
+    expect({
+      neverRun: onDisk.filter(path => !named.includes(path)).sort(),
+      namedButAbsent: named.filter(path => !onDisk.includes(path)).sort(),
+    }).toEqual({ neverRun: [], namedButAbsent: [] });
+  });
+
+  /**
    * The PostgreSQL specs self-skip unless DATABASE_TYPE=postgres, so the unit lane reports one as
    * skipped, which is green. The only lane that sets it is the `test-postgres` job, and that job
    * names its specs inline. jest reads those positionals as OR'd regex filters, so a stale name
    * matches nothing and still exits 0, and a new spec left off the list runs nowhere. Diff each
    * workflow's list against the files on disk.
    */
+  /** Every `*.spec.ts` path the workflow's `test-postgres` job names on a run line. */
+  const postgresJobSpecs = (file: string): string[] => {
+    const workflow = yaml.load(readFileSync(join(repoRoot, '.github', 'workflows', file), 'utf8')) as {
+      jobs?: Record<string, { steps?: { run?: string }[] }>;
+    };
+    return (workflow.jobs?.['test-postgres']?.steps ?? [])
+      .flatMap(step => (step.run ?? '').split(/\s+/))
+      .filter(token => token.endsWith('.spec.ts'));
+  };
+
   it.each(['ci.yml', 'release.yml'])('runs every *.pg.spec.ts in the %s test-postgres job', file => {
     const isPgSpec = (path: string): boolean => path.endsWith('.pg.spec.ts');
     const onDisk = (readdirSync(join(repoRoot, 'src'), { recursive: true }) as string[])
       .filter(isPgSpec)
       .map(path => `src/${path.split('\\').join('/')}`);
-    const workflow = yaml.load(readFileSync(join(repoRoot, '.github', 'workflows', file), 'utf8')) as {
-      jobs?: Record<string, { steps?: { run?: string }[] }>;
-    };
-    const named = (workflow.jobs?.['test-postgres']?.steps ?? [])
-      .flatMap(step => (step.run ?? '').split(/\s+/))
-      .filter(isPgSpec);
+    const named = postgresJobSpecs(file).filter(isPgSpec);
 
     // Vacuity guard: a scan or a parse that found nothing would pass the diff below.
     expect(onDisk.length).toBeGreaterThanOrEqual(5);
@@ -137,6 +167,33 @@ describe('Test lane partition', () => {
       neverRun: onDisk.filter(path => !named.includes(path)).sort(),
       namedButAbsent: named.filter(path => !onDisk.includes(path)).sort(),
     }).toEqual({ neverRun: [], namedButAbsent: [] });
+  });
+
+  /**
+   * A spec that picks its dialect from DATABASE_TYPE is not a `*.pg.spec.ts`, so the scan above never
+   * sees it, yet its PostgreSQL half runs only in this job. Dropping it from both workflows at once
+   * leaves release-gate-parity green (the two still agree) and the scenarios silently SQLite-only. A
+   * hand-kept list cannot see a spec nobody added to it, so the list is every plain spec on disk that
+   * compares DATABASE_TYPE with postgres (`===`, `!==`, or the loose forms). A spec that reads the variable
+   * into another name first is not seen; compare it in place.
+   */
+  const dialectSwitchedSpecs = (): string[] =>
+    (readdirSync(join(repoRoot, 'src'), { recursive: true }) as string[])
+      .map(path => `src/${path.split('\\').join('/')}`)
+      .filter(path => path.endsWith('.spec.ts') && !path.endsWith('.pg.spec.ts'))
+      .filter(path => /DATABASE_TYPE\s*[!=]==?\s*['"]postgres['"]/.test(readFileSync(join(repoRoot, path), 'utf8')))
+      .sort();
+
+  it.each(['ci.yml', 'release.yml'])('runs the dialect-switched specs in the %s test-postgres job', file => {
+    const onDisk = dialectSwitchedSpecs();
+    const named = postgresJobSpecs(file).filter(path => !path.endsWith('.pg.spec.ts'));
+
+    // Vacuity guard: the scan must find the twelve specs that switch today.
+    expect(onDisk.length).toBeGreaterThanOrEqual(12);
+    expect({
+      neverRun: onDisk.filter(path => !named.includes(path)),
+      unlisted: named.filter(path => !onDisk.includes(path)).sort(),
+    }).toEqual({ neverRun: [], unlisted: [] });
   });
 
   it('names suites that exist on disk', () => {

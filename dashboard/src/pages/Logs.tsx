@@ -11,6 +11,7 @@ import { CustomSelect } from '../components/CustomSelect';
 import { pageWindow } from '../utils/pageWindow';
 import { fetchAllPages } from '../utils/fetchAllPages';
 import { escapeCsvCell } from '../utils/csv';
+import { scheduleObjectUrlRevoke } from '../utils/objectUrl';
 import './Logs.css';
 
 export function Logs() {
@@ -84,7 +85,7 @@ export function Logs() {
     a.href = url;
     a.download = `openwa-logs-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
-    URL.revokeObjectURL(url);
+    scheduleObjectUrlRevoke(url);
   };
 
   // Export the WHOLE audit history (honouring the active severity filter + search), not just the
@@ -166,12 +167,14 @@ export function Logs() {
               setSeverityFilter(value);
               setPage(1);
             }}
+            // No Error option: the gateway writes audit rows as info or warn only, failures included, so it would
+            // only ever show an empty table. A stored error row still renders its badge.
             options={[
               { value: 'all', label: t('logs.severity.all') },
               { value: 'info', label: t('logs.severity.info') },
               { value: 'warn', label: t('logs.severity.warn') },
-              { value: 'error', label: t('logs.severity.error') },
             ]}
+            ariaLabel={t('logs.columns.severity')}
           />
         </div>
       </div>
@@ -221,10 +224,19 @@ export function Logs() {
             filteredLogs.map(log => (
               <div key={log.id} className="table-row">
                 <span className="timestamp">{formatTimestamp(log.createdAt)}</span>
-                <span className="action">{log.action}</span>
-                <span>{log.sessionName || log.sessionId || '—'}</span>
-                <span className="api-key">{log.apiKeyName || '—'}</span>
-                <span className="ip">{log.ipAddress || '—'}</span>
+                <span className="action">
+                  {log.action}
+                  {log.errorMessage && <span className="log-message">{log.errorMessage}</span>}
+                </span>
+                <span className="session" title={log.sessionName || log.sessionId || undefined}>
+                  {log.sessionName || log.sessionId || '—'}
+                </span>
+                <span className="api-key" title={log.apiKeyName || undefined}>
+                  {log.apiKeyName || '—'}
+                </span>
+                <span className="ip" title={log.ipAddress || undefined}>
+                  {log.ipAddress || '—'}
+                </span>
                 <span>
                   <span className={`severity-badge ${log.severity}`}>{t(`logs.severity.${log.severity}`)}</span>
                 </span>
@@ -241,7 +253,12 @@ export function Logs() {
           </button>
           <span className="page-numbers">
             {pageWindow(page, totalPages).map(p => (
-              <button key={p} className={p === page ? 'active' : ''} onClick={() => setPage(p)}>
+              <button
+                key={p}
+                className={p === page ? 'active' : ''}
+                aria-current={p === page ? 'page' : undefined}
+                onClick={() => setPage(p)}
+              >
                 {p}
               </button>
             ))}

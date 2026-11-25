@@ -8,10 +8,10 @@ export type { EngineHistoryMessage };
 // bubble. The DB copy of a recent message still wins in mergeChatMessages, so its real media is kept.
 const HISTORY_MEDIA_TYPES = new Set(['image', 'video', 'audio', 'voice', 'sticker', 'document']);
 
-// Normalize an engine history message into the DB ChatMessage shape the thread renders. Historical
-// messages have no live delivery state, so default to `read` (they are old/already-seen); real status
-// for current-session messages still comes from the DB copy and live websocket acks.
-export function mapEngineHistoryMessage(h: EngineHistoryMessage): ChatMessage {
+// Normalize an engine history message into the shape the thread renders. The engine history carries
+// no delivery state, so a row known only from it has no `status` and draws no tick; real status for
+// current-session messages comes from the DB copy and live websocket acks.
+export function mapEngineHistoryMessage(h: EngineHistoryMessage): ChatMessageView {
   return {
     id: h.id,
     waMessageId: h.id,
@@ -23,7 +23,6 @@ export function mapEngineHistoryMessage(h: EngineHistoryMessage): ChatMessage {
     body: h.body ?? '',
     type: h.type as MessageType,
     direction: h.fromMe ? 'outgoing' : 'incoming',
-    status: 'read',
     timestamp: h.timestamp,
     createdAt: new Date((h.timestamp ?? 0) * 1000).toISOString(),
     metadata: (() => {
@@ -41,16 +40,80 @@ export function mapEngineHistoryMessage(h: EngineHistoryMessage): ChatMessage {
   };
 }
 
-const msgKey = (m: ChatMessage): string => m.waMessageId ?? m.id;
-const msgTime = (m: ChatMessage): number =>
+const msgKey = (m: ChatMessageView): string => m.waMessageId ?? m.id;
+const msgTime = (m: ChatMessageView): number =>
   typeof m.timestamp === 'number' ? m.timestamp : Math.floor(Date.parse(m.createdAt) / 1000) || 0;
+
+// WhatsApp Web lists a message deleted for everyone under the id of the delete notice, not the id the
+// message had, so its history entry never pairs with the stored row by id and the thread drew the
+// deleted message twice. Such an entry IS the stored `revoked` row with the same direction, sender and
+// timestamp (measured on a live session: only the id differs). It is matched one to one and left out,
+// so the stored row, with its real status, is the one kept. A history-only deleted message has no
+// stored row to match and stays.
+function withoutStoredTwins(history: ChatMessageView[], db: ChatMessageView[]): ChatMessageView[] {
+  const historyKeys = new Set(history.map(msgKey));
+  const storedKeys = new Set(db.map(msgKey));
+  const unpaired = db.filter(s => s.type === 'revoked' && !historyKeys.has(msgKey(s)));
+  const leftOut = new Set<string>();
+  return history.filter(h => {
+    const key = msgKey(h);
+    if (leftOut.has(key)) return false;
+    if (h.type !== 'revoked' || storedKeys.has(key) || typeof h.timestamp !== 'number') return true;
+    const sender = h.author ?? h.from;
+    const twin = unpaired.findIndex(
+      s => s.direction === h.direction && (s.author ?? s.from) === sender && s.timestamp === h.timestamp,
+    );
+    if (twin === -1) return true;
+    unpaired.splice(twin, 1);
+    leftOut.add(key);
+    return false;
+  });
+}
+
+// A whatsapp-web.js message id is `<fromMe>_<chat>_<stanza>`, plus the author on a group message or `out` on
+// an own 1:1 one. A person's chat, and an author, can be named by phone number in one id and by lid in
+// another id of the same message; the direction and the stanza are what the two share. Undefined for an id
+// in any other form, a stanza that holds an underscore included: its last part would pass for a fourth one.
+const SERIALIZED_MESSAGE_ID = /^(true|false)_[^_@]+@[^_@]+_([^_]+)(?:_(?:out|[^_@]+@[^_@]+))?$/;
+const stanzaKey = (m: ChatMessageView): string | undefined => {
+  const parts = SERIALIZED_MESSAGE_ID.exec(msgKey(m));
+  return parts ? `${parts[1]}_${parts[2]}` : undefined;
+};
+
+// A deleted message's history entry that names the chat, or the author, in the other id form than its
+// stored row (measured live: the party that deleted the message addressed the chat by phone number, the
+// stored row has the lid) is put under the stored row's id, so the two merge as any pair with one id does:
+// the stored row is kept, and is shown deleted even if the delete never reached it. A stored row the page
+// lists under its own id is accounted for, and nothing else is taken for it.
+function underStoredKeys(history: ChatMessageView[], db: ChatMessageView[]): ChatMessageView[] {
+  const storedKeys = new Set(db.map(msgKey));
+  const listedKeys = new Set(history.map(msgKey));
+  const storedByStanza = new Map<string, string>();
+  for (const s of db) {
+    const stanza = stanzaKey(s);
+    if (stanza && !listedKeys.has(msgKey(s))) storedByStanza.set(stanza, msgKey(s));
+  }
+  // Decided per id, not per entry: a page that lists one message twice lists that message, deleted or not.
+  const moved = new Map<string, string>();
+  for (const h of history) {
+    const key = msgKey(h);
+    if (h.type !== 'revoked' || storedKeys.has(key)) continue;
+    const stanza = stanzaKey(h);
+    const storedKey = stanza && storedByStanza.get(stanza);
+    if (storedKey) moved.set(key, storedKey);
+  }
+  return history.map(h => {
+    const storedKey = moved.get(msgKey(h));
+    return storedKey ? { ...h, waMessageId: storedKey } : h;
+  });
+}
 
 // Merge persisted DB messages with engine history into one ascending thread. The engine fills the
 // backfill (history from before the gateway captured anything); the DB copy wins on conflict so the
 // real delivery status survives. Deduped by the wweb.js serialized id (engine `id` == DB `waMessageId`).
-export function mergeChatMessages(db: ChatMessage[], history: ChatMessage[]): ChatMessage[] {
-  const byId = new Map<string, ChatMessage>();
-  for (const m of [...history, ...db]) {
+export function mergeChatMessages(db: ChatMessageView[], history: ChatMessageView[]): ChatMessageView[] {
+  const byId = new Map<string, ChatMessageView>();
+  for (const m of [...withoutStoredTwins(underStoredKeys(history, db), db), ...db]) {
     const key = msgKey(m);
     const hist = byId.get(key);
     // The DB copy wins (authoritative status) — but a legacy row has no stable sender id, so
@@ -96,8 +159,10 @@ export function capMediaPayloads(list: ChatMessageView[], keep = MEDIA_PAYLOAD_C
   let payloadCount = 0;
   const retainsMedia = (message: ChatMessageView): boolean => {
     const media = message.metadata?.media;
+    // An archived marker previews only while its copy exists (mediaPath, as ChatThread checks); retention nulls it.
     return Boolean(
-      media?.data || (media?.archived && HISTORY_MEDIA_TYPES.has(message.type) && message.type !== 'document'),
+      media?.data ||
+      (media?.archived && message.mediaPath && HISTORY_MEDIA_TYPES.has(message.type) && message.type !== 'document'),
     );
   };
   for (const m of list) if (retainsMedia(m)) payloadCount++;
@@ -236,19 +301,101 @@ export type MessageMedia = {
   archived?: boolean;
 };
 
+// Allowlisted passive media MIME essences that may be embedded directly in inline `data:` URIs.
+// Matches backend INERT_MEDIA_MIMETYPE so active document/markup types (such as text/html or
+// image/svg+xml) are downgraded to inert application/octet-stream.
+const INERT_MEDIA_MIMETYPE =
+  /^(image\/(jpeg|png|gif|webp|bmp)|video\/(mp4|webm|quicktime|3gpp)|audio\/(mpeg|mp4|ogg|aac|wav|webm))$/;
+
+/** Return the normalized MIME essence if it is safe passive media, else `application/octet-stream`. */
+export function inertMediaMimetype(mimetype?: string): string {
+  const essence = (mimetype ?? '').split(';')[0].trim().toLowerCase();
+  return INERT_MEDIA_MIMETYPE.test(essence) ? essence : 'application/octet-stream';
+}
+
 export const getMediaSrc = (media?: MessageMedia): string => {
   if (!media || !media.data) return '';
-  if (media.data.startsWith('data:') || media.data.startsWith('http://') || media.data.startsWith('https://')) {
+  if (/^https?:\/\//i.test(media.data)) {
     return media.data;
   }
-  return `data:${media.mimetype};base64,${media.data}`;
+  if (/^data:/i.test(media.data)) {
+    const comma = media.data.indexOf(',');
+    if (comma === -1) return '';
+    const header = media.data.slice(5, comma);
+    const payload = media.data.slice(comma + 1);
+    const isBase64 = /;base64$/i.test(header.trim());
+    const safeMime = inertMediaMimetype(header);
+    return `data:${safeMime}${isBase64 ? ';base64' : ''},${payload}`;
+  }
+  return `data:${inertMediaMimetype(media.mimetype)};base64,${media.data}`;
 };
 
-export interface ChatMessageView extends ChatMessage {
+function decodeBase64(raw: string): Uint8Array<ArrayBuffer> | null {
+  try {
+    const binary = atob(raw.replace(/\s+/g, ''));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+/** Decode an inline media payload (raw base64 or `data:` URI) into an inert `application/octet-stream` Blob. */
+export function inlineMediaToBlob(media?: MessageMedia): Blob | null {
+  if (!media?.data || /^https?:\/\//i.test(media.data)) return null;
+  if (/^data:/i.test(media.data)) {
+    const comma = media.data.indexOf(',');
+    if (comma === -1) return null;
+    const header = media.data.slice(5, comma);
+    const payload = media.data.slice(comma + 1);
+    if (/;base64$/i.test(header.trim())) {
+      const bytes = decodeBase64(payload);
+      return bytes ? new Blob([bytes], { type: 'application/octet-stream' }) : null;
+    }
+    let decoded = payload;
+    try {
+      decoded = decodeURIComponent(payload);
+    } catch {
+      // Keep raw payload when percent-decoding fails so the download still delivers inert bytes.
+    }
+    const bytes = new TextEncoder().encode(decoded);
+    return new Blob([bytes], { type: 'application/octet-stream' });
+  }
+  const bytes = decodeBase64(media.data);
+  return bytes ? new Blob([bytes], { type: 'application/octet-stream' }) : null;
+}
+
+/**
+ * A message's time in epoch seconds as the thread dates it, for its clock and its day separators: the WhatsApp
+ * timestamp, else when the gateway stored it.
+ */
+export const timestampOf = (msg: ChatMessageView): number =>
+  msg.timestamp || Math.floor(new Date(msg.createdAt).getTime() / 1000);
+
+/**
+ * Whether the thread has anything to draw for a row. An `unknown` row with no text, media, quote or
+ * prompt buttons would be a bubble holding a sender and a time and nothing else, so it is left out of
+ * the thread and of everything that asks which row is last.
+ */
+export function isRenderableMessage(msg: ChatMessageView): boolean {
+  if (msg.type !== 'unknown') return true;
+  const mediaInfo = msg.metadata?.media;
+  if (mediaInfo?.omitted || Boolean(mediaInfo && getMediaSrc(mediaInfo))) return true;
+  if (msg.body && (!mediaInfo || msg.body !== mediaInfo.filename)) return true;
+  if (msg.metadata?.quotedMessage) return true;
+  if (msg.direction !== 'outgoing' && (msg.metadata?.buttons?.length ?? 0) > 0) return true;
+  return false;
+}
+
+export interface ChatMessageView extends Omit<ChatMessage, 'status'> {
+  /** Absent on a row known only from the engine history, which carries no delivery state. */
+  status?: ChatMessage['status'];
   metadata?: {
     media?: MessageMedia;
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
+    edited?: boolean;
     call?: { video: boolean; missed: boolean };
     buttons?: Array<{ id: string; text: string }>;
     poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
@@ -258,7 +405,8 @@ export interface ChatMessageView extends ChatMessage {
 /**
  * Metadata for a live `message.received` / `message.sent` WS payload. Prompt `buttons` arrive
  * top-level on that event (the history route never populates them) and are folded here so the
- * thread renders from `metadata.buttons`, matching persisted DB rows.
+ * thread renders from `metadata.buttons`, matching persisted DB rows. So is `edited`, set on a
+ * message edited before the gateway stored it, whose `message.edited` came while no thread held it.
  */
 export function liveMessageMetadata(msg: {
   media?: MessageMedia;
@@ -266,10 +414,12 @@ export function liveMessageMetadata(msg: {
   call?: { video: boolean; missed: boolean };
   buttons?: Array<{ id: string; text: string }>;
   poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+  edited?: boolean;
   metadata?: ChatMessageView['metadata'];
 }): ChatMessageView['metadata'] {
-  if (msg.metadata) return msg.metadata;
+  if (msg.metadata) return msg.edited ? { ...msg.metadata, edited: true } : msg.metadata;
   const metadata: NonNullable<ChatMessageView['metadata']> = {};
+  if (msg.edited) metadata.edited = true;
   if (msg.media) metadata.media = msg.media;
   if (msg.quotedMessage) metadata.quotedMessage = msg.quotedMessage;
   if (msg.call) metadata.call = msg.call;
@@ -314,6 +464,69 @@ export function mergeReactionSnapshot(
   return incoming ?? existing;
 }
 
+/** Extract bare phone digits from a session phone value or JID, or null when absent/non-numeric. */
+export function normalizeSessionPhone(phone?: string | null): string | null {
+  if (!phone) return null;
+  const digits = phone.split('@')[0].split(':')[0].replace(/\D/g, '');
+  return digits.length > 0 ? digits : null;
+}
+
+/**
+ * Whether a reaction map key belongs to the current session: `'me'` or an exact match on the
+ * session's normalized phone local-part (with optional numeric `:device` suffix) and either no
+ * domain, `@c.us`, or `@s.whatsapp.net`. Never performs substring matching and never matches
+ * `@lid` or `@g.us`.
+ */
+export function isOwnReactionSender(sender: string, sessionPhone?: string | null): boolean {
+  if (sender === 'me') return true;
+  const digits = normalizeSessionPhone(sessionPhone);
+  if (!digits) return false;
+  const at = sender.indexOf('@');
+  const local = at === -1 ? sender : sender.slice(0, at);
+  const domain = at === -1 ? '' : sender.slice(at + 1).toLowerCase();
+  if (at !== -1 && domain !== 'c.us' && domain !== 's.whatsapp.net') return false;
+  const colon = local.indexOf(':');
+  if (colon === -1) return local === digits;
+  const phonePart = local.slice(0, colon);
+  const devicePart = local.slice(colon + 1);
+  return phonePart === digits && /^\d+$/.test(devicePart);
+}
+
+/** Canonical reaction map key for the local session (`<digits>@c.us`, or `'me'` when phone is unknown). */
+export function ownReactionKey(sessionPhone?: string | null): string {
+  const digits = normalizeSessionPhone(sessionPhone);
+  return digits ? `${digits}@c.us` : 'me';
+}
+
+/** Return `''` if the session already reacted with `emoji` (toggle off), otherwise `emoji`. */
+export function toggleOwnReaction(
+  reactions: Record<string, string> | undefined,
+  emoji: string,
+  sessionPhone?: string | null,
+): string {
+  for (const [sender, emo] of Object.entries(reactions ?? {})) {
+    if (isOwnReactionSender(sender, sessionPhone) && emo === emoji) return '';
+  }
+  return emoji;
+}
+
+/**
+ * Return an updated reaction map with all existing own-sender entries (`'me'` and `<phone>@...`)
+ * removed, and `ownReactionKey(sessionPhone)` set to `emoji` when `emoji` is non-empty.
+ */
+export function applyOwnReaction(
+  reactions: Record<string, string> | undefined,
+  emoji: string,
+  sessionPhone?: string | null,
+): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [sender, emo] of Object.entries(reactions ?? {})) {
+    if (!isOwnReactionSender(sender, sessionPhone)) next[sender] = emo;
+  }
+  if (emoji !== '') next[ownReactionKey(sessionPhone)] = emoji;
+  return next;
+}
+
 /**
  * Merge two metadata bags field-by-field. The incoming copy wins per field only when it actually
  * carries a value — a live `message.sent` echo is built as `{media, quotedMessage, call}` with
@@ -336,6 +549,7 @@ function mergeMessageMetadata(
     return incoming.media;
   })();
   const merged: NonNullable<ChatMessageView['metadata']> = {};
+  if (existing.edited || incoming.edited) merged.edited = true;
   if (media) merged.media = media;
   const quotedMessage = incoming.quotedMessage ?? existing.quotedMessage;
   if (quotedMessage) merged.quotedMessage = quotedMessage;
@@ -460,7 +674,8 @@ export function findRevokedIndex(list: ChatMessageView[], event: { id: string; r
 /**
  * Replace the displayed body of a cached WhatsApp message after a `message.edited` event. Both id
  * candidates are matched, for the reason given on findRevokedIndex. Returns the original array on
- * a miss.
+ * a miss, and when the event repeats the text the message already has: the gateway announces such an
+ * event but stores no edited marker for it, so labelling it here would show what a reload does not.
  */
 export function applyMessageEdit(
   list: ChatMessageView[],
@@ -468,8 +683,28 @@ export function applyMessageEdit(
 ): ChatMessageView[] {
   if (!event.messageId) return list;
   const idx = list.findIndex(byMessageId(event.messageId));
-  if (idx === -1 || list[idx].type === 'revoked') return list;
+  if (idx === -1 || list[idx].type === 'revoked' || list[idx].body === event.body) return list;
   const next = list.slice();
-  next[idx] = { ...next[idx], body: event.body };
+  next[idx] = { ...next[idx], body: event.body, metadata: { ...next[idx].metadata, edited: true } };
   return next;
+}
+
+/**
+ * The ids a read of a chat should name on an engine that acknowledges messages one by one: the incoming messages
+ * of the thread that no read has acknowledged yet, at most `max` of the newest, oldest first. An id the gateway
+ * would refuse (whitespace, or longer than 128 characters) is left out, since one of them fails the whole read.
+ */
+export function unacknowledgedIncomingIds(
+  thread: ChatMessageView[],
+  acknowledged: ReadonlySet<string>,
+  max: number,
+): string[] {
+  const ids: string[] = [];
+  for (let i = thread.length - 1; i >= 0 && ids.length < max; i--) {
+    const { direction, waMessageId } = thread[i];
+    if (direction === 'incoming' && waMessageId && /^\S{1,128}$/.test(waMessageId) && !acknowledged.has(waMessageId)) {
+      ids.push(waMessageId);
+    }
+  }
+  return ids.reverse();
 }

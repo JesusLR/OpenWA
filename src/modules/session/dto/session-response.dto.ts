@@ -4,15 +4,17 @@ import { SessionStatus } from '../entities/session.entity';
 
 export class AccountRestrictionDto {
   @ApiProperty({
-    enum: ['reachout_timelock', 'tos_block', 'proxy_block'],
+    enum: ['reachout_timelock', 'tos_block', 'proxy_block', 'passkey_required'],
     description:
       'What WhatsApp is restricting. `reachout_timelock` leaves the session connected and existing ' +
       'chats working, blocking only the start of new conversations. `tos_block` and `proxy_block` ' +
       'are connection-level refusals — the session cannot stay linked while one is in force, so ' +
-      'seeing either alongside a `ready` status is not possible.',
+      'seeing either alongside a `ready` status is not possible. `passkey_required` means WhatsApp ' +
+      'asked for a passkey to finish linking a device, which the Baileys engine cannot answer; the ' +
+      'session stays at its QR and the kind is dropped once a link completes.',
     example: 'reachout_timelock',
   })
-  kind!: 'reachout_timelock' | 'tos_block' | 'proxy_block';
+  kind!: 'reachout_timelock' | 'tos_block' | 'proxy_block' | 'passkey_required';
 
   @ApiProperty({
     description:
@@ -87,7 +89,10 @@ export class SessionResponseDto {
     description:
       "A restriction WhatsApp itself has placed on this session's account, or null when there is " +
       'none. Distinct from `lastError`, which describes a fault on our side of the link. Derived ' +
-      'from live engine state, so it is never persisted: it is re-established on the next connect.',
+      "from live engine state and held in the gateway's memory, never persisted: a restart drops it " +
+      'and the engine reports it again on the next connect when it still applies. A stop, start or ' +
+      'logout does not drop it; a lift the engine reports, a link that reaches `ready` (for the types ' +
+      'a linked session cannot carry), the passing of its `expiresAt` or deleting the session does.',
     nullable: true,
   })
   restriction?: AccountRestrictionDto | null;
@@ -99,7 +104,9 @@ export class SessionResponseDto {
       'alone does not imply it: a `disconnected` session keeps its engine for the duration of an automatic ' +
       'reconnect backoff, while a session stopped through `POST /sessions/:sessionId/stop` carries the same ' +
       'status with no engine. On the node running the session, `true` means `stop`, `logout` and ' +
-      '`force-kill` can act and `start` answers 400; `false` means the reverse. For a session another node ' +
+      '`force-kill` can act and `start` answers 400; `false` means `start` can act and `logout` and `force-kill` ' +
+      'answer 400, while `stop` still answers 200 and records the stop, so the session stays down across a ' +
+      'restart until the next start. For a session another node ' +
       'runs, request routing (NODE_URL set on every node) forwards the lifecycle routes to that node, where ' +
       'they act; without routing, only that node can act on it, and any other node answers 409 to `start` ' +
       'and `stop` and 400 to `logout` and `force-kill`. Derived per request from live state, so it is never ' +

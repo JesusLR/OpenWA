@@ -1,6 +1,7 @@
 import type { WAMessage } from '@whiskeysockets/baileys';
 import type { LidMappingStore } from '../identity/lid-mapping-store.service';
 import type { ChatStateStore } from '../adapters/baileys-chat-state-store.service';
+import type { StoredChatPreviewSource } from '../adapters/baileys-stored-chat-previews.service';
 
 /**
  * Persistence boundary for the Baileys engine's message store. The adapter depends on this narrow
@@ -46,13 +47,14 @@ export interface BaileysAdapterConfig {
   dbSessionId: string;
   authDir: string;
   proxyUrl?: string;
-  proxyType?: 'http' | 'https' | 'socks4' | 'socks5';
   /** Persisted store for reply/forward/react/delete. Provided by the plugin; the four ops require it. */
   messageStore?: BaileysMessageStore;
   /** Persisted, cross-session lid->phone resolution table. Backs lid resolution beyond the in-memory map. */
   lidMappingStore?: LidMappingStore;
   /** Persisted per-session mute/archive/pin, so those chat fields survive a reconnect Baileys cannot resync. */
   chatStateStore?: ChatStateStore;
+  /** The newest stored message per chat, read once per engine to list the chats a new engine starts without. */
+  storedChatPreviews?: StoredChatPreviewSource;
 }
 
 /**

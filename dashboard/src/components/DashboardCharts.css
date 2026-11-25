@@ -103,3 +103,17 @@
     grid-column: auto;
   }
 }
+
+/* Time runs left to right and numbers read left to right on every page. Under an inherited right to left
+   direction recharts still places the axis labels for a left to right plot, but the end of each label is
+   anchored on its other side, so the category labels were drawn across their own bars. */
+.dashboard-charts .recharts-surface {
+  direction: ltr;
+}
+
+/* Forced colours drop fills, so the selected period draws a heavy frame. */
+@media (forced-colors: active) {
+  .dashboard-charts .period-tab.active {
+    border: 3px solid CanvasText;
+  }
+}

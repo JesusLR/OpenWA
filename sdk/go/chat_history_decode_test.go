@@ -12,7 +12,7 @@ func TestChatHistoryMessageDecodesEngineFields(t *testing.T) {
 	raw := []byte(`{
 	  "id":"true_628@c.us_ABC","from":"628@c.us","to":"629@c.us","chatId":"628@c.us",
 	  "body":"","type":"call","timestamp":1719312000,"fromMe":false,"isGroup":false,
-	  "kind":"individual","ephemeralDuration":604800,
+	  "kind":"individual","ephemeralDuration":604800,"isForwarded":true,"forwardingScore":2,
 	  "call":{"video":true,"missed":false},
 	  "contact":{"pushName":"Budi","number":"628","isMyContact":true,"verifiedLevel":0,"labels":["vip"]}
 	}`)
@@ -23,6 +23,9 @@ func TestChatHistoryMessageDecodesEngineFields(t *testing.T) {
 	}
 	if m.EphemeralDuration != 604800 {
 		t.Errorf("ephemeralDuration = %d, want 604800", m.EphemeralDuration)
+	}
+	if !m.IsForwarded || m.ForwardingScore != 2 {
+		t.Errorf("forwarded = %v score = %d, want true and 2", m.IsForwarded, m.ForwardingScore)
 	}
 	if m.Call == nil || !m.Call.Video || m.Call.Missed {
 		t.Errorf("call = %+v, want {Video:true Missed:false}", m.Call)
@@ -53,6 +56,9 @@ func TestChatHistoryMessageLeavesAbsentFieldsEmpty(t *testing.T) {
 	if m.EphemeralDuration != 0 || m.BackgroundColor != "" {
 		t.Errorf("absent scalars should stay zero: ephemeral=%d bg=%q", m.EphemeralDuration, m.BackgroundColor)
 	}
+	if m.IsForwarded || m.ForwardingScore != 0 {
+		t.Errorf("absent forwarded marker should stay zero: forwarded=%v score=%d", m.IsForwarded, m.ForwardingScore)
+	}
 }
 
 func TestChatSummaryDecodesOptionalLastMessageType(t *testing.T) {
@@ -73,6 +79,28 @@ func TestChatSummaryDecodesOptionalLastMessageType(t *testing.T) {
 	}
 	if _, ok := empty["lastMessageType"]; ok {
 		t.Fatal("absent type must stay omitted")
+	}
+}
+
+func TestChatSummaryDecodesOptionalPhone(t *testing.T) {
+	var chats []ChatSummary
+	body := `[{"id":"262813461250072@lid","name":"","phone":"15550006666"},{"id":"15550001111@c.us","name":"Alice"}]`
+	if err := json.Unmarshal([]byte(body), &chats); err != nil {
+		t.Fatal(err)
+	}
+	if chats[0].Phone != "15550006666" || chats[0].Name != "" || chats[1].Phone != "" {
+		t.Fatalf("unexpected phones: %+v", chats)
+	}
+	wire, err := json.Marshal(chats[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var absent map[string]interface{}
+	if err := json.Unmarshal(wire, &absent); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := absent["phone"]; ok {
+		t.Fatal("absent phone must stay omitted")
 	}
 }
 

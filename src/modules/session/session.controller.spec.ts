@@ -10,6 +10,7 @@ import type { ChatSummary } from '../../engine/interfaces/whatsapp-engine.interf
 import { ApiKeyRole, type ApiKey } from '../auth/entities/api-key.entity';
 import { REQUIRED_ROLE_KEY, UNSCOPED_KEY } from '../auth/decorators/auth.decorators';
 import { BadGatewayException, BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
+import { ENGINE_NOT_READY_409, SESSION_NOT_STARTED_400 } from '../../common/openapi/engine-status-responses';
 
 // POST /sessions declared a SessionResponseDto in its Swagger metadata but returned the raw
 // TypeORM entity, leaking internal columns (config, proxyUrl, proxyType) and the entity-only
@@ -369,6 +370,31 @@ describe('SessionController — muteChat', () => {
   });
 });
 
+// A session with no engine answers 400 "Session is not started"; a started one that is not ready answers the 409
+// these routes also list. A 400 described as "not ready" sends a client waiting for a session nobody started.
+describe('SessionController chat routes document the 400 of a session that is not started', () => {
+  const declared = (handler: keyof SessionController): Record<string, { description?: string }> =>
+    (Reflect.getMetadata(
+      'swagger/apiResponse',
+      Object.getOwnPropertyDescriptor(SessionControllerClass.prototype, handler)?.value as object,
+    ) ?? {}) as Record<string, { description?: string }>;
+
+  it.each([
+    'getGroups',
+    'getChats',
+    'markChatRead',
+    'markChatUnread',
+    'clearChatMessages',
+    'archiveChat',
+    'muteChat',
+    'pinChat',
+    'deleteChat',
+  ] as const)('%s', handler => {
+    expect(declared(handler)['400']?.description).toContain(SESSION_NOT_STARTED_400);
+    expect(declared(handler)['409']?.description).toBe(ENGINE_NOT_READY_409);
+  });
+});
+
 describe('SessionController findAll name filter', () => {
   const apiKey = { allowedSessions: ['sess-uuid-1'] } as unknown as ApiKey;
   let sessionService: { findAll: jest.Mock; engineLoaded: jest.Mock };
@@ -404,6 +430,105 @@ describe('SessionController findAll name filter', () => {
   it.each([[['a', 'b']], ['']])('rejects name=%p with 400', async name => {
     await expect(controller.findAll(apiKey, undefined, undefined, name)).rejects.toBeInstanceOf(BadRequestException);
     expect(sessionService.findAll).not.toHaveBeenCalled();
+  });
+
+  it('passes DB-fetched leaseClockNow into engineLoaded for findAll and findOne', async () => {
+    const dbNow = new Date('2026-11-22T12:00:00.000Z');
+    const row: Session = {
+      id: 'sess-uuid-1',
+      name: 'peer-bot',
+      status: SessionStatus.READY,
+      phone: '628111',
+      pushName: 'Peer Bot',
+      config: {},
+      proxyUrl: null,
+      proxyType: null,
+      connectedAt: null,
+      lastActiveAt: null,
+      nodeId: 'peer-node',
+      claimedAt: null,
+      nodeUrl: 'http://peer:2785',
+      leaseExpiresAt: new Date(dbNow.getTime() + 60_000),
+      desiredState: null,
+      createdAt: dbNow,
+      updatedAt: dbNow,
+    };
+    const svc = {
+      findAll: jest.fn().mockResolvedValue([row]),
+      findOne: jest.fn().mockResolvedValue(row),
+      leaseClockNow: jest.fn().mockResolvedValue(dbNow),
+      engineLoaded: jest.fn().mockReturnValue(true),
+    };
+    const ctrl = new SessionControllerClass(
+      svc as unknown as SessionService,
+      { logInfo: jest.fn() } as unknown as AuditService,
+      new ChatScopeService(),
+    );
+
+    const list = await ctrl.findAll(apiKey);
+    expect(list[0].engineLoaded).toBe(true);
+    expect(svc.leaseClockNow).toHaveBeenCalledTimes(1);
+    expect(svc.engineLoaded).toHaveBeenCalledWith(row, dbNow);
+
+    const one = await ctrl.findOne('sess-uuid-1');
+    expect(one.engineLoaded).toBe(true);
+    expect(svc.leaseClockNow).toHaveBeenCalledTimes(2);
+    expect(svc.engineLoaded).toHaveBeenLastCalledWith(row, dbNow);
+  });
+});
+
+// GET /sessions/stats/overview names no :sessionId, so the guard has nothing to scope it against and the
+// key's allowlist handed to the service is the whole fence: without it a key confined to one session reads
+// the gateway-wide totals and status distribution.
+describe('SessionController getStats scope', () => {
+  const stats = {
+    total: 1,
+    active: 0,
+    ready: 1,
+    disconnected: 0,
+    byStatus: { ready: 1 },
+    memoryUsage: { heapUsed: 1, heapTotal: 2, rss: 3 },
+  };
+  let sessionService: { getStats: jest.Mock };
+  let controller: SessionController;
+
+  beforeEach(() => {
+    sessionService = { getStats: jest.fn().mockResolvedValue(stats) };
+    controller = new SessionControllerClass(
+      sessionService as unknown as SessionService,
+      { logInfo: jest.fn() } as unknown as AuditService,
+      new ChatScopeService(),
+    );
+  });
+
+  it("hands the key's allowedSessions to the service and omits memoryUsage for scoped or non-admin callers", async () => {
+    const apiKey = {
+      role: ApiKeyRole.ADMIN,
+      allowedSessions: ['sess-uuid-1', 'sess-uuid-2'],
+    } as unknown as ApiKey;
+
+    await expect(controller.getStats(apiKey)).resolves.toBe(stats);
+
+    expect(sessionService.getStats).toHaveBeenCalledTimes(1);
+    expect(sessionService.getStats).toHaveBeenCalledWith(['sess-uuid-1', 'sess-uuid-2'], {
+      includeMemoryUsage: false,
+    });
+  });
+
+  it('includes memoryUsage only for an unscoped ADMIN key', async () => {
+    await controller.getStats({ role: ApiKeyRole.ADMIN, allowedSessions: null } as unknown as ApiKey);
+    await controller.getStats({ role: ApiKeyRole.ADMIN, allowedSessions: [] } as unknown as ApiKey);
+    await controller.getStats({ role: ApiKeyRole.OPERATOR, allowedSessions: null } as unknown as ApiKey);
+    await controller.getStats({ role: ApiKeyRole.VIEWER, allowedSessions: null } as unknown as ApiKey);
+    await controller.getStats(undefined);
+
+    expect(sessionService.getStats.mock.calls).toEqual([
+      [null, { includeMemoryUsage: true }],
+      [[], { includeMemoryUsage: true }],
+      [null, { includeMemoryUsage: false }],
+      [null, { includeMemoryUsage: false }],
+      [undefined, { includeMemoryUsage: false }],
+    ]);
   });
 });
 
@@ -447,6 +572,186 @@ describe('SessionController — pinChat', () => {
   });
 });
 
+// The chat-action routes are one line each, so what they can get wrong is the mapping: which request field
+// reaches which service argument, and whether the engine's own answer reaches the caller. API spec says
+// `success: false` is a real outcome on Baileys, and a route that hard-coded success would report a chat it
+// could not archive as archived.
+describe('SessionController: chat actions map the request to the service', () => {
+  const ID = 'sess-uuid-1';
+  const CHAT = '628123@c.us';
+  type Mocks = Record<
+    | 'sendSeen'
+    | 'markUnread'
+    | 'clearChatMessages'
+    | 'archiveChat'
+    | 'deleteChat'
+    | 'subscribeToPresence'
+    | 'setOnlinePresence'
+    | 'sendChatState'
+    | 'requestPairingCode',
+    jest.Mock
+  >;
+  let sessionService: Mocks;
+  let controller: SessionController;
+
+  beforeEach(() => {
+    sessionService = {
+      sendSeen: jest.fn().mockResolvedValue(true),
+      markUnread: jest.fn().mockResolvedValue(true),
+      clearChatMessages: jest.fn().mockResolvedValue(true),
+      archiveChat: jest.fn().mockResolvedValue(true),
+      deleteChat: jest.fn().mockResolvedValue(true),
+      subscribeToPresence: jest.fn().mockResolvedValue(undefined),
+      setOnlinePresence: jest.fn().mockResolvedValue(undefined),
+      sendChatState: jest.fn().mockResolvedValue(undefined),
+      requestPairingCode: jest.fn(),
+    };
+    controller = new SessionControllerClass(
+      sessionService as unknown as SessionService,
+      { logInfo: jest.fn() } as unknown as AuditService,
+      new ChatScopeService(),
+    );
+  });
+
+  // The service answers true, then false, so a route that hard-codes either one fails.
+  it.each<[string, keyof Mocks, (c: SessionController) => Promise<{ success: boolean }>, unknown[]]>([
+    [
+      'markChatRead',
+      'sendSeen',
+      c => c.markChatRead(ID, { chatId: CHAT, messageIds: ['A1', 'B2'] }),
+      [ID, CHAT, ['A1', 'B2']],
+    ],
+    ['markChatUnread', 'markUnread', c => c.markChatUnread(ID, { chatId: CHAT }), [ID, CHAT]],
+    ['clearChatMessages', 'clearChatMessages', c => c.clearChatMessages(ID, CHAT), [ID, CHAT]],
+    ['archiveChat', 'archiveChat', c => c.archiveChat(ID, { chatId: CHAT, archive: false }), [ID, CHAT, false]],
+    ['deleteChat', 'deleteChat', c => c.deleteChat(ID, { chatId: CHAT }), [ID, CHAT]],
+  ])('%s forwards its request and reports the engine outcome, declined included', async (_route, method, run, args) => {
+    await expect(run(controller)).resolves.toEqual({ success: true });
+    expect(sessionService[method]).toHaveBeenCalledWith(...args);
+
+    sessionService[method].mockResolvedValue(false);
+    await expect(run(controller)).resolves.toEqual({ success: false });
+  });
+
+  it('archiveChat forwards archive:true as well', async () => {
+    await controller.archiveChat(ID, { chatId: CHAT, archive: true });
+
+    expect(sessionService.archiveChat).toHaveBeenCalledWith(ID, CHAT, true);
+  });
+
+  it('markChatRead leaves the message ids undefined when none are sent, which means the newest message', async () => {
+    await controller.markChatRead(ID, { chatId: CHAT });
+
+    expect(sessionService.sendSeen).toHaveBeenCalledWith(ID, CHAT, undefined);
+  });
+
+  it('subscribeToPresence forwards the chat id and answers success', async () => {
+    await expect(controller.subscribeToPresence(ID, { chatId: CHAT })).resolves.toEqual({ success: true });
+
+    expect(sessionService.subscribeToPresence).toHaveBeenCalledWith(ID, CHAT);
+  });
+
+  it.each([true, false])('setOnlinePresence forwards available:%s', async available => {
+    await expect(controller.setOnlinePresence(ID, { available })).resolves.toEqual({ success: true });
+
+    expect(sessionService.setOnlinePresence).toHaveBeenCalledWith(ID, available);
+  });
+
+  it.each(['typing', 'recording', 'paused'] as const)('sendChatState forwards the %s state', async state => {
+    await expect(controller.sendChatState(ID, { chatId: CHAT, state })).resolves.toEqual({ success: true });
+
+    expect(sessionService.sendChatState).toHaveBeenCalledWith(ID, CHAT, state);
+  });
+
+  it('requestPairingCode asks for a code for the number in the request and returns the answer', async () => {
+    const answer = { pairingCode: 'ABCD1234', status: SessionStatus.QR_READY };
+    sessionService.requestPairingCode.mockResolvedValue(answer);
+
+    await expect(controller.requestPairingCode(ID, { phoneNumber: '628123456789' })).resolves.toBe(answer);
+
+    expect(sessionService.requestPairingCode).toHaveBeenCalledWith(ID, '628123456789');
+  });
+});
+
+// Delete, QR and config write their record only after the service resolves, and the content is what makes
+// the record usable: the name has to be read before the row is gone, the QR record names the session, and a
+// config patch is only meaningful next to the state it merged into.
+describe('SessionController: delete, QR and config routes write their record', () => {
+  const ID = 'sess-uuid-1';
+  let sessionService: { findOneForDelete: jest.Mock; delete: jest.Mock; getQRCode: jest.Mock; updateConfig: jest.Mock };
+  let auditService: { logInfo: jest.Mock };
+  let controller: SessionController;
+
+  beforeEach(() => {
+    sessionService = {
+      findOneForDelete: jest.fn().mockResolvedValue({ id: ID, name: 'my-bot' }),
+      delete: jest.fn().mockResolvedValue(undefined),
+      getQRCode: jest.fn(),
+      updateConfig: jest.fn(),
+    };
+    auditService = { logInfo: jest.fn().mockResolvedValue(undefined) };
+    controller = new SessionControllerClass(
+      sessionService as unknown as SessionService,
+      auditService as unknown as AuditService,
+      new ChatScopeService(),
+    );
+  });
+
+  it('delete records SESSION_DELETED with the name it read before the row went', async () => {
+    await controller.delete(ID);
+
+    expect(sessionService.delete).toHaveBeenCalledWith(ID);
+    expect(auditService.logInfo).toHaveBeenCalledTimes(1);
+    expect(auditService.logInfo).toHaveBeenCalledWith(AuditAction.SESSION_DELETED, {
+      sessionId: ID,
+      sessionName: 'my-bot',
+    });
+    expect(sessionService.findOneForDelete.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionService.delete.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('delete forwards a refusal verbatim and records nothing', async () => {
+    const refused = new ConflictException('Another node holds this session');
+    sessionService.delete.mockRejectedValue(refused);
+
+    await expect(controller.delete(ID)).rejects.toBe(refused);
+    expect(auditService.logInfo).not.toHaveBeenCalled();
+  });
+
+  it('getQRCode returns the code and records SESSION_QR_GENERATED for the session', async () => {
+    const qr = { qrCode: 'data:image/png;base64,AAAA', status: SessionStatus.QR_READY };
+    sessionService.getQRCode.mockResolvedValue(qr);
+
+    await expect(controller.getQRCode(ID)).resolves.toBe(qr);
+
+    expect(auditService.logInfo).toHaveBeenCalledTimes(1);
+    expect(auditService.logInfo).toHaveBeenCalledWith(AuditAction.SESSION_QR_GENERATED, { sessionId: ID });
+  });
+
+  it('getQRCode forwards the not-ready 400 verbatim and records nothing', async () => {
+    const notReady = new BadRequestException('QR code not ready');
+    sessionService.getQRCode.mockRejectedValue(notReady);
+
+    await expect(controller.getQRCode(ID)).rejects.toBe(notReady);
+    expect(auditService.logInfo).not.toHaveBeenCalled();
+  });
+
+  it('updateConfig records the resulting config rather than the request', async () => {
+    const resulting = { autoRejectCalls: true, maxReconnectAttempts: 5, reconnectBaseDelay: 2000, linkPreview: null };
+    sessionService.updateConfig.mockResolvedValue(resulting);
+
+    await expect(controller.updateConfig(ID, { autoRejectCalls: true })).resolves.toBe(resulting);
+
+    expect(sessionService.updateConfig).toHaveBeenCalledWith(ID, { autoRejectCalls: true });
+    expect(auditService.logInfo).toHaveBeenCalledTimes(1);
+    expect(auditService.logInfo).toHaveBeenCalledWith(AuditAction.SESSION_CONFIG_UPDATED, {
+      sessionId: ID,
+      metadata: resulting,
+    });
+  });
+});
+
 describe('SessionController — proxy() response contract', () => {
   const proxyProjection = {
     enabled: true,
@@ -470,6 +775,12 @@ describe('SessionController — proxy() response contract', () => {
       auditService as unknown as AuditService,
       new ChatScopeService(),
     );
+  });
+
+  it('getProxy restricts reads to unscoped ADMIN keys matching updateProxy', () => {
+    const handler = Object.getOwnPropertyDescriptor(SessionControllerClass.prototype, 'getProxy')!.value as object;
+    expect(Reflect.getMetadata(REQUIRED_ROLE_KEY, handler)).toBe(ApiKeyRole.ADMIN);
+    expect(Reflect.getMetadata(UNSCOPED_KEY, handler)).toBe(true);
   });
 
   it('getProxy returns the masked projection without proxyUrl', async () => {

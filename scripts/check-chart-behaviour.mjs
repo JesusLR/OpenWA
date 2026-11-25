@@ -36,8 +36,8 @@ const render = (...setArgs) =>
   });
 
 /** Render with `valuesYaml` as a values file (`-f -`), which parses numbers unlike `--set`. */
-const renderValues = valuesYaml =>
-  execFileSync('docker', ['run', '-i', '--rm', '-v', `${CHARTS}:/charts:ro`, HELM_IMAGE, 'template', 'ci', '/charts/openwa', '-f', '-'], {
+const renderValues = (valuesYaml, release = 'ci') =>
+  execFileSync('docker', ['run', '-i', '--rm', '-v', `${CHARTS}:/charts:ro`, HELM_IMAGE, 'template', release, '/charts/openwa', '-f', '-'], {
     encoding: 'utf8',
     input: valuesYaml,
     maxBuffer: 1 << 24,
@@ -234,6 +234,30 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
   );
 }
 
+// The ServiceMonitor's bearer token must name a key its Secret holds, or the Prometheus Operator cannot read the
+// token and no metrics arrive. The chart's own Secret stores each secretEnv entry under its variable name, which
+// the default key `token` is not, so the setup values.yaml documents is rendered and its key looked up there.
+{
+  const values = readFileSync(`${CHARTS}/openwa/values.yaml`, 'utf8');
+  const setup = /^# {3}serviceMonitor:\n(?:# {3}.*\n)+/m.exec(values)?.[0] ?? '';
+  const documented = setup.replace(/^# {3}/gm, '');
+  const out = renderValues(`${documented}secretEnv:\n  METRICS_TOKEN: a-long-random-token\n`, 'openwa');
+  const ref = mapAt(byKind(out, 'ServiceMonitor')[0] ?? '', ['bearerTokenSecret']) ?? {};
+  const secret = byKind(out, 'Secret').find(doc => nameOf(doc) === ref.name);
+  const keys = mapAt(secret ?? '', ['stringData']) ?? {};
+  check(
+    'servicemonitor-token-key-exists',
+    Boolean(setup) && Boolean(secret) && ref.key in keys,
+    !setup
+      ? 'values.yaml documents no serviceMonitor setup to scrape with'
+      : !secret
+        ? `the documented bearerTokenSecret names ${ref.name ?? 'no Secret'}, which the chart does not render`
+        : ref.key in keys
+          ? `the documented setup reads the token from ${ref.name}, key ${ref.key}`
+          : `the documented key ${ref.key} is not in Secret ${ref.name}, which holds ${Object.keys(keys).join(', ')}`,
+  );
+}
+
 // A values file is parsed as YAML, so an unquoted number reaches the templates as a float64, and
 // `quote` prints one of a million or more in exponent form. The app then reads "5.24288e+07" for a
 // byte limit (and refuses to boot) or "1.2345678e+07" for a password. `--set` parses integers as
@@ -316,15 +340,78 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
   let detail;
   let ok = false;
   try {
-    const probe = mapAt(byKind(render('--set', 'startupProbe=null'), 'StatefulSet')[0] ?? '', ['startupProbe']);
-    ok = probe?.periodSeconds === '5' && probe?.failureThreshold === '60';
+    const sts = byKind(render('--set', 'startupProbe=null', '--set', 'secretChecksumAnnotation=null'), 'StatefulSet')[0] ?? '';
+    const probe = mapAt(sts, ['startupProbe']);
+    const annotations = mapAt(sts, ['template', 'metadata', 'annotations']) ?? {};
+    ok =
+      probe?.periodSeconds === '5' &&
+      probe?.failureThreshold === '60' &&
+      Boolean(annotations['checksum/secret']);
     detail = ok
-      ? 'values without the startupProbe block render with the 5 s period and 60 failures'
-      : `values without startupProbe rendered periodSeconds ${probe?.periodSeconds}, failureThreshold ${probe?.failureThreshold}`;
+      ? 'values without startupProbe or secretChecksumAnnotation render with the 5 s / 60 probe defaults and keep checksum/secret'
+      : `values without new keys rendered periodSeconds ${probe?.periodSeconds}, failureThreshold ${probe?.failureThreshold}, checksum/secret=${annotations['checksum/secret'] ?? '(absent)'}`;
   } catch (error) {
-    detail = `the chart does not render with values that predate startupProbe: ${String(error.stderr ?? error.message).split('\n')[0]}`;
+    detail = `the chart does not render with values that predate new keys: ${String(error.stderr ?? error.message).split('\n')[0]}`;
   }
   check('renders-with-previous-release-values', ok, detail);
+}
+
+// Operators can opt out of publishing the sha256 of the rendered Secret in pod annotations
+// (secretChecksumAnnotation: false), and setting existingSecret omits the empty-template hash as well.
+{
+  const annotationsOf = (...args) =>
+    mapAt(byKind(render(...args), 'StatefulSet')[0] ?? '', ['template', 'metadata', 'annotations']) ?? {};
+  const def = annotationsOf();
+  const optOut = annotationsOf('--set', 'secretChecksumAnnotation=false');
+  const ext = annotationsOf('--set', 'existingSecret=ext');
+  const optOutStable =
+    podTemplate(render('--set', 'secretChecksumAnnotation=false', '--set', 'secretEnv.API_KEY=aaa')) ===
+    podTemplate(render('--set', 'secretChecksumAnnotation=false', '--set', 'secretEnv.API_KEY=bbb'));
+  const problems = [
+    !def['checksum/secret'] && 'default render omitted checksum/secret',
+    'checksum/secret' in optOut && 'secretChecksumAnnotation=false still rendered checksum/secret',
+    !optOut['checksum/config'] && 'secretChecksumAnnotation=false dropped checksum/config',
+    !optOutStable && 'secretChecksumAnnotation=false still perturbed pod template on secretEnv change',
+    'checksum/secret' in ext && 'existingSecret=ext still rendered checksum/secret',
+    !ext['checksum/config'] && 'existingSecret=ext dropped checksum/config',
+  ].filter(Boolean);
+  check(
+    'secret-checksum-annotation-toggle',
+    problems.length === 0,
+    problems.length
+      ? problems.join('; ')
+      : 'default renders checksum/secret; secretChecksumAnnotation=false and existingSecret omit it while keeping checksum/config',
+  );
+}
+
+// Replicating above 1 while main.sqlite is pod-local must fail both schema validation and template rendering.
+for (const [label, args] of [
+  ['replicaCount=2', ['--set', 'replicaCount=2']],
+  ['replicaCount=2 template fail guard', ['--skip-schema-validation', '--set', 'replicaCount=2']],
+  ['env.PORT=3000', ['--set-string', 'env.PORT=3000']],
+  ['secretEnv.PORT=3000', ['--set-string', 'secretEnv.PORT=3000']],
+]) {
+  let failedCleanly = false;
+  let detail = '';
+  try {
+    render(...args);
+    detail = `${label} rendered without failing`;
+  } catch (error) {
+    failedCleanly = true;
+    detail = String(error.stderr ?? error.message).split('\n')[0];
+  }
+  check(`rejects-${label.replaceAll(/[= ]/g, '-').toLowerCase()}`, failedCleanly, detail);
+}
+
+// Bounded /tmp emptyDir sizeLimit must be present on the StatefulSet volume.
+{
+  const sts = byKind(render(), 'StatefulSet')[0] ?? '';
+  const hasTmpLimit = /name:\s*tmp[\s\S]*?emptyDir:[\s\S]*?sizeLimit:\s*\S+/.test(sts);
+  check(
+    'tmp-emptydir-sizelimit',
+    hasTmpLimit,
+    hasTmpLimit ? '/tmp emptyDir has bounded sizeLimit' : 'StatefulSet /tmp emptyDir is missing sizeLimit',
+  );
 }
 
 const failed = results.filter(r => !r.ok);

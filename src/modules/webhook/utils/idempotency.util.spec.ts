@@ -7,6 +7,21 @@ describe('Idempotency Utils', () => {
       expect(key).toBe('msg_A_ABC123');
     });
 
+    it('keys message.receipt by recipient and status, so two members reading the same message stay distinct', () => {
+      const read = (participant: string): string =>
+        generateIdempotencyKey('message.receipt', { id: 'ABC123', participant, status: 'read', sessionId: 'A' });
+      expect(read('628111@c.us')).toBe('receipt_A_ABC123_628111@c.us_read');
+      expect(read('628222@c.us')).not.toBe(read('628111@c.us'));
+      expect(
+        generateIdempotencyKey('message.receipt', {
+          id: 'ABC123',
+          participant: '628111@c.us',
+          status: 'delivered',
+          sessionId: 'A',
+        }),
+      ).not.toBe(read('628111@c.us'));
+    });
+
     it('falls back to the legacy `ack` integer for message.ack when no `status` is present', () => {
       const key = generateIdempotencyKey('message.ack', { messageId: 'ABC123', ack: 3, sessionId: 'A' });
       expect(key).toBe('ack_A_ABC123_3');
@@ -300,6 +315,44 @@ describe('Idempotency Utils', () => {
       expect(generateIdempotencyKey('event.response', { ...data, sessionId: 'B' }, at)).not.toBe(key);
     });
 
+    it('keys poll.vote on the session + poll + voter + vote time (distinct per change, stable across retries)', () => {
+      const at = '2026-07-20T00:00:00.000Z';
+      const data = { sessionId: 'A', pollMessageId: 'POLL1', voterId: 'V1', selectedOptions: ['Yes'], timestamp: 100 };
+      const key = generateIdempotencyKey('poll.vote', data, at);
+      // Without the millisecond stamp the whole second stands in for it.
+      expect(key).toMatch(/^vote_A_POLL1_V1_100_[0-9a-f]{12}$/);
+      expect(generateIdempotencyKey('poll.vote', data, '2026-07-20T01:00:00.000Z')).toBe(key);
+      // An identical redelivery dedupes, a different selection in the same second does not.
+      expect(generateIdempotencyKey('poll.vote', { ...data }, at)).toBe(key);
+      expect(generateIdempotencyKey('poll.vote', { ...data, selectedOptions: ['Yes', 'No'] }, at)).not.toBe(key);
+      expect(generateIdempotencyKey('poll.vote', { ...data, selectedOptions: [] }, at)).not.toBe(key);
+      // Going back to an earlier selection later is a new change, never deduped against the first.
+      expect(generateIdempotencyKey('poll.vote', { ...data, timestamp: 200 }, at)).not.toBe(key);
+      // Two voters on the same poll in the same second are two events.
+      expect(generateIdempotencyKey('poll.vote', { ...data, voterId: 'V2' }, at)).not.toBe(key);
+    });
+
+    // A voter flipping A, B, A within one second: the third change shares the whole second, the selection and so
+    // the hash with the first. Under the key of the first it would be dropped by a receiver that dedupes on it,
+    // which would then end on B while the voter's choice is A.
+    it('keeps a vote that returns to an earlier selection within the same second apart from the first', () => {
+      const at = '2026-07-20T00:00:00.000Z';
+      const first = {
+        sessionId: 'A',
+        pollMessageId: 'POLL1',
+        voterId: 'V1',
+        selectedOptions: ['A'],
+        timestamp: 100,
+        timestampMs: 100100,
+      };
+      const third = { ...first, timestampMs: 100900 };
+      expect(generateIdempotencyKey('poll.vote', third, at)).not.toBe(generateIdempotencyKey('poll.vote', first, at));
+      // A redelivery of the same change still carries the same stamp and the same key.
+      expect(generateIdempotencyKey('poll.vote', { ...first }, '2026-07-20T01:00:00.000Z')).toBe(
+        generateIdempotencyKey('poll.vote', first, at),
+      );
+    });
+
     it('keys call.received on the session + call id (unique per call, no occurrence salt needed)', () => {
       const at = '2026-07-20T00:00:00.000Z';
       const data = { sessionId: 'A', callId: 'CALL1', from: '628111@c.us', timestamp: 1782000000 };
@@ -316,6 +369,59 @@ describe('Idempotency Utils', () => {
     it('should generate fallback key for unknown events', () => {
       const key = generateIdempotencyKey('custom.event', {});
       expect(key).toMatch(/^evt_custom_event_[a-f0-9]{12}$/);
+    });
+
+    // An engine that cannot read a message's id reports the empty string, and the pipeline still announces the
+    // message. Such a message has nothing to dedupe on, so every dispatch of one is its own event: a key shared by
+    // all of them made a receiver that dedupes on it keep the first message and drop the rest, and made the outbox
+    // keep one row for them all.
+    describe('for a message whose id could not be read', () => {
+      const keyOf = (event: string, data: Record<string, unknown>, occurrenceId?: string): string =>
+        generateIdempotencyKey(event, { sessionId: 'A', ...data }, occurrenceId);
+      const events = ['message.received', 'message.sent', 'message.revoked'];
+
+      it.each(events)('%s is keyed per dispatch, stable across the retries of one', event => {
+        const first = keyOf(event, { id: '' }, 'occ-1');
+
+        expect(keyOf(event, { id: '' }, 'occ-2')).not.toBe(first);
+        expect(keyOf(event, { id: '' }, 'occ-1')).toBe(first);
+        expect(first).toMatch(/^(msg|rev)_A_noid_occ-1$/);
+      });
+
+      it.each([
+        ['empty', ''],
+        ['blank', '   '],
+        ['missing', undefined],
+        ['null', null],
+        ['an object', {}],
+        ['an array', ['x']],
+      ])('treats an id that is %s as unreadable', (_label, id) => {
+        expect(keyOf('message.received', { id }, 'occ-1')).toBe('msg_A_noid_occ-1');
+        expect(keyOf('message.revoked', { id }, 'occ-1')).toBe('rev_A_noid_occ-1');
+      });
+
+      it('reads the legacy messageId when the id is empty', () => {
+        expect(keyOf('message.received', { id: '', messageId: 'LEGACY' }, 'occ-1')).toBe('msg_A_LEGACY');
+        expect(keyOf('message.revoked', { id: ' ', messageId: 'LEGACY' }, 'occ-1')).toBe('rev_A_LEGACY');
+      });
+
+      it.each(events)('hashes the payload of %s when the caller gives no occurrence', event => {
+        const first = keyOf(event, { id: '', body: 'a' });
+
+        expect(first).toMatch(/^(msg|rev)_A_noid_[a-f0-9]{12}$/);
+        expect(keyOf(event, { id: '', body: 'a' })).toBe(first);
+        expect(keyOf(event, { id: '', body: 'b' })).not.toBe(first);
+      });
+
+      it('keeps the key of a readable id byte for byte, whatever the occurrence', () => {
+        expect(keyOf('message.received', { id: '3EB0ABC' }, 'occ-1')).toBe('msg_A_3EB0ABC');
+        expect(keyOf('message.sent', { id: '3EB0ABC' }, 'occ-2')).toBe('msg_A_3EB0ABC');
+        expect(keyOf('message.revoked', { id: 'REV1' }, 'occ-1')).toBe('rev_A_REV1');
+        expect(keyOf('message.received', { messageId: 'LEGACY' }, 'occ-1')).toBe('msg_A_LEGACY');
+        // A real id is not trimmed, and a number is a readable id.
+        expect(keyOf('message.received', { id: ' x ' }, 'occ-1')).toBe('msg_A_ x ');
+        expect(keyOf('message.received', { id: 12345 }, 'occ-1')).toBe('msg_A_12345');
+      });
     });
   });
 

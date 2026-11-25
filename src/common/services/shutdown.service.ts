@@ -58,7 +58,15 @@ export class ShutdownService {
     if (!this.shuttingDown) {
       this.shuttingDown = true;
       this.logger.log('Entering draining state — readiness now reports 503');
-      for (const listener of this.shutdownListeners) listener();
+      for (const listener of this.shutdownListeners) {
+        try {
+          listener();
+        } catch (error) {
+          this.logger.warn('Shutdown listener threw an error', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     }
   }
 
@@ -96,7 +104,8 @@ export class ShutdownService {
         // The exit status mirrors the teardown outcome: 0 when teardown completed, 1 when it
         // failed, so an orchestrator (k8s, systemd, docker restart policies) must not read a
         // resource-leaking shutdown as a clean one. A teardown that hangs is cut by the force-exit
-        // timer above (or by a second signal in main.ts).
+        // timer above, or by a repeat SIGTERM or SIGINT 1 s or more after the first (stop-signals.ts;
+        // a repeat inside that window is the same signal delivered twice and is ignored, as is a SIGHUP).
         let exitCode = 0;
         try {
           if (this.destroyCallback) {

@@ -10,6 +10,7 @@ import {
   Validate,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { ToStrictArray, ToStrictString } from '../../../common/utils/strict-boolean';
 import { MaxCodePoints } from '../../../common/validation/max-code-points';
 import { ApiKeyRole } from '../entities/api-key.entity';
 import { IsIpOrCidrConstraint } from './is-ip-or-cidr.validator';
@@ -31,6 +32,7 @@ export class CreateApiKeyDto {
     minLength: 3,
     maxLength: 100,
   })
+  @ToStrictString()
   @IsString()
   @MinLength(3)
   @MaxCodePoints(100)
@@ -50,6 +52,7 @@ export class CreateApiKeyDto {
     example: ['192.168.1.1', '10.0.0.0/8'],
   })
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @IsString({ each: true })
   @Validate(IsIpOrCidrConstraint, { each: true })
@@ -63,6 +66,7 @@ export class CreateApiKeyDto {
     example: ['0a941dac-a965-45e7-b318-74ae8be134f0', '8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a'],
   })
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @IsString({ each: true })
   @ArrayUnique()
@@ -81,6 +85,7 @@ export class CreateApiKeyDto {
     maxItems: ALLOWED_CHATS_MAX,
   })
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @ArrayMaxSize(ALLOWED_CHATS_MAX)
   @IsString({ each: true })
@@ -105,7 +110,8 @@ export class ApiKeyResponseDto {
   name!: string;
 
   @ApiProperty({
-    description: 'First 12 characters of the key (for identification)',
+    description:
+      'First 12 characters of the key (for identification). A key seeded from API_MASTER_KEY lists the fixed text "(master key)" instead, except one seeded by an earlier release, which lists its first 12 characters.',
   })
   keyPrefix!: string;
 
@@ -166,9 +172,25 @@ export class ValidateApiKeyResponseDto {
   scoped?: boolean;
 }
 
+/** Result of `POST /auth/session` and `GET /auth/session`. */
+export class BrowserSessionResponseDto extends ValidateApiKeyResponseDto {
+  @ApiProperty({
+    description: 'ID of the API key bound to this browser session.',
+    example: '550e8400-e29b-41d4-a716-446655440000',
+  })
+  apiKeyId!: string;
+}
+
+/** Result of `DELETE /auth/session`. */
+export class BrowserSessionLogoutResponseDto {
+  @ApiProperty({ description: 'Always true once the session cookie has been cleared.', example: true })
+  ok!: boolean;
+}
+
 export class UpdateApiKeyDto {
   @ApiPropertyOptional({ minLength: 3, maxLength: 100 })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @MinLength(3)
   @MaxCodePoints(100)
@@ -181,6 +203,7 @@ export class UpdateApiKeyDto {
 
   @ApiPropertyOptional()
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @IsString({ each: true })
   @Validate(IsIpOrCidrConstraint, { each: true })
@@ -188,6 +211,7 @@ export class UpdateApiKeyDto {
 
   @ApiPropertyOptional()
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @IsString({ each: true })
   @ArrayUnique()
@@ -196,6 +220,7 @@ export class UpdateApiKeyDto {
 
   @ApiPropertyOptional({ maxItems: ALLOWED_CHATS_MAX })
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @ArrayMaxSize(ALLOWED_CHATS_MAX)
   @IsString({ each: true })

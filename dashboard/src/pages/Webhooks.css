@@ -184,6 +184,9 @@
   font-size: 0.875rem;
   font-weight: 500;
   color: var(--text-primary);
+  /* Text of its own, hugging the start edge (see .chat-item-name in Chats.css). */
+  width: fit-content;
+  unicode-bidi: plaintext;
 }
 
 .webhooks-page .webhook-events {
@@ -263,7 +266,7 @@
 
 .webhooks-page .modal-body .event-tag.selected {
   background: var(--primary);
-  color: white;
+  color: #0f172a;
   border-color: var(--primary);
 }
 
@@ -289,7 +292,7 @@
 [data-theme='dark'] .webhooks-page .modal-body .event-tag.selected,
 :root:not([data-theme='light']) .webhooks-page .modal-body .event-tag.selected {
   background: var(--primary);
-  color: white;
+  color: #0f172a;
   border-color: var(--primary);
 }
 
@@ -313,9 +316,14 @@
   outline: none;
 }
 
-.webhooks-page .filter-badge-interactive:hover,
-.webhooks-page .filter-badge-interactive:focus-visible {
+.webhooks-page .filter-badge-interactive:hover {
   border-color: var(--primary);
+  color: var(--text-primary);
+}
+
+/* The badge takes no ring, so its border is the focus cue and has to be the contrast token, not the brand fill. */
+.webhooks-page .filter-badge-interactive:focus-visible {
+  border-color: var(--focus-ring);
   color: var(--text-primary);
 }
 
@@ -324,7 +332,8 @@
   position: fixed;
   z-index: 100;
   min-width: 200px;
-  max-width: 340px;
+  /* 16px of the viewport stay free: FilterBadge pulls the popover back from the screen edges by 8px each. */
+  max-width: min(340px, calc(100vw - 16px));
   padding: 0.5rem 0.625rem;
   background: var(--bg-white);
   border: 1px solid var(--border);
@@ -336,6 +345,15 @@
   font-weight: 500;
   white-space: normal;
   cursor: default;
+}
+
+/* Spans the 6px FilterBadge leaves between the badge and the popover, above or below it, plus the 1px border and
+   1px for a fractional badge edge: a pointer crossing it stays inside the badge, so the popover stays open. */
+.webhooks-page .filter-popover::before {
+  content: '';
+  position: absolute;
+  inset: -8px -1px;
+  z-index: -1;
 }
 
 .webhooks-page .filter-popover-title {
@@ -623,6 +641,7 @@
   display: inline-block;
   width: 48px;
   height: 26px;
+  flex-shrink: 0;
 }
 
 .webhooks-page .toggle-switch input {
@@ -665,7 +684,7 @@
 }
 
 .webhooks-page .toggle-switch input:focus-visible + .toggle-slider {
-  outline: 2px solid var(--primary);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -680,4 +699,28 @@
 
 .webhooks-page .toggle-status.inactive {
   color: var(--text-muted);
+}
+
+/* Forced colours drop fills and shadows: the filter badge draws an outline on focus, a switch its track and knob. */
+@media (forced-colors: active) {
+  .webhooks-page .filter-badge-interactive:focus-visible {
+    outline: 2px solid var(--focus-ring);
+  }
+
+  .webhooks-page .toggle-slider {
+    border: 1px solid CanvasText;
+  }
+
+  .webhooks-page .toggle-slider::before {
+    background: CanvasText;
+  }
+
+  .webhooks-page .toggle-switch input:checked + .toggle-slider {
+    background: Highlight;
+    border-color: Highlight;
+  }
+
+  .webhooks-page .toggle-switch input:checked + .toggle-slider::before {
+    background: HighlightText;
+  }
 }

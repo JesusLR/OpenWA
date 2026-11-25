@@ -1,4 +1,4 @@
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { SessionStatusBroadcaster } from './session-status-broadcaster';
 
@@ -101,5 +101,88 @@ describe('SessionStatusBroadcaster', () => {
     broadcaster.clear('s1');
     await broadcaster.updateStatus('s1', SessionStatus.READY);
     expect(emitSessionStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])('checks announcement permission after the write settles: %s', async allowed => {
+    const { broadcaster, update, emitSessionStatus, dispatch } = make();
+    let resolve!: () => void;
+    update.mockImplementationOnce(() => new Promise<void>(yes => (resolve = yes)));
+    let current = true;
+    const canAnnounce = jest.fn(() => current);
+    broadcaster.lastDispatchedStatus.set('s1', SessionStatus.DISCONNECTED);
+
+    const pending = broadcaster.updateStatus('s1', SessionStatus.INITIALIZING, canAnnounce);
+    expect(canAnnounce).not.toHaveBeenCalled();
+    current = allowed;
+    resolve();
+    await pending;
+
+    expect(update).toHaveBeenCalledWith('s1', { status: SessionStatus.INITIALIZING });
+    expect(canAnnounce).toHaveBeenCalledTimes(1);
+    expect(emitSessionStatus).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    expect(dispatch).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    expect(broadcaster.lastDispatchedStatus.get('s1')).toBe(
+      allowed ? SessionStatus.INITIALIZING : SessionStatus.DISCONNECTED,
+    );
+  });
+
+  it('propagates a failed write without checking or announcing its status', async () => {
+    const { broadcaster, update, emitSessionStatus, dispatch } = make();
+    const failure = new Error('write failed');
+    update.mockRejectedValueOnce(failure);
+    const canAnnounce = jest.fn(() => true);
+
+    await expect(broadcaster.updateStatus('s1', SessionStatus.INITIALIZING, canAnnounce)).rejects.toBe(failure);
+
+    expect(canAnnounce).not.toHaveBeenCalled();
+    expect(emitSessionStatus).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('fences the DB update on ownerNodeId and returns true while announcing when a row matches', async () => {
+    const { broadcaster, update, emitSessionStatus, dispatch } = make();
+    const updated = await broadcaster.updateStatus('s1', SessionStatus.READY, { ownerNodeId: 'node-a' });
+
+    expect(updated).toBe(true);
+    expect(update).toHaveBeenCalledWith({ id: 's1', nodeId: 'node-a' }, { status: SessionStatus.READY });
+    expect(emitSessionStatus).toHaveBeenCalledWith('s1', SessionStatus.READY);
+    expect(dispatch).toHaveBeenCalledWith('s1', 'session.status', {
+      sessionId: 's1',
+      status: SessionStatus.READY,
+    });
+  });
+
+  it('allows unowned rows when allowUnowned is enabled for retirement cleanup', async () => {
+    const { broadcaster, update } = make();
+    const updated = await broadcaster.updateStatus('s1', SessionStatus.DISCONNECTED, {
+      ownerNodeId: 'node-a',
+      allowUnowned: true,
+    });
+
+    expect(updated).toBe(true);
+    expect(update).toHaveBeenCalledWith(
+      [
+        { id: 's1', nodeId: 'node-a' },
+        { id: 's1', nodeId: IsNull() },
+      ],
+      { status: SessionStatus.DISCONNECTED },
+    );
+  });
+
+  it('returns false and skips WS/webhook announcement when the fenced update affects 0 rows', async () => {
+    const { broadcaster, update, emitSessionStatus, dispatch } = make();
+    update.mockResolvedValueOnce({ affected: 0 });
+    const canAnnounce = jest.fn(() => true);
+
+    const updated = await broadcaster.updateStatus('s1', SessionStatus.READY, {
+      ownerNodeId: 'node-a',
+      canAnnounce,
+    });
+
+    expect(updated).toBe(false);
+    expect(canAnnounce).not.toHaveBeenCalled();
+    expect(emitSessionStatus).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(broadcaster.lastDispatchedStatus.has('s1')).toBe(false);
   });
 });

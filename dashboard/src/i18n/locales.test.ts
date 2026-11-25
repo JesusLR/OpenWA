@@ -139,6 +139,22 @@ test('every session-scope API key string resolves in every locale', () => {
   }
 });
 
+test('the passkey restriction label and note resolve in every locale, and the note names the passkey', () => {
+  for (const lng of LOCALE_IDS) {
+    for (const key of ['sessions.restriction.passkey_required', 'sessions.restriction.passkey_required_note']) {
+      const value = i18n.t(key, { lng });
+      assert.ok(value && value !== key, `${lng}: ${key} missing from the catalog (the card would show a raw key)`);
+    }
+    // The note says what WhatsApp asked for and that OpenWA does not answer it; a label pasted into both
+    // places would resolve and say neither.
+    const note = i18n.t('sessions.restriction.passkey_required_note', { lng });
+    const label = i18n.t('sessions.restriction.passkey_required', { lng });
+    assert.notEqual(note, label, `${lng}: the note repeats the label`);
+    assert.ok(note.includes('OpenWA'), `${lng}: the note does not say that OpenWA cannot answer the request`);
+  }
+  assert.equal(i18n.t('sessions.restriction.passkey_required', { lng: 'en' }), 'Passkey required');
+});
+
 test('English session-scope copy explains the empty-allowlist default', () => {
   assert.equal(i18n.t('apiKeys.sessions.all'), 'All sessions');
   assert.equal(i18n.t('apiKeys.sessions.choose'), 'Choose sessions');
@@ -257,16 +273,28 @@ test('English unlink success/incomplete copy does not claim handset Linked-Devic
   assert.ok(/incomplete/i.test(incomplete), `incomplete copy lost the "incomplete" framing: "${incomplete}"`);
 });
 
-// The data export drops webhook secrets and headers and strips proxy userinfo, but carries
-// integration instance secrets as-is (src/modules/infra/export-tables.ts). The hint must say which.
-test('English backup hint says which credentials the export leaves out and which it carries', () => {
+// The data export drops webhook secrets and headers, strips proxy userinfo, and omits
+// integration instance secrets by default unless explicitly opted in (src/modules/infra/export-tables.ts).
+test('English backup hint says which credentials the export leaves out by default', () => {
   const hint = i18n.t('infrastructure.migration.backupHint', { lng: 'en' });
   assert.ok(!/contains webhook secrets/i.test(hint), `hint claims webhook secrets are exported: "${hint}"`);
   assert.ok(/webhook signing secrets[^.]*not included/i.test(hint), `hint lost the webhook omission: "${hint}"`);
   assert.ok(
-    /integration instance secrets[^.]*included in plaintext/i.test(hint),
-    `hint lost the plaintext note: "${hint}"`,
+    /integration instance secrets[^.]*omitted by default/i.test(hint),
+    `hint lost the default plugin secret redaction note: "${hint}"`,
   );
+  const optInHint = i18n.t('infrastructure.migration.includePluginSecretsHint', { lng: 'en' });
+  assert.ok(/plaintext/i.test(optInHint), `opt-in hint lost the plaintext warning: "${optInHint}"`);
+});
+
+test("English '*' event description names the one event the wildcard leaves out", () => {
+  const all = i18n.t('webhooks.eventDescriptions.all', { lng: 'en' });
+  assert.match(
+    all,
+    /except message\.receipt/,
+    `the '*' description does not say it leaves out message.receipt: "${all}"`,
+  );
+  assert.ok(!/^all events$/i.test(all), `the '*' description claims every event: "${all}"`);
 });
 
 test('English start teardown-pending copy is a retryable warning, not an error', () => {
@@ -414,6 +442,23 @@ test('the webhook filter chat-kind field is translated in every locale', () => {
 test('the Templates nav item reads the same as the page it opens in every locale', () => {
   for (const lng of LOCALE_IDS) {
     assert.equal(i18n.t('nav.templates', { lng }), i18n.t('templates.title', { lng }), `${lng} nav.templates`);
+  }
+});
+
+// A confirm dialog sets its action beside Cancel, so a label that does not mean Cancel must not read as that
+// locale's Cancel: two buttons reading Cancel leave nothing to tell the one that acts from the one that backs out.
+test("no label reads as its locale's Cancel unless it means Cancel", () => {
+  const leaves = (node: unknown, path = ''): [string, unknown][] =>
+    node && typeof node === 'object'
+      ? Object.entries(node).flatMap(([key, value]) => leaves(value, path ? `${path}.${key}` : key))
+      : [[path, node]];
+  const english = new Map(leaves(resources.en.translation));
+  for (const lng of LOCALE_IDS) {
+    const cancel = i18n.t('common.cancel', { lng });
+    const lookalikes = leaves(resources[lng].translation)
+      .filter(([key, value]) => value === cancel && english.get(key) !== english.get('common.cancel'))
+      .map(([key]) => key);
+    assert.deepEqual(lookalikes, [], `${lng} labels that read as its Cancel`);
   }
 });
 

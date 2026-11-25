@@ -1,11 +1,11 @@
 # 29 - Engine Capability Matrix
 
 Three-way comparison of every capability: the **Baileys library** (`@whiskeysockets/baileys`
-7.0.0-rc14), the **whatsapp-web.js library** (1.34.7), and what **OpenWA actually exposes** through
+7.0.0-rc14), the **whatsapp-web.js library** (1.34.8), and what **OpenWA actually exposes** through
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
-the installed library. Coverage is total: all 113 `IWhatsAppEngine` methods (29.4), **all 152
+the installed library. Coverage is total: all 116 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
-12 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
+14 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
 ## 29.1 How to read this matrix
 
@@ -22,36 +22,39 @@ Statuses used in the tables:
   **⚠️ `<engine>` only** when the answer depends on the session's engine (the other engine
   answers HTTP 501), **❌ 501** on both engines, and **⚙️ internal** for a method the REST surface
   never exposes: the gateway calls it itself (`probeLiveness`), or no route calls it (`getPhoneNumber`,
-  `getPushName`; a caller reads the session's `phone` and `pushName`, stored from the ready event).
+  `getPushName`; a caller reads the session's `phone` and `pushName`, stored from the ready event, and on Baileys
+  `pushName` again once WhatsApp syncs the account's name after it, as it does for a newly linked account), or only the
+  plugin capability bridge calls it (`checkNumberExists`; the REST number check `GET /contacts/check/:number` calls
+  `getNumberId`).
 
 Two complementary views:
 
-- **29.4, the OpenWA contract view.** Rows are the 113 `IWhatsAppEngine` methods; use it to see
+- **29.4, the OpenWA contract view.** Rows are the 116 `IWhatsAppEngine` methods; use it to see
   what a REST caller gets per engine. Source of truth: `src/engine/engine-capability-matrix.ts`
   (per-cell `evidence` strings cite the exact library `file:symbol` inspected).
 - **29.5 — the full engine inventory.** Rows are **every method the installed libraries expose**,
   each mapped to the OpenWA interface method that uses it (or marked unexposed). Use it as the
   implementation backlog: anything `❌ not exposed` with a library symbol behind it is wiring work,
-  not research work. 29.5.3 distills the sweetest spot: capabilities **both** libraries already
-  have and only OpenWA lacks.
+  not research work, unless the row is marked `run in-page`: an adapter page function already serves it.
+  29.5.3 distills the sweetest spot: capabilities **both** libraries already have and only OpenWA lacks.
 
 ## 29.2 Adapter architecture
 
 OpenWA never calls a WhatsApp library directly from a controller. Every session owns one engine
-instance behind the neutral `IWhatsAppEngine` interface (113 methods +
+instance behind the neutral `IWhatsAppEngine` interface (116 methods +
 `EngineEventCallbacks`), and all modules go through it:
 
 ```mermaid
 flowchart LR
     subgraph OpenWA["OpenWA"]
         API["REST API controllers"] --> SVC["Modules / services"]
-        SVC --> IF["IWhatsAppEngine - 113 methods"]
+        SVC --> IF["IWhatsAppEngine - 116 methods"]
         IF --> WA["WhatsAppWebJsAdapter"]
         IF --> BA["BaileysAdapter"]
         SVC --> STORE["OpenWA-side stores"]
     end
-    WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 9 OpenWA patches"]
-    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 3 OpenWA patches"]
+    WA --> WLIB["whatsapp-web.js 1.34.8<br/>+ 7 OpenWA patches"]
+    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 7 OpenWA patches"]
     WLIB --> WEB["WhatsApp Web<br/>headless Chromium"]
     BLIB --> WAS["WhatsApp servers<br/>browser-free socket"]
     WA -.->|"not-available"| E["EngineNotSupportedError<br/>HTTP 501"]
@@ -80,9 +83,13 @@ Key adapter facts:
   plain single-quoted string naming the refused method (a template-literal or variable-argument
   construction fails the gate outside the one `unsupported()` helper body, as does a literal that
   names no interface method), and a refusal
-  that fires only under a runtime condition - `sendTextMessage` with `customPreview` on whatsapp-web.js -
-  is pinned in the gate's conditional list instead of flipping the cell, because 'supported with a
-  refused option' is not 'not-available'.
+  that fires only under a runtime condition - `sendTextMessage` with `customPreview` on whatsapp-web.js, or
+  `revokeGroupInviteCode`, `getGroupInviteCode`, `joinGroupViaInviteCode`, `deleteGroupPicture`, `pinMessage`, `unpinMessage`,
+  `setProfileStatus`, and the group and profile writes (`setGroupSubject`, `setGroupDescription`, `setGroupPicture`,
+  `setGroupMessagesAdminsOnly`, `setGroupInfoAdminsOnly`, `setGroupMemberAddMode`, `setProfilePicture`,
+  `deleteProfilePicture`) on a WhatsApp Web build that lacks the call each one makes - is
+  pinned in the gate's conditional list instead of flipping the cell, because 'supported with a refused option'
+  is not 'not-available'.
 - **Inbound events** flow the other way: each adapter normalizes library events into the neutral
   `EngineEventCallbacks` (`onMessage`, `onMessageAck`, `onGroupEvent`, `onCall`, …), which the
   session module turns into OpenWA webhook events. Which library events are consumed — and which
@@ -128,69 +135,71 @@ wrong interface method. Those three remain reader-verified.
 
 ## 29.3 Install-time patches OpenWA applies to the libraries
 
-OpenWA ships twelve exact, self-disabling source transforms over the installed engines. Each runs at
-`npm install` (`scripts/postinstall.js`, `--best-effort`) and again in the Docker production stage
-(**without** best-effort — dependency drift fails the image build). A recognized repaired source shape makes the
-patcher no-op; an unrecognized source shape fails loudly rather than shipping a silently partial
-patch. Retire the rc14 pairing backport once an upstream release includes both fixes.
+OpenWA ships fourteen exact, self-disabling source transforms over the installed engines. Each runs at
+`npm install` (`scripts/postinstall.js`) and again in the Docker production stage. A recognized repaired
+source shape makes the patcher a no-op. Every image transform fails on an unknown shape. The Puppeteer
+compatibility transform also fails a source install; the other transforms run with `--best-effort` there.
+Retire the rc14 pairing backport once an upstream release includes both fixes.
 
-"Fails loudly" holds for the image build, not for `npm install`, where `--best-effort` turns a
-refusal into one line of a long transcript. So each patcher also exports an `isApplied()` predicate,
-its own stand-down branch read back against the installed file, and each engine reports the patches
-it is missing as it starts (`src/engine/adapters/engine-patch-status.ts`; 🔧¹ keeps the separate
-check described below). The report is diagnostic, not preventive: startup continues, so a session
+A best-effort refusal appears as one line of a long install transcript. So each patcher also exports an
+`isApplied()` predicate, its own stand-down branch read back against the installed file, and each engine reports the patches
+it is missing as it starts (`src/engine/adapters/engine-patch-status.ts`). The report is diagnostic, not preventive: startup continues, so a session
 reaching READY is not evidence that every patch landed. See docs/12 for the operator procedure.
 
-### 29.3.1 The twelve patches
+### 29.3.1 The fourteen patches
 
-| #    | Patcher                                                    | Library target                                     | What it repairs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Stand-down predicate                                                                                                                                                                                                                                                                                                                                                  |
-| ---- | ---------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🔧¹  | `scripts/patch-wwebjs-201832.js` (+ `wwebjs-201832.patch`) | whatsapp-web.js models                             | WhatsApp Web 2.3000.x renamed the serialized message-id property `id._serialized` → `id.$1`; 1.34.7 reads the old name in the `Message` constructor and ~40 downstream sites, so message ids, acks, quoted-message resolution and media downloads break. Backports upstream fix #201832 (`Base._normalizeId()`). One known harmless reject on 1.34.7 (a LID-aware `Contact.js` path that does not exist there); any other reject aborts the build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | no-ops once `_normalizeId` exists upstream. Runtime double-check: `src/engine/adapters/wwebjs-backport-check.ts` detects an unpatched install and logs an error naming the fix as the wwjs session starts, in `WwebjsLifecycle.initialize()`. It is diagnostic, **not** preventive — startup continues, so a session reaching READY is not evidence the patch landed. |
-| 🔧²  | `scripts/patch-wwebjs-status.js`                           | whatsapp-web.js injected status send               | Two independent breakages in current WhatsApp Web builds: (1) the `canCheckStatusRankingPosterGating()` helper is gone and its call threw before any status send — now called when present, `false` (pre-gating meaning) when not; (2) `sendStatusMediaMsgAction` changed signature from positional `(msg, mediaUpdate)` to a single options object — adopted from upstream PR #201816. The two edits of the media repair are all-or-nothing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
-| 🔧³  | `scripts/patch-wwebjs-newsletter-preview.js`               | whatsapp-web.js `Injected/Utils.js`                | Link-preview generation omitted the destination chat, so WhatsApp Web could not select the newsletter preview transport: `getLinkPreview(link)` → `getLinkPreview(link, chat)`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
-| 🔧⁴  | `scripts/patch-wwebjs-ready-sync.js`                       | whatsapp-web.js readiness pipeline                 | Two live-observed races: on a warm profile the page can reach `hasSynced=true` before the edge listener attaches (the whole post-auth pipeline silently never runs), and a partial `attachEventListeners` failure was swallowed (message bridge dead while sends still work). Adds an `eventsAttached` completion marker and fires the handler once when the level is already true; double-fire is deduped by the adapter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | exact-shape, one group all-or-nothing; unknown shape fails the build.                                                                                                                                                                                                                                                                                                 |
-| 🔧⁵  | `scripts/patch-baileys-appstate.js`                        | Baileys `lib/Socket/chats.js`                      | `resyncAppState`'s `while (collectionsToHandle.size)` loop: `query()` resolves `undefined` on its own 60s timeout, decoding to `{}`, and every loop exit — including the library's own attempts guard — lives inside `for (const key in decoded)`, which never runs on an empty decode. The loop would burn one 60s query per pass for the life of the socket (~1000 wasted queries/day). The patch adds the missing exit: empty decode → `break`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | exact-shape match; remove once upstream bounds the loop.                                                                                                                                                                                                                                                                                                              |
-| 🔧⁶  | `scripts/patch-baileys-newsletter-create.js`               | Baileys `lib/Socket/newsletter.js`                 | `parseNewsletterCreateResponse` reads `thread.picture.id` eagerly, but `newsletterCreate` sends only `{ name, description }` — there is no picture parameter anywhere in the chain — so `thread.picture` is null on EVERY create and the parse threw for all of them. WhatsApp creates the newsletter server-side BEFORE the response is parsed, so each call returned 500 while leaving a real channel behind, and `createChannel` is non-idempotent, so a client retrying a 5xx leaked one orphan per attempt (confirmed on the test account). `description` has the same defect whenever the caller omits one. The patch reads every nested field defensively so the response's `id` — the only place the new channel's id appears — always survives.                                                                                                                                                                                                                                                                                                                                                                                           | exact-shape match; remove once upstream tolerates a pictureless newsletter.                                                                                                                                                                                                                                                                                           |
-| 🔧¹² | `scripts/patch-baileys-pairing.js`                         | Baileys `lib/Socket/socket.js`, `messages-recv.js` | Send notification ACKs before login. Rotate retired registration secrets, persist them and refresh the current QR without consuming another reference.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Rc14 backport with one adaptation: once `creds.me` is set the QR timer stops, which upstream keeps running; remove once an upstream release includes both fixes and recheck the pairing-code timeout.                                                                                                                                                                 |
-| 🔧⁷  | `scripts/patch-wwebjs-participant-arity.js`                | whatsapp-web.js `GroupChat.js`                     | `removeParticipants`/`promoteParticipants`/`demoteParticipants` resolve each requested id against the group's own member collection and drop what they cannot find, then resolve `{status: 200}` for the batch. Dropping EVERY id left the WA Web request builder an empty repeated field, whose arity assertion threw — the caller saw an unnamed `500` on removal. Promote and demote have no such assertion, so they answered `200` claiming success for people WhatsApp never touched. The patch keeps the resolved array with its holes, skips the call when nothing resolved, and returns `matched` (one boolean per REQUESTED id) so the adapter can report a per-participant outcome instead of inventing one.                                                                                                                                                                                                                                                                                                                                                                                                                             | exact-shape match; remove once upstream reports which participants it acted on.                                                                                                                                                                                                                                                                                       |
-| 🔧⁸  | `scripts/patch-wwebjs-block.js`                            | whatsapp-web.js `Contact.js`                       | `Contact.block()`/`unblock()` resolved their target through `getContactToBlockOnlyUseIfNoAssociatedChat`, which WhatsApp Web removed, so both answered an opaque `500` for every id shape. The replacement helpers `handleBlock`/`handleUnblock` are modal-driven UI wrappers that block nothing when called headless, and the server now refuses a phone-keyed block outright (`trying to block a pn contact without a chat`) because individual chats are keyed by LID while wwjs folds every id back to a phone number. Resolves through `WAWebLidMigrationUtils.toUserLid` to the chat-owning identity and calls `blockContact`/`unblockContact` directly, falling back to the original contact when no LID or chat exists.                                                                                                                                                                                                                                                                                                                                                                                                                    | exact-shape match on both bodies; unknown shape fails the build.                                                                                                                                                                                                                                                                                                      |
-| 🔧⁹  | `scripts/patch-wwebjs-group-description.js`                | whatsapp-web.js `GroupChat.js`                     | `GroupChat.setDescription()` calls the page's `WAWebGroupModifyInfoJob.setGroupDescription(chatWid, description, newId, descId)` positionally, but that job now takes a single options object `{desc, groupWid, newDescId, prevDescId}`. The first positional argument lands where the object is read, every field comes back undefined, and `widToGroupJid(undefined)` throws inside the page — reaching the caller as a bare `500` while the library still types the method `Promise<boolean>`. `setGroupSubject` in the same module is still positional, which is why subjects kept working and made the Wid look innocent. The patch sends the options object, takes `newDescId` from `WARandomHex.randomHex(8)` as the product does, and maps an empty description to `desc: null` so it selects the job's delete branch rather than sending an empty body element. The open upstream fix #201895 changes the same call, but keeps `WAWebMsgKey.newId()` and passes an empty description through verbatim, so this patcher will not stand down when it lands and the `desc: null` mapping has to be carried over rather than dropped with it. | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
-| 🔧¹⁰ | `scripts/patch-wwebjs-media-id.js`                         | whatsapp-web.js `Injected/Utils.js`                | Every media send built by `processMediaData` failed on the WhatsApp Web builds rolled out on 2026-09-17 with `Data passed to getter must include an id property`, while text still sent. `window.WWebJS.sendMessage` builds the outgoing message with `id: newMsgKey` and then spreads the media model returned by `processMediaData` into it, and on those builds that model carries an enumerable private `__x_id` that clobbers the id when the `Msg` model initialises. The patch deletes `message.__x_id` right after the object is built, which is upstream's own fix (whatsapp-web.js PR #201923, unmerged, no release after 1.34.7). It stands down once the installed tree carries that line.                                                                                                                                                                                                                                                                                                                                                                                                                                             | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
-| 🔧¹¹ | `scripts/patch-wwebjs-send-error.js`                       | whatsapp-web.js `Client.js`                        | A send the page refused reached OpenWA as the minified `t: t`, with nothing but Node frames: puppeteer rebuilds a page-side exception from its class name and description only, and WhatsApp Web's own error classes are minified to one letter and keep their detail in their own properties. The patch wraps the `window.WWebJS.sendMessage` call inside `Client.sendMessage`'s evaluate. A plain `Error`, which is what whatsapp-web.js's own send failures and WhatsApp Web's `No LID for user` already are, is rethrown as the same object, so its text and OpenWA's matching on it are unchanged. Anything else is rethrown as an `Error` reading `page threw {...}`, a capped JSON summary of the WhatsApp Web build actually running, the constructor name, `name`, `message`, `stack` and the value's own properties. Diagnostic only: a successful send returns what it returned before, and the dead-page classifier never reads a captured error as a transport death.                                                                                                                                                                 | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
+| #    | Patcher                                      | Library target                                     | What it repairs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Stand-down predicate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---- | -------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔧²  | `scripts/patch-wwebjs-status.js`             | whatsapp-web.js injected status send               | Two independent breakages in current WhatsApp Web builds: (1) the `canCheckStatusRankingPosterGating()` helper is gone and its call threw before any status send — now called when present, `false` (pre-gating meaning) when not; (2) `sendStatusMediaMsgAction` changed signature from positional `(msg, mediaUpdate)` to a single options object — adopted from upstream PR #201816. The two edits of the media repair are all-or-nothing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 🔧³  | `scripts/patch-wwebjs-newsletter-preview.js` | whatsapp-web.js `Injected/Utils.js`                | Link-preview generation omitted the destination chat, so WhatsApp Web could not select the newsletter preview transport: `getLinkPreview(link)` → `getLinkPreview(link, chat)`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 🔧⁴  | `scripts/patch-wwebjs-ready-sync.js`         | whatsapp-web.js readiness pipeline                 | A partial `attachEventListeners` failure is swallowed (message bridge dead while sends still work). Adds an `eventsAttached` completion marker, reset whenever a page without the helpers starts attaching so it describes the page now loaded. The earlier race, a warm profile reaching `hasSynced=true` before the edge listener attached, is closed upstream since 1.34.8, which fires the handler once on the level itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | exact-shape, one group all-or-nothing; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 🔧⁵  | `scripts/patch-baileys-appstate.js`          | Baileys `lib/Socket/chats.js`                      | `resyncAppState`'s `while (collectionsToHandle.size)` loop: `query()` resolves `undefined` on its own 60s timeout, decoding to `{}`, and every loop exit — including the library's own attempts guard — lives inside `for (const key in decoded)`, which never runs on an empty decode. The loop would burn one 60s query per pass for the life of the socket (~1000 wasted queries/day). The patch adds the missing exit: empty decode → `break`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | exact-shape match; remove once upstream bounds the loop.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 🔧⁶  | `scripts/patch-baileys-newsletter-create.js` | Baileys `lib/Socket/newsletter.js`                 | `parseNewsletterCreateResponse` reads `thread.picture.id` eagerly, but `newsletterCreate` sends only `{ name, description }` — there is no picture parameter anywhere in the chain — so `thread.picture` is null on EVERY create and the parse threw for all of them. WhatsApp creates the newsletter server-side BEFORE the response is parsed, so each call returned 500 while leaving a real channel behind, and `createChannel` is non-idempotent, so a client retrying a 5xx leaked one orphan per attempt (confirmed on the test account). `description` has the same defect whenever the caller omits one. The patch reads every nested field defensively so the response's `id` — the only place the new channel's id appears — always survives.                                                                                                                                                                                                                                                                                                                                                                                  | exact-shape match; remove once upstream tolerates a pictureless newsletter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| 🔧¹² | `scripts/patch-baileys-pairing.js`           | Baileys `lib/Socket/socket.js`, `messages-recv.js` | Send notification ACKs before login. Rotate retired registration secrets, persist them and refresh the current QR without consuming another reference.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Rc14 backport with four adaptations: once `creds.me` is set the QR timer stops, which upstream keeps running; a new pair-device flow clears the timer of the one before it; the secret is not rotated while the socket is closed; and the ACK takes #2749's bare `creds.me?.id` where #2765 refuses to ack a message node before `creds.me` is set; remove once an upstream release includes both fixes. Upstream's timer then ends a pairing wait again when the QR refs run out, which can come before the 5 minutes OpenWA waits for a requested code. |
+| 🔧⁷  | `scripts/patch-wwebjs-participant-arity.js`  | whatsapp-web.js `GroupChat.js`                     | `removeParticipants`/`promoteParticipants`/`demoteParticipants` resolve each requested id against the group's own member collection and drop what they cannot find, then resolve `{status: 200}` for the batch. Dropping EVERY id left the WA Web request builder an empty repeated field, whose arity assertion threw — the caller saw an unnamed `500` on removal. Promote and demote have no such assertion, so they answered `200` claiming success for people WhatsApp never touched. The patch keeps the resolved array with its holes, skips the call when nothing resolved, and returns `matched` (one boolean per REQUESTED id) so the adapter can report a per-participant outcome instead of inventing one.                                                                                                                                                                                                                                                                                                                                                                                                                    | exact-shape match; remove once upstream reports which participants it acted on.                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 🔧¹⁰ | `scripts/patch-wwebjs-media-id.js`           | whatsapp-web.js `Injected/Utils.js`                | Every media send built by `processMediaData` failed on the WhatsApp Web builds rolled out on 2026-09-17 with `Data passed to getter must include an id property`, while text still sent. `window.WWebJS.sendMessage` builds the outgoing message with `id: newMsgKey` and then spreads the media model returned by `processMediaData` into it, and on those builds that model carries an enumerable private `__x_id` that clobbers the id when the `Msg` model initialises. The patch deletes `message.__x_id` unconditionally right after the object is built. Stock 1.34.8 (whatsapp-web.js PR #201923) guards deletion with `if (message.__x_id)`, which skips own-falsy properties, so this unconditional delete stays active beside it. It stands down once the installed tree carries that line.                                                                                                                                                                                                                                                                                                                                    | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 🔧¹¹ | `scripts/patch-wwebjs-send-error.js`         | whatsapp-web.js `Client.js`                        | A send the page refused reached OpenWA as the minified `t: t`, with nothing but Node frames: puppeteer rebuilds a page-side exception from its class name and description only, and WhatsApp Web's own error classes are minified to one letter and keep their detail in their own properties. The patch wraps the `window.WWebJS.sendMessage` call inside `Client.sendMessage`'s evaluate. A plain `Error`, which is what whatsapp-web.js's own send failures and WhatsApp Web's `No LID for user` already are, is rethrown as the same object, so its text and OpenWA's matching on it are unchanged. Anything else is rethrown as an `Error` reading `page threw {...}`, a capped JSON summary of the WhatsApp Web build actually running, the constructor name, `name`, `message`, `stack` and the value's own properties. Diagnostic only: a successful send returns what it returned before, and the dead-page classifier never reads a captured error as a transport death.                                                                                                                                                        | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 🔧¹³ | `scripts/patch-wwebjs-puppeteer.js`          | whatsapp-web.js `Client.js`                        | Use Puppeteer 25 browser connection getters so destroy closes Chromium and logout removes authentication only after closure.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Both exact replacements must match; an unknown or partial shape aborts installation. Stands down when upstream carries both changes.                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 🔧¹⁴ | `scripts/patch-baileys-media-stream.js`      | Baileys `lib/Utils/messages-media.js`              | `downloadEncryptedContent` wires the HTTP body into the decrypting stream with a bare `fetched.pipe(output)`: `pipe` forwards no errors and leaves no `'error'` listener on the body. When the inbound download deadline (`MEDIA_DOWNLOAD_TIMEOUT_MS`) or byte cap destroys the stream it was handed, the body stays open, and a later HTTP/2 reset (`NGHTTP2_PROTOCOL_ERROR`, `NGHTTP2_INTERNAL_ERROR`) or `ECONNRESET` is emitted with no listener and exits the process with `TypeError: terminated`. Ties the two streams together in both directions: a body error destroys the output, and closing the output destroys the body.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | exact-shape match; remove once upstream stops using a bare `pipe` there.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 🔧¹⁵ | `scripts/patch-baileys-status-ack.js`        | Baileys `lib/Socket/messages-recv.js`              | WhatsApp delivers some accounts' contact statuses as a top-level `<status>` stanza instead of `<message from="status@broadcast">`, and `makeMessagesRecvSocket` registers no handler for it, so the stanza is never acknowledged. About 50 minutes later the server ends the stream with `<stream:error><ack class="status"/></stream:error>`, which Baileys reports as `Stream Errored (ack)` with status code 500. OpenWA reconnects from that, the server redelivers the stanza as an offline node, and the loop repeats while a status is pending. Reports also describe an account that stops receiving after such a reconnect while the session reads ready. The patch routes the stanza through `processNode` and the offline queue, decodes one shaped as the status message it replaces (`from="status@broadcast"`, the poster in `participant`) so it reaches the status store, and ends every outcome in one ack with no error code. Any other shape is acknowledged undecoded, and a status that fails to decrypt is dropped, not retried. Upstream: WhiskeySockets/Baileys#2858, with fixes #2866 and #2883, neither merged. | exact-shape match; unknown shape fails the build. A library that registers its own `CB:status` handler also fails it (the patch would send a second ack), which is the signal to retire the patch; `isApplied()` reads that state as applied.                                                                                                                                                                                                                                                                                                             |
+| 🔧¹⁶ | `scripts/patch-baileys-event-buffer.js`      | Baileys `lib/Utils/event-buffer.js`                | While its event buffer is on (from a linked account's connect until the offline marker or 30 seconds, and around every node the socket processes), Baileys folds what is emitted into one batch per flush, and three of its merges lose data. `groups.update` keeps only the first update of a group, so a second change in the window (a rename and a new description saved together, every change replayed after downtime) and a change after a `groupFetchAllParticipating` snapshot never produce `group.update`. `messaging-history.set` drops `lidPnMappings`, so a sync emitted while buffering loses its lid to phone pairs. `messages.update` merges with `Object.assign`, so of several answers to one event only the last reaches `event.response`. The patch keeps the updates of a group as an ordered list, concatenates the pairs into the consolidated history set and concatenates the RSVPs of a message; every other field keeps the library's merge. The upstream main branch still drops all three.                                                                                                                  | exact-shape, five sites all-or-nothing; unknown shape fails the build. A library that carries all three fixes (a `groups.update` case without the first-wins guard, and a buffer that handles `lidPnMappings` and `eventResponses`) is left alone, and `isApplied()` reads it as applied. One that carries only some of them fails the build, which is the signal to retire that part.                                                                                                                                                                    |
+| 🔧¹⁷ | `scripts/patch-baileys-media-signal.js`      | Baileys `lib/Utils/messages-media.js`              | `getHttpStream` passes only `dispatcher`, `method`, and `headers` to `fetch()`, dropping `options.signal`. An inbound media download that stalls before response headers arrive could not be cancelled when `MEDIA_DOWNLOAD_TIMEOUT_MS` fired, leaving the underlying HTTP socket open. Forwards `signal: options.signal` into `fetch()` so OpenWA's `AbortController` cancels stalled or capped downloads immediately.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | exact-shape match; remove once upstream forwards `options.signal` to `fetch()` in `getHttpStream`.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 ### 29.3.2 Which matrix rows depend on which patch
 
-This is the patch visibility the matrix cells refer to. Every patch is engine-specific (9 on wwjs,
-3 on Baileys), and **no row carries a row-level patch mark on both engines**. The two column-wide
-patches are a separate matter: 🔧¹ underwrites every wwjs cell and 🔧⁵ every baileys cell, so in
-that sense every row does depend on a patch on each side. "Patch-dependent" below means a patch
-this row needs specifically, which is usually marked in the row and, for the two that cover a whole
-class of rows (🔧⁸ and 🔧¹⁰), stated in the table instead.
+This is the patch visibility the matrix cells refer to. Every patch is engine-specific (7 on wwjs,
+7 on Baileys), and **no row carries a row-level patch mark on both engines**. The column-wide
+patch 🔧⁵ underwrites every baileys cell, while whatsapp-web.js 1.34.8 ships upstream #201832
+natively so wwjs carries no column-wide patch. "Patch-dependent" below means a patch
+this row needs specifically, which is usually marked in the row and, for the one that covers a whole
+class of rows (🔧¹⁰) and for 🔧¹³, stated in the table instead.
 
 | Patch                       | Matrix rows that depend on it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🔧¹ message-id backport     | **The whole wwjs column** (header-marked, not repeated per row): every wwjs cell that sends, receives or resolves a message id. On unpatched 1.34.7 against WhatsApp Web ≥ 2.3000.x, sends return no message object and chat/media reads throw the minified `r: r`. Not row-specific, so the wwjs column header carries `🔧¹`.                                                                                                                                                                                                                           |
-| 🔧² status-send repair      | `postTextStatus`, `postImageStatus`, `postVideoStatus`, `postVoiceStatus` — **wwjs cells only**. Stock 1.34.7 throws before any status send on current WhatsApp Web builds. These four rows are ✅ on both engines, but the wwjs side works only because of this patch.                                                                                                                                                                                                                                                                                  |
+| 🔧² status-send repair      | `postTextStatus`, `postImageStatus`, `postVideoStatus`, `postVoiceStatus` — **wwjs cells only**. Stock 1.34.8 throws before any status send on current WhatsApp Web builds. These four rows are ✅ on both engines, but the wwjs side works only because of this patch.                                                                                                                                                                                                                                                                                  |
 | 🔧³ newsletter link preview | `sendTextMessage` (and any send carrying a link preview) **to a channel JID** on wwjs. Row-marked on `sendTextMessage` as the common case.                                                                                                                                                                                                                                                                                                                                                                                                               |
-| 🔧⁴ ready-sync              | `initialize` on wwjs (warm-restore readiness race). Row-marked.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 🔧⁴ ready-sync              | `initialize` on wwjs (the bridge-attached marker the readiness probe reads). Row-marked.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | 🔧⁵ app-state resync bound  | No single row — keeps the Baileys socket's app-state resync from spinning (~1000 wasted 60s queries/day). Connection health under **every baileys cell**; the baileys column header carries `🔧⁵`.                                                                                                                                                                                                                                                                                                                                                       |
 | 🔧⁶ newsletter-create parse | `createChannel` on **baileys** — without it the call always answers 500 and leaks the channel it just created. Row-marked.                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | 🔧⁷ participant arity       | `removeParticipants`, `promoteParticipants`, `demoteParticipants` on **wwjs**. Without it a request naming only non-members throws an arity assertion on removal, and promote/demote answer `200` for people WhatsApp never touched; the patch returns one boolean per REQUESTED id so the adapter reports a real per-participant outcome. Row-marked.                                                                                                                                                                                                   |
-| 🔧⁹ group description       | `setGroupDescription` on **wwjs**. Without it every call throws in the page and answers a bare `500`, so the capability is dead rather than degraded; `setGroupSubject` beside it is unaffected. Row-marked.                                                                                                                                                                                                                                                                                                                                             |
-| 🔧⁸ block/unblock           | `blockContact`, `unblockContact` on **wwjs**. Without it both answer an opaque `500` on every id, so the capability is dead rather than degraded; the blocklist read still works, which makes the failure look one-sided.                                                                                                                                                                                                                                                                                                                                |
 | 🔧¹⁰ media send repair      | Every **wwjs** media send built by `processMediaData`: `sendImageMessage`, `sendVideoMessage`, `sendAudioMessage` (voice notes included, through `ptt`), `sendDocumentMessage` and the media status posts. A sticker is built by `processStickerData`, which returns a new object rather than the media model. On the WhatsApp Web builds from 2026-09-17 the library's own id is clobbered by the media model and every such send answers a bare `500`, while text sends keep working. Not row-marked: it covers a whole class of rows rather than one. |
 | 🔧¹¹ send error capture     | No row. Every **wwjs** send that fails in the page reports what the page threw instead of `t: t`, but no cell's outcome depends on it: a send that works without the patch works the same way with it.                                                                                                                                                                                                                                                                                                                                                   |
-| 🔧¹² pairing refresh        | No row. Baileys linking by QR or pairing code: notification ACKs go out before login, retired registration secrets rotate and the current QR re-renders without spending a ref. Once a pairing code was requested (`creds.me` set) the QR timer stops, so running out of refs no longer ends that socket, as it does upstream.                                                                                                                                                                                                                           |
+| 🔧¹² pairing refresh        | No row. Baileys linking by QR or pairing code: notification ACKs go out before login, retired registration secrets rotate and the current QR re-renders without spending a ref. Once a pairing code was requested (`creds.me` set) the QR timer stops, so running out of refs no longer ends that socket, as it does upstream. OpenWA ends it instead 5 minutes after the latest pairing request, and the session registers again with a new QR.                                                                                                         |
+| 🔧¹³ Puppeteer teardown     | `logout` and `destroy` on **wwjs**. Puppeteer 25 removed `isConnected()`, which stock 1.34.8 calls in both: without the patch `destroy()` never closes Chromium, so the browser leaks, and `logout()` throws before the auth strategy removes the session's auth directory. Not row-marked; recorded here.                                                                                                                                                                                                                                               |
+| 🔧¹⁴ media download stream  | No row. Every **baileys** inbound media message: without it a download abandoned at `MEDIA_DOWNLOAD_TIMEOUT_MS` or the byte cap can crash the whole gateway when its HTTP/2 stream is later reset, taking every session offline until the restart. No cell's outcome changes; the process survives instead.                                                                                                                                                                                                                                              |
+| 🔧¹⁵ status stanza ack      | No row. Every **baileys** session on an account that WhatsApp delivers contact statuses to as `<status>` stanzas: without it the connection drops about every 50 minutes with `Stream Errored (ack)`, an account can stop receiving after a reconnect, and those statuses are never stored. No cell's outcome changes. A status that fails to decrypt is dropped, not retried.                                                                                                                                                                           |
+| 🔧¹⁶ event buffer merges    | No row. Every **baileys** `group.update`, `event.response` and history sync: without it a second change of a group in one buffer window, a change after a group snapshot, every answer to one event but the last, and the lid to phone pairs of a sync emitted while buffering are lost. No cell's outcome changes.                                                                                                                                                                                                                                      |
+| 🔧¹⁷ media download signal  | No row. Every **baileys** inbound media download: without it an HTTP fetch stalled before response headers ignores `AbortSignal` when `MEDIA_DOWNLOAD_TIMEOUT_MS` fires, leaving the underlying socket open. No cell's outcome changes; stalled downloads cancel immediately instead.                                                                                                                                                                                                                                                                    |
 
 Rows that are ✅ on **both** engines where one side is patch-dependent: `initialize` (🔧⁴ wwjs),
 `sendTextMessage` (🔧³ wwjs), `postTextStatus` / `postImageStatus` / `postVideoStatus` /
 `postVoiceStatus` (🔧² wwjs), `removeParticipants` / `promoteParticipants` / `demoteParticipants`
-(🔧⁷ wwjs), `setGroupDescription` (🔧⁹ wwjs), `blockContact` / `unblockContact` (🔧⁸ wwjs), and
-every media send built from the media model (🔧¹⁰ wwjs). The last two carry no mark in the rows
-themselves and are recorded in the table above instead: 🔧¹⁰ because it covers a whole class of rows
-rather than one, 🔧⁸ simply because its two rows were never marked. Everything else that is ✅-both
-carries no patch dependency of its own, but still rests on the column-wide 🔧¹ (wwjs) and 🔧⁵
-(baileys), so no row runs on stock library code on both sides.
+(🔧⁷ wwjs), `logout` /
+`destroy` (🔧¹³ wwjs), and every media send built from the media model (🔧¹⁰ wwjs). The last two carry
+no mark in the rows themselves and are recorded in the table above instead: 🔧¹⁰ because it covers a
+whole class of rows rather than one, 🔧¹³ simply because its row was never marked.
+Everything else that is ✅-both
+carries no patch dependency of its own on wwjs and rests on the column-wide 🔧⁵ on Baileys.
 
 ### 29.3.3 Why no patch surfaces `transferChannelOwnership`'s swallowed reason
 
@@ -204,7 +213,7 @@ the channel cluster. Four of them — `acceptChannelAdminInvite`, `revokeChannel
 `demoteChannelAdmin`, `deleteChannel` — catch **only** `ServerStatusCodeError` and rethrow everything
 else, which is the behaviour we would want and the same shape as `deleteProfilePicture`. The
 indiscriminate `catch (ignoredError) { return false; }` appears **once**, in
-`transferChannelOwnership` (`Client.js:2627`).
+`transferChannelOwnership` (`Client.js`).
 
 So it is not a house style, and the one method carrying it is the one OpenWA answers 501 for and
 never invokes (29.6.2). The patch would repair a path our code does not take. It is also not an
@@ -216,154 +225,165 @@ opens `if (!channel) return false;` before its try, so its `false` conflates _ch
 _WhatsApp refused_, and the adapter answers 403 for both. That distinction is ours to make in our own
 adapter and involves no library change.
 
-## 29.4 Full capability matrix: the OpenWA contract view (113 methods)
+## 29.4 Full capability matrix: the OpenWA contract view (116 methods)
 
 Legend recap: **✅** supported · **✅🔧ⁿ** supported via OpenWA patch `🔧ⁿ` (29.3) ·
 **❌ gap** adapter-gap · **❌ lib** library-limitation. Column headers carry the engine-wide
-patch dependencies (🔧¹ message-id backport on wwjs; 🔧⁵ app-state bound on
-Baileys). The **OpenWA REST** column reads from the caller's side: ✅ works whatever engine the
+patch dependency (🔧⁵ app-state bound on Baileys). The **OpenWA REST** column reads from the caller's side: ✅ works whatever engine the
 session runs; ⚠️ depends on the session engine; ❌ 501 on both.
 
 ### 29.4.1 Session & connection
 
-| Method               | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST |
-| -------------------- | ------------------- | ---------------- | ----------- |
-| `initialize`         | ✅                  | ✅🔧⁴            | ✅          |
-| `disconnect`         | ✅                  | ✅               | ✅          |
-| `logout`             | ✅                  | ✅               | ✅          |
-| `destroy`            | ✅                  | ✅               | ✅          |
-| `forceDestroy`       | ✅                  | ✅               | ✅          |
-| `getQRCode`          | ✅                  | ✅               | ✅          |
-| `requestPairingCode` | ✅                  | ✅               | ✅          |
-| `getStatus`          | ✅                  | ✅               | ✅          |
-| `probeLiveness`      | ✅ local            | ✅ round trip    | ⚙️ internal |
+| Method               | Baileys adapter 🔧⁵ | wwjs adapter  | OpenWA REST |
+| -------------------- | ------------------- | ------------- | ----------- |
+| `initialize`         | ✅                  | ✅🔧⁴         | ✅          |
+| `disconnect`         | ✅                  | ✅            | ✅          |
+| `logout`             | ✅                  | ✅            | ✅          |
+| `destroy`            | ✅                  | ✅            | ✅          |
+| `forceDestroy`       | ✅                  | ✅            | ✅          |
+| `getQRCode`          | ✅                  | ✅            | ✅          |
+| `requestPairingCode` | ✅                  | ✅            | ✅          |
+| `getStatus`          | ✅                  | ✅            | ✅          |
+| `probeLiveness`      | ✅ local            | ✅ round trip | ⚙️ internal |
 
 `probeLiveness` is the one optional member of `IWhatsAppEngine`, and the two adapters answer it to
 different depths — which is what the optional marker exists to allow. wwjs races a real
 `Client.getState()` round trip against a 10s timeout, because a wedged page keeps reporting
 CONNECTED. Baileys returns a local check (`status === READY && sock != null`), because its keepalive
 already emits a close event within ~35s. So a wedged wwjs page is caught here; a wedged Baileys
-socket is caught by the transport instead. No REST route: the session watchdog polls it.
+socket is caught by the transport instead. No REST route: the session watchdog polls it. A wwjs
+reload whose re-inject loads the helpers but then fails to attach the event listeners emits no
+`ready`. The ready-sync patch (🔧⁴) resets its `eventsAttached` marker whenever a page without the
+helpers starts attaching, so the probe does not take the helpers alone as a recovered reload: the
+session stays `READY`, sends still working, until the 3-minute recovery bound after the reload has
+passed, and the watchdog then restarts it after two failed probes in a row. An install whose patch is
+missing or still the earlier version cannot tell that page from a healthy one, and inbound messages
+can stop reaching the gateway until the session is restarted.
 
 ### 29.4.2 Sending messages
 
-| Method                | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
-| --------------------- | ------------------- | ---------------- | --------------- |
-| `sendTextMessage`     | ✅                  | ✅🔧³            | ✅              |
-| `sendImageMessage`    | ✅                  | ✅               | ✅              |
-| `sendVideoMessage`    | ✅                  | ✅               | ✅              |
-| `sendAudioMessage`    | ✅                  | ✅               | ✅              |
-| `sendDocumentMessage` | ✅                  | ✅               | ✅              |
-| `sendStickerMessage`  | ✅                  | ✅               | ✅              |
-| `sendContactMessage`  | ✅                  | ✅               | ✅              |
-| `sendLocationMessage` | ✅                  | ✅               | ✅              |
-| `sendPollMessage`     | ✅                  | ✅               | ✅              |
-| `sendProduct`         | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `sendCatalog`         | ❌ lib              | ❌ lib           | ❌ not exposed  |
-| `replyToMessage`      | ✅                  | ✅               | ✅              |
-| `forwardMessage`      | ✅                  | ✅               | ✅              |
-| `sendChatState`       | ✅                  | ✅               | ✅              |
-| `sendSeen`            | ✅                  | ✅               | ✅              |
+| Method                | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST     |
+| --------------------- | ------------------- | ------------ | --------------- |
+| `sendTextMessage`     | ✅                  | ✅🔧³        | ✅              |
+| `sendImageMessage`    | ✅                  | ✅           | ✅              |
+| `sendVideoMessage`    | ✅                  | ✅           | ✅              |
+| `sendAudioMessage`    | ✅                  | ✅           | ✅              |
+| `sendDocumentMessage` | ✅                  | ✅           | ✅              |
+| `sendStickerMessage`  | ✅                  | ✅           | ✅              |
+| `sendContactMessage`  | ✅                  | ✅           | ✅              |
+| `sendLocationMessage` | ✅                  | ✅           | ✅              |
+| `sendPollMessage`     | ✅                  | ✅           | ✅              |
+| `sendProduct`         | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `sendCatalog`         | ❌ lib              | ❌ lib       | ❌ not exposed  |
+| `replyToMessage`      | ✅                  | ✅           | ✅              |
+| `forwardMessage`      | ✅                  | ✅           | ✅              |
+| `sendChatState`       | ✅                  | ✅           | ✅              |
+| `sendSeen`            | ✅                  | ✅           | ✅              |
 
 ### 29.4.3 Message management
 
-| Method                | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
-| --------------------- | ------------------- | ---------------- | --------------- |
-| `editMessage`         | ✅                  | ✅               | ✅              |
-| `deleteMessage`       | ✅                  | ✅               | ✅              |
-| `reactToMessage`      | ✅                  | ✅               | ✅              |
-| `starMessage`         | ✅                  | ✅               | ✅              |
-| `pinMessage`          | ✅                  | ✅               | ✅              |
-| `unpinMessage`        | ✅                  | ✅               | ✅              |
-| `getMessageReactions` | ❌ lib              | ✅               | ⚠️ wwjs only    |
-| `votePoll`            | ❌ lib              | ✅               | ⚠️ wwjs only    |
-| `clickButton`         | ✅                  | ❌ lib           | ⚠️ Baileys only |
+| Method                | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST     |
+| --------------------- | ------------------- | ------------ | --------------- |
+| `editMessage`         | ✅                  | ✅           | ✅              |
+| `deleteMessage`       | ✅                  | ✅           | ✅              |
+| `reactToMessage`      | ✅                  | ✅           | ✅              |
+| `starMessage`         | ✅                  | ✅           | ✅              |
+| `pinMessage`          | ✅                  | ✅           | ✅              |
+| `unpinMessage`        | ✅                  | ✅           | ✅              |
+| `getMessageReactions` | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `getMessageReceipts`  | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `votePoll`            | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `clickButton`         | ✅                  | ❌ lib       | ⚠️ Baileys only |
 
 ### 29.4.4 Chats
 
-| Method              | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST  |
-| ------------------- | ------------------- | ---------------- | ------------ |
-| `getChats`          | ✅                  | ✅               | ✅           |
-| `getChatHistory`    | ❌ lib              | ✅               | ⚠️ wwjs only |
-| `archiveChat`       | ✅                  | ✅               | ✅           |
-| `clearChatMessages` | ✅                  | ✅               | ✅           |
-| `deleteChat`        | ✅                  | ✅               | ✅           |
-| `markUnread`        | ✅                  | ✅               | ✅           |
-| `muteChat`          | ✅                  | ✅               | ✅           |
-| `pinChat`           | ✅                  | ✅               | ✅           |
+| Method              | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST  |
+| ------------------- | ------------------- | ------------ | ------------ |
+| `getChats`          | ✅                  | ✅           | ✅           |
+| `getChatHistory`    | ❌ lib              | ✅           | ⚠️ wwjs only |
+| `archiveChat`       | ✅                  | ✅           | ✅           |
+| `clearChatMessages` | ✅                  | ✅           | ✅           |
+| `deleteChat`        | ✅                  | ✅           | ✅           |
+| `markUnread`        | ✅                  | ✅           | ✅           |
+| `muteChat`          | ✅                  | ✅           | ✅           |
+| `pinChat`           | ✅                  | ✅           | ✅           |
+
+`getChats` fills `ChatSummary.phone`, the number a privacy-id chat maps to, on Baileys only. whatsapp-web.js lists none, and neither does its `getChatsByLabel`. Both whatsapp-web.js reads list a chat the page gives no title under its own id as `name`, which for a chat held under a privacy id is `<digits>@lid`, where Baileys lists `""`; a `name` equal to the id is no name.
 
 ### 29.4.5 Contacts
 
-| Method                | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST |
-| --------------------- | ------------------- | ---------------- | ----------- |
-| `getContacts`         | ✅                  | ✅               | ✅          |
-| `getContactById`      | ✅                  | ✅               | ✅          |
-| `upsertContact`       | ✅                  | ✅               | ✅          |
-| `deleteContact`       | ✅                  | ✅               | ✅          |
-| `blockContact`        | ✅                  | ✅               | ✅          |
-| `unblockContact`      | ✅                  | ✅               | ✅          |
-| `getBlockedContacts`  | ✅                  | ✅               | ✅          |
-| `checkNumberExists`   | ✅                  | ✅               | ✅          |
-| `getNumberId`         | ✅                  | ✅               | ✅          |
-| `getPhoneNumber`      | ✅                  | ✅               | ⚙️ internal |
-| `getPushName`         | ✅                  | ✅               | ⚙️ internal |
-| `resolveContactPhone` | ✅                  | ✅               | ✅          |
-| `getProfilePicture`   | ✅                  | ✅               | ✅          |
+| Method                | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST |
+| --------------------- | ------------------- | ------------ | ----------- |
+| `getContacts`         | ✅                  | ✅           | ✅          |
+| `getContactById`      | ✅                  | ✅           | ✅          |
+| `upsertContact`       | ✅                  | ✅           | ✅          |
+| `deleteContact`       | ✅                  | ✅           | ✅          |
+| `blockContact`        | ✅                  | ✅           | ✅          |
+| `unblockContact`      | ✅                  | ✅           | ✅          |
+| `getBlockedContacts`  | ✅                  | ✅           | ✅          |
+| `checkNumberExists`   | ✅                  | ✅           | ⚙️ internal |
+| `getNumberId`         | ✅                  | ✅           | ✅          |
+| `getPhoneNumber`      | ✅                  | ✅           | ⚙️ internal |
+| `getPushName`         | ✅                  | ✅           | ⚙️ internal |
+| `resolveContactPhone` | ✅                  | ✅           | ✅          |
+| `getContactLid`       | ✅                  | ✅           | ✅          |
+| `getProfilePicture`   | ✅                  | ✅           | ✅          |
 
 ### 29.4.6 Groups
 
-| Method                           | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
-| -------------------------------- | ------------------- | ---------------- | --------------- |
-| `createGroup`                    | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `getGroups`                      | ✅                  | ✅               | ✅              |
-| `getGroupInfo`                   | ✅                  | ✅               | ✅              |
-| `addParticipants`                | ✅                  | ✅               | ✅              |
-| `removeParticipants`             | ✅                  | ✅🔧⁷            | ✅              |
-| `promoteParticipants`            | ✅                  | ✅🔧⁷            | ✅              |
-| `demoteParticipants`             | ✅                  | ✅🔧⁷            | ✅              |
-| `approveGroupMembershipRequests` | ✅                  | ✅               | ✅              |
-| `rejectGroupMembershipRequests`  | ✅                  | ✅               | ✅              |
-| `getGroupMembershipRequests`     | ✅                  | ✅               | ✅              |
-| `leaveGroup`                     | ✅                  | ✅               | ✅              |
-| `getGroupInviteCode`             | ✅                  | ✅               | ✅              |
-| `joinGroupViaInviteCode`         | ✅                  | ✅               | ✅              |
-| `revokeGroupInviteCode`          | ✅                  | ✅               | ✅              |
-| `getGroupJoinInfo`               | ✅                  | ✅               | ✅              |
-| `setGroupSubject`                | ✅                  | ✅               | ✅              |
-| `setGroupDescription`            | ✅                  | ✅🔧⁹            | ✅              |
-| `setGroupPicture`                | ✅                  | ✅               | ✅              |
-| `deleteGroupPicture`             | ✅                  | ✅               | ✅              |
-| `setGroupMessagesAdminsOnly`     | ✅                  | ✅               | ✅              |
-| `setGroupInfoAdminsOnly`         | ✅                  | ✅               | ✅              |
-| `setGroupMemberAddMode`          | ✅                  | ✅               | ✅              |
-| `setGroupEphemeral`              | ✅                  | ❌ lib           | ⚠️ baileys only |
+| Method                           | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST     |
+| -------------------------------- | ------------------- | ------------ | --------------- |
+| `createGroup`                    | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `getGroups`                      | ✅                  | ✅           | ✅              |
+| `getGroupInfo`                   | ✅                  | ✅           | ✅              |
+| `addParticipants`                | ✅                  | ✅           | ✅              |
+| `removeParticipants`             | ✅                  | ✅🔧⁷        | ✅              |
+| `promoteParticipants`            | ✅                  | ✅🔧⁷        | ✅              |
+| `demoteParticipants`             | ✅                  | ✅🔧⁷        | ✅              |
+| `approveGroupMembershipRequests` | ✅                  | ✅           | ✅              |
+| `rejectGroupMembershipRequests`  | ✅                  | ✅           | ✅              |
+| `getGroupMembershipRequests`     | ✅                  | ✅           | ✅              |
+| `leaveGroup`                     | ✅                  | ✅           | ✅              |
+| `getGroupInviteCode`             | ✅                  | ✅           | ✅              |
+| `joinGroupViaInviteCode`         | ✅                  | ✅           | ✅              |
+| `revokeGroupInviteCode`          | ✅                  | ✅           | ✅              |
+| `getGroupJoinInfo`               | ✅                  | ✅           | ✅              |
+| `setGroupSubject`                | ✅                  | ✅           | ✅              |
+| `setGroupDescription`            | ✅                  | ✅           | ✅              |
+| `setGroupPicture`                | ✅                  | ✅           | ✅              |
+| `deleteGroupPicture`             | ✅                  | ✅           | ✅              |
+| `setGroupMessagesAdminsOnly`     | ✅                  | ✅           | ✅              |
+| `setGroupInfoAdminsOnly`         | ✅                  | ✅           | ✅              |
+| `setGroupMemberAddMode`          | ✅                  | ✅           | ✅              |
+| `setGroupEphemeral`              | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `setGroupMemberLabel`            | ✅                  | ❌ lib       | ⚠️ baileys only |
 
 ### 29.4.7 Channels
 
-| Method                     | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
-| -------------------------- | ------------------- | ---------------- | --------------- |
-| `createChannel`            | ✅🔧⁶               | ✅               | ✅              |
-| `deleteChannel`            | ✅                  | ✅               | ✅              |
-| `muteChannel`              | ✅                  | ✅               | ✅              |
-| `demoteChannelAdmin`       | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `transferChannelOwnership` | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `getChannelById`           | ✅                  | ✅               | ✅              |
-| `getChannelMessages`       | ❌ gap              | ✅               | ⚠️ wwjs only    |
-| `getSubscribedChannels`    | ❌ lib              | ✅               | ⚠️ wwjs only    |
-| `subscribeToChannel`       | ✅                  | ❌ gap           | ⚠️ baileys only |
-| `unsubscribeFromChannel`   | ✅                  | ✅               | ✅              |
+| Method                     | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST     |
+| -------------------------- | ------------------- | ------------ | --------------- |
+| `createChannel`            | ✅🔧⁶               | ✅           | ✅              |
+| `deleteChannel`            | ✅                  | ✅           | ✅              |
+| `muteChannel`              | ✅                  | ✅           | ✅              |
+| `demoteChannelAdmin`       | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `transferChannelOwnership` | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `getChannelById`           | ✅                  | ✅           | ✅              |
+| `getChannelMessages`       | ❌ gap              | ✅           | ⚠️ wwjs only    |
+| `getSubscribedChannels`    | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `subscribeToChannel`       | ✅                  | ❌ gap       | ⚠️ baileys only |
+| `unsubscribeFromChannel`   | ✅                  | ✅           | ✅              |
 
 ### 29.4.8 Status / stories
 
-| Method               | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST  |
-| -------------------- | ------------------- | ---------------- | ------------ |
-| `postTextStatus`     | ✅                  | ✅🔧²            | ✅           |
-| `postImageStatus`    | ✅                  | ✅🔧²            | ✅           |
-| `postVideoStatus`    | ✅                  | ✅🔧²            | ✅           |
-| `postVoiceStatus`    | ✅                  | ✅🔧²            | ✅           |
-| `deleteStatus`       | ✅                  | ✅               | ✅           |
-| `getContactStatus`   | ❌ lib              | ✅               | ✅ (store) ‡ |
-| `getContactStatuses` | ❌ lib              | ✅               | ✅ (store) ‡ |
+| Method               | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST  |
+| -------------------- | ------------------- | ------------ | ------------ |
+| `postTextStatus`     | ✅                  | ✅🔧²        | ✅           |
+| `postImageStatus`    | ✅                  | ✅🔧²        | ✅           |
+| `postVideoStatus`    | ✅                  | ✅🔧²        | ✅           |
+| `postVoiceStatus`    | ✅                  | ✅🔧²        | ✅           |
+| `deleteStatus`       | ✅                  | ✅           | ✅           |
+| `getContactStatus`   | ❌ lib              | ✅           | ✅ (store) ‡ |
+| `getContactStatuses` | ❌ lib              | ✅           | ✅ (store) ‡ |
 
 ‡ Status **reads** are served from `StatusStoreService` (fed by inbound status ingestion on both
 engines), not by calling the engine — so the REST API is engine-neutral here even though the
@@ -372,49 +392,49 @@ answers 501.
 
 ### 29.4.9 Labels (WA Business)
 
-| Method                | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
-| --------------------- | ------------------- | ---------------- | --------------- |
-| `getLabels`           | ❌ lib              | ✅               | ⚠️ wwjs only    |
-| `getLabelById`        | ❌ lib              | ✅               | ⚠️ wwjs only    |
-| `getChatLabels`       | ❌ lib              | ✅               | ⚠️ wwjs only    |
-| `getChatsByLabel`     | ❌ lib              | ✅               | ⚠️ wwjs only    |
-| `addLabelToChat`      | ✅                  | ✅               | ✅              |
-| `removeLabelFromChat` | ✅                  | ✅               | ✅              |
-| `upsertLabel`         | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `deleteLabel`         | ✅                  | ❌ lib           | ⚠️ baileys only |
+| Method                | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST     |
+| --------------------- | ------------------- | ------------ | --------------- |
+| `getLabels`           | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `getLabelById`        | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `getChatLabels`       | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `getChatsByLabel`     | ❌ lib              | ✅           | ⚠️ wwjs only    |
+| `addLabelToChat`      | ✅                  | ✅           | ✅              |
+| `removeLabelFromChat` | ✅                  | ✅           | ✅              |
+| `upsertLabel`         | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `deleteLabel`         | ✅                  | ❌ lib       | ⚠️ baileys only |
 
 ### 29.4.10 Catalog & products (WA Business)
 
-| Method        | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
-| ------------- | ------------------- | ---------------- | --------------- |
-| `getCatalog`  | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `getProducts` | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `getProduct`  | ✅                  | ❌ lib           | ⚠️ baileys only |
+| Method        | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST     |
+| ------------- | ------------------- | ------------ | --------------- |
+| `getCatalog`  | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `getProducts` | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `getProduct`  | ✅                  | ❌ lib       | ⚠️ baileys only |
 
 ### 29.4.11 Own profile & presence
 
-| Method                 | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST |
-| ---------------------- | ------------------- | ---------------- | ----------- |
-| `setProfileName`       | ✅                  | ✅               | ✅          |
-| `setProfilePicture`    | ✅                  | ✅               | ✅          |
-| `deleteProfilePicture` | ✅                  | ✅               | ✅          |
-| `setProfileStatus`     | ✅                  | ✅               | ✅          |
-| `setOnlinePresence`    | ✅                  | ✅               | ✅          |
+| Method                 | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST |
+| ---------------------- | ------------------- | ------------ | ----------- |
+| `setProfileName`       | ✅                  | ✅           | ✅          |
+| `setProfilePicture`    | ✅                  | ✅           | ✅          |
+| `deleteProfilePicture` | ✅                  | ✅           | ✅          |
+| `setProfileStatus`     | ✅                  | ✅           | ✅          |
+| `setOnlinePresence`    | ✅                  | ✅           | ✅          |
 
 ### 29.4.12 Presence & calls
 
-| Method                | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
-| --------------------- | ------------------- | ---------------- | --------------- |
-| `subscribeToPresence` | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `rejectCall`          | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `createCallLink`      | ✅                  | ✅               | ✅              |
+| Method                | Baileys adapter 🔧⁵ | wwjs adapter | OpenWA REST     |
+| --------------------- | ------------------- | ------------ | --------------- |
+| `subscribeToPresence` | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `rejectCall`          | ✅                  | ❌ lib       | ⚠️ baileys only |
+| `createCallLink`      | ✅                  | ✅           | ✅              |
 
-**Totals:** 113 methods → 226 adapter cells: **199 ✅, 27 ❌** (2 adapter-gaps, 25
-library-limitations, 0 uncertain) across 26 methods. From the REST caller's side: **89** methods
-work on any engine (87 fully supported + 2 store-backed status reads), **14** are Baileys-only,
-**9** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
-is not exposed. Three of the 89 (`probeLiveness`, `getPhoneNumber`, `getPushName`) are ⚙️ internal and
-have no route.
+**Totals:** 116 methods → 232 adapter cells: **203 ✅, 29 ❌** (2 adapter-gaps, 27
+library-limitations, 0 uncertain) across 28 methods. From the REST caller's side: **90** methods
+work on any engine (88 fully supported + 2 store-backed status reads), **15** are Baileys-only,
+**10** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
+is not exposed. Four of the 90 (`probeLiveness`, `getPhoneNumber`, `getPushName`, `checkNumberExists`) are ⚙️
+internal and have no route.
 
 ## 29.5 Full engine method inventory — every library method, mapped to OpenWA
 
@@ -438,32 +458,35 @@ Exposure column values:
   capabilities; correctly never exposed.
 - **❌ not exposed** — a real library capability with no OpenWA path. **This is the implementation
   backlog.**
+- **❌ not exposed (run in-page)** is not backlog: the library method is not called, and the capability is exposed
+  through an adapter page function that sends the same request in the page, so that the status WhatsApp gave decides
+  the answer. 29.8 counts these rows apart from the real capabilities that are missing.
 
 ### 29.5.1 Baileys — 152 socket methods
 
 **Messaging & media** (19)
 
-| Library method                 | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `getMediaHost`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `readMessages`                 | ✅ `sendSeen`                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `refreshMediaConn`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `relayMessage`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `requestPlaceholderResend`     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendMessage`                  | ✅ `sendTextMessage`, `sendImageMessage`, `sendVideoMessage`, `sendAudioMessage`, `sendDocumentMessage`, `sendStickerMessage`, `sendLocationMessage`, `sendContactMessage`, `sendPollMessage`, `sendProduct`, `replyToMessage`, `forwardMessage`, `reactToMessage`, `editMessage`, `deleteMessage`, `pinMessage`, `unpinMessage`, `postTextStatus`, `postImageStatus`, `postVideoStatus`, `postVoiceStatus`, `deleteStatus` |
-| `sendMessageAck`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendNode`                     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendPeerDataOperationMessage` | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendPresenceUpdate`           | ✅ `sendChatState`, `setOnlinePresence`                                                                                                                                                                                                                                                                                                                                                                                     |
-| `sendRawMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendReceipt`                  | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendReceipts`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendRetryRequest`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendUnifiedSession`           | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendWAMBuffer`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `updateMediaMessage`           | ⚙️ internal wiring                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `upsertMessage`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `waitForMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Library method                 | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `getMediaHost`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `readMessages`                 | ✅ `sendSeen`                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `refreshMediaConn`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `relayMessage`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `requestPlaceholderResend`     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendMessage`                  | ✅ `sendTextMessage`, `sendImageMessage`, `sendVideoMessage`, `sendAudioMessage`, `sendDocumentMessage`, `sendStickerMessage`, `sendLocationMessage`, `sendContactMessage`, `sendPollMessage`, `sendProduct`, `replyToMessage`, `clickButton`, `forwardMessage`, `reactToMessage`, `editMessage`, `deleteMessage`, `pinMessage`, `unpinMessage`, `postTextStatus`, `postImageStatus`, `postVideoStatus`, `postVoiceStatus`, `deleteStatus` |
+| `sendMessageAck`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendNode`                     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendPeerDataOperationMessage` | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendPresenceUpdate`           | ✅ `sendChatState`, `setOnlinePresence`                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `sendRawMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendReceipt`                  | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendReceipts`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendRetryRequest`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendUnifiedSession`           | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendWAMBuffer`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `updateMediaMessage`           | ⚙️ internal wiring                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `upsertMessage`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `waitForMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 **Groups** (19)
 
@@ -568,7 +591,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 | `addMessageLabel`    | ❌ **not exposed**              |
 | `removeChatLabel`    | ✅ `removeLabelFromChat`        |
 | `removeMessageLabel` | ❌ **not exposed**              |
-| `updateMemberLabel`  | ❌ **not exposed**              |
+| `updateMemberLabel`  | ✅ `setGroupMemberLabel`        |
 
 **Privacy & account settings** (13)
 
@@ -590,16 +613,16 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 **Queries** (8)
 
-| Library method                 | OpenWA exposure                                                                                                                                        |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `executeUSyncQuery`            | ❌ **not exposed**                                                                                                                                     |
-| `fetchAccountReachoutTimelock` | ⚙️ internal wiring                                                                                                                                     |
-| `fetchBlocklist`               | ✅ `getBlockedContacts`                                                                                                                                |
-| `fetchDisappearingDuration`    | ❌ **not exposed**                                                                                                                                     |
-| `fetchNewChatMessageCap`       | ❌ **not exposed**                                                                                                                                     |
-| `fetchStatus`                  | ❌ **not exposed**                                                                                                                                     |
-| `getUSyncDevices`              | ❌ **not exposed**                                                                                                                                     |
-| `onWhatsApp`                   | ✅ `getNumberId`, `checkNumberExists`, and the lookup a send to a phone number without a known LID makes first (`sendTextMessage` and the other sends) |
+| Library method                 | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `executeUSyncQuery`            | ✅ `getContactLid`, and the check that a phone number and a LID are one person, which runs when a chat id and the stored key or chat it is checked against are those two forms and the persisted mapping does not pair them yet: `getContactById`, `sendSeen`, `markUnread`, `archiveChat`, `clearChatMessages`, `deleteChat`, `muteChat`, `pinChat`, `addLabelToChat`, `removeLabelFromChat`, `replyToMessage`, `clickButton`, `forwardMessage`, `reactToMessage`, `deleteMessage`, `editMessage`, `starMessage`, `pinMessage`, `unpinMessage` |
+| `fetchAccountReachoutTimelock` | ⚙️ internal wiring                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `fetchBlocklist`               | ✅ `getBlockedContacts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `fetchDisappearingDuration`    | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `fetchNewChatMessageCap`       | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `fetchStatus`                  | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `getUSyncDevices`              | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `onWhatsApp`                   | ✅ `getNumberId`, `checkNumberExists`, and the lookup a send to a phone number without a known LID makes first (`sendTextMessage` and the other sends)                                                                                                                                                                                                                                                                                                                                                                                          |
 
 **Profile, contacts & presence** (12)
 
@@ -624,7 +647,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `appPatch`                        | 🔩 plumbing                                                                                                                                                                 |
 | `assertSessions`                  | 🔩 plumbing                                                                                                                                                                 |
-| `chatModify`                      | ✅ `markUnread`, `clearChatMessages`, `archiveChat`, `muteChat`, `pinChat`, `deleteChat`, `deleteMessage`, `starMessage`                                                    |
+| `chatModify`                      | ✅ `sendSeen` (`markRead: true`), `markUnread`, `clearChatMessages`, `archiveChat`, `muteChat`, `pinChat`, `deleteChat`, `deleteMessage`, `starMessage`                     |
 | `cleanDirtyBits`                  | 🔩 plumbing                                                                                                                                                                 |
 | `createParticipantNodes`          | 🔩 plumbing                                                                                                                                                                 |
 | `digestKeyBundle`                 | 🔩 plumbing                                                                                                                                                                 |
@@ -671,7 +694,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 | Library method                 | OpenWA exposure                                                                                                                                                                                                                                                          |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `getMessageById`               | ❌ **not exposed**                                                                                                                                                                                                                                                       |
+| `getMessageById`               | ✅ `getMessageReceipts`                                                                                                                                                                                                                                                  |
 | `getPinnedMessages`            | ❌ **not exposed**                                                                                                                                                                                                                                                       |
 | `getPollVotes`                 | ❌ **not exposed**                                                                                                                                                                                                                                                       |
 | `searchMessages`               | ❌ **not exposed**                                                                                                                                                                                                                                                       |
@@ -682,28 +705,28 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 **Chats** (9)
 
-| Library method   | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                          |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `archiveChat`    | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                         |
-| `getChatById`    | ✅ `muteChannel`, `sendSeen`, `clearChatMessages`, `markUnread`, `deleteChat`, `sendChatState`, `getGroupInfo`, `addParticipants`, `leaveGroup`, `setGroupSubject`, `setGroupDescription`, `getGroupInviteCode`, `revokeGroupInviteCode`, `getChatLabels`, `replyToMessage`, `forwardMessage`, `reactToMessage`, `getMessageReactions`, `getChatHistory`, `deleteMessage`, `editMessage` |
-| `getChats`       | ⚙️ read via a direct page walk, not `Client.getChats`, for `getChats` and `getGroups`                                                                                                                                                                                                                                                                                                    |
-| `markChatUnread` | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                       |
-| `muteChat`       | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                            |
-| `pinChat`        | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                             |
-| `unarchiveChat`  | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                         |
-| `unmuteChat`     | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                            |
-| `unpinChat`      | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                             |
+| Library method   | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `archiveChat`    | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                                               |
+| `getChatById`    | ✅ `muteChannel`, `sendSeen`, `clearChatMessages`, `markUnread`, `deleteChat`, `sendChatState`, `getGroupInfo`, `addParticipants`, `leaveGroup`, `setGroupSubject`, `setGroupDescription`, `getGroupInviteCode`, `revokeGroupInviteCode`, `getChatLabels`, `replyToMessage`, `forwardMessage`, `reactToMessage`, `getMessageReactions`, `getMessageReceipts`, `getChatHistory`, `deleteMessage`, `editMessage` |
+| `getChats`       | ⚙️ read via a direct page walk, not `Client.getChats`, for `getChats` and `getGroups`                                                                                                                                                                                                                                                                                                                          |
+| `markChatUnread` | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                             |
+| `muteChat`       | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `pinChat`        | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `unarchiveChat`  | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                                               |
+| `unmuteChat`     | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `unpinChat`      | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 **Groups** (7)
 
 | Library method                   | OpenWA exposure                     |
 | -------------------------------- | ----------------------------------- |
-| `acceptInvite`                   | ✅ `joinGroupViaInviteCode`         |
+| `acceptInvite`                   | ❌ **not exposed** (run in-page)    |
 | `approveGroupMembershipRequests` | ✅ `approveGroupMembershipRequests` |
 | `createGroup`                    | ❌ not-available (29.6.2)           |
 | `getCommonGroups`                | ❌ **not exposed**                  |
 | `getGroupMembershipRequests`     | ✅ `getGroupMembershipRequests`     |
-| `getInviteInfo`                  | ✅ `getGroupJoinInfo`               |
+| `getInviteInfo`                  | ❌ **not exposed** (run in-page)    |
 | `rejectGroupMembershipRequests`  | ✅ `rejectGroupMembershipRequests`  |
 
 **Channels** (12)
@@ -712,7 +735,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 | -------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `acceptChannelAdminInvite` | ❌ **not exposed**                                                                                   |
 | `createChannel`            | ✅ `createChannel`                                                                                   |
-| `deleteChannel`            | ✅ `deleteChannel`                                                                                   |
+| `deleteChannel`            | ❌ **not exposed** (run in-page)                                                                     |
 | `demoteChannelAdmin`       | ❌ **not exposed** — page function gone, see 29.4                                                    |
 | `getChannelByInviteCode`   | ❌ **not exposed** — the invite→channel bridge adapter-gap #2 needs (29.6.2)                         |
 | `getChannels`              | ✅ `getSubscribedChannels`, `getChannelMessages`                                                     |
@@ -721,7 +744,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 | `sendChannelAdminInvite`   | ❌ **not exposed**                                                                                   |
 | `subscribeToChannel`       | ❌ **not exposed** — adapter-gap #2; the delegate throws pending a verified two-step wiring (29.6.2) |
 | `transferChannelOwnership` | ❌ **not exposed** — page rejects locally, see 29.4                                                  |
-| `unsubscribeFromChannel`   | ✅ `unsubscribeFromChannel`                                                                          |
+| `unsubscribeFromChannel`   | ❌ **not exposed** (run in-page)                                                                     |
 
 **Labels** (5)
 
@@ -743,19 +766,19 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 **Contacts & numbers** (11)
 
-| Library method                 | OpenWA exposure                                                  |
-| ------------------------------ | ---------------------------------------------------------------- |
-| `deleteAddressbookContact`     | ✅ `deleteContact`                                               |
-| `getBlockedContacts`           | ✅ `getBlockedContacts`                                          |
-| `getContactById`               | ✅ `getContactById`, `blockContact`, `unblockContact`            |
-| `getContactDeviceCount`        | ❌ **not exposed**                                               |
-| `getContactLidAndPhone`        | ✅ `resolveContactPhone`                                         |
-| `getContacts`                  | ⚙️ read via a direct page walk, not `Client.getContacts` (#1501) |
-| `getCountryCode`               | ❌ **not exposed**                                               |
-| `getFormattedNumber`           | ❌ **not exposed**                                               |
-| `getNumberId`                  | ✅ `checkNumberExists`, `getNumberId`                            |
-| `isRegisteredUser`             | ❌ **not exposed**                                               |
-| `saveOrEditAddressbookContact` | ✅ `upsertContact`                                               |
+| Library method                 | OpenWA exposure                                                                            |
+| ------------------------------ | ------------------------------------------------------------------------------------------ |
+| `deleteAddressbookContact`     | ✅ `deleteContact`                                                                         |
+| `getBlockedContacts`           | ✅ `getBlockedContacts`                                                                    |
+| `getContactById`               | ✅ `getContactById`, `blockContact`, `unblockContact`                                      |
+| `getContactDeviceCount`        | ❌ **not exposed**                                                                         |
+| `getContactLidAndPhone`        | ✅ `resolveContactPhone`, `getNumberId`, `getContactLid`, `blockContact`, `unblockContact` |
+| `getContacts`                  | ⚙️ read via a direct page walk, not `Client.getContacts` (#1501)                           |
+| `getCountryCode`               | ❌ **not exposed**                                                                         |
+| `getFormattedNumber`           | ❌ **not exposed**                                                                         |
+| `getNumberId`                  | ✅ `checkNumberExists`, `getNumberId`                                                      |
+| `isRegisteredUser`             | ❌ **not exposed**                                                                         |
+| `saveOrEditAddressbookContact` | ✅ `upsertContact`                                                                         |
 
 **Business** (2)
 
@@ -766,15 +789,15 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 **Profile & presence** (7)
 
-| Library method            | OpenWA exposure           |
-| ------------------------- | ------------------------- |
-| `deleteProfilePicture`    | ✅ `deleteProfilePicture` |
-| `getProfilePicUrl`        | ✅ `getProfilePicture`    |
-| `sendPresenceAvailable`   | ✅ `setOnlinePresence`    |
-| `sendPresenceUnavailable` | ✅ `setOnlinePresence`    |
-| `setDisplayName`          | ✅ `setProfileName`       |
-| `setProfilePicture`       | ✅ `setProfilePicture`    |
-| `setStatus`               | ✅ `setProfileStatus`     |
+| Library method            | OpenWA exposure                  |
+| ------------------------- | -------------------------------- |
+| `deleteProfilePicture`    | ❌ **not exposed** (run in-page) |
+| `getProfilePicUrl`        | ✅ `getProfilePicture`           |
+| `sendPresenceAvailable`   | ✅ `setOnlinePresence`           |
+| `sendPresenceUnavailable` | ✅ `setOnlinePresence`           |
+| `setDisplayName`          | ✅ `setProfileName`              |
+| `setProfilePicture`       | ❌ **not exposed** (run in-page) |
+| `setStatus`               | ✅ `setProfileStatus`            |
 
 **Misc** (1)
 
@@ -813,7 +836,7 @@ OpenWA consumes events by normalizing them into `EngineEventCallbacks`; anything
 | --------------------------- | --------------------------------------------------- | --- | -------------------------------- | ------------------------------- |
 | `messages.upsert`           | ✅                                                  |     | `chats.lock`                     | ❌                              |
 | `messages.update`           | ✅                                                  |     | `message-capping.update`         | ❌                              |
-| `messages.reaction`         | ❌ — inbound reactions arrive via `messages.upsert` |     | `message-receipt.update`         | ❌                              |
+| `messages.reaction`         | ❌ — inbound reactions arrive via `messages.upsert` |     | `message-receipt.update`         | ✅                              |
 | `messages.delete`           | ❌ candidate (delete-for-me webhook)                |     | `messages.media-update`          | ❌                              |
 | `messaging-history.set`     | ✅                                                  |     | `messaging-history.status`       | ❌                              |
 | `chats.upsert`              | ✅                                                  |     | `newsletter-participants.update` | ❌                              |
@@ -840,63 +863,73 @@ OpenWA consumes events by normalizing them into `EngineEventCallbacks`; anything
 | `message_reaction`          | ✅           |     | `contact_changed`      | ❌                                                                              |
 | `message_revoke_everyone`   | ✅           |     | `group_admin_changed`  | ❌                                                                              |
 | `message_revoke_me`         | ❌ candidate |     | `loading_screen`       | ❌                                                                              |
-| `message_ciphertext`        | ❌           |     | `media_uploaded`       | ❌                                                                              |
+| `message_ciphertext`        | ✅           |     | `media_uploaded`       | ❌                                                                              |
 | `message_ciphertext_failed` | ❌           |     | `remote_session_saved` | ❌                                                                              |
 | `call`                      | ✅           |     | `unread_count`         | ❌ candidate                                                                    |
-| `qr`                        | ✅           |     | `vote_update`          | ❌ candidate (poll-vote webhook)                                                |
+| `qr`                        | ✅           |     | `vote_update`          | ✅                                                                              |
 | `ready`                     | ✅           |     | `authenticated`        | ✅                                                                              |
 | `auth_failure`              | ✅           |     | `code`                 | ❌ — the pairing code is the return value of `requestPairingCode`, not an event |
 | `disconnected`              | ✅           |     | `group_join`           | ✅                                                                              |
 | `group_leave`               | ✅           |     | `group_update`         | ✅                                                                              |
 | `group_membership_request`  | ✅           |     |                        |                                                                                 |
 
-## 29.6 The 27 not-available cells in detail
+## 29.6 The 29 not-available cells in detail
 
 Every ❌ in 29.4, with the exact library symbol inspected (full evidence strings:
 `engine-capability-matrix.ts`). All of these throw `EngineNotSupportedError` → HTTP 501 at the
 adapter boundary — none silently stubs.
 
-### 29.6.1 Baileys adapter (12 cells)
+### 29.6.1 Baileys adapter (13 cells)
 
-| Method                  | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                                |
-| ----------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `getChannelMessages`    | gap   | `sock.newsletterFetchMessages(jid,count,since,after)` (`Socket/newsletter.d.ts:19`) returns the raw `BinaryNode` of `<message_updates>` (`newsletter.js:144`); the fetch is one line, but no library parser maps `BinaryNode`→`ChannelMessage`, and a hand-written walk can't be verified without a live session. The one remaining Baileys adapter-gap. |
-| `getSubscribedChannels` | lib   | No enumerate-subscribed-newsletters query; 18 of the 19 `Socket/newsletter.d.ts` members address a single newsletter by jid/invite key (the 19th creates one). The `newsletter` event surfaces jids only incrementally.                                                                                                                                  |
-| `getLabels`             | lib   | No label read symbol anywhere in `lib/**/*.d.ts`; `Types/Label.d.ts` is types-only, `chats.d.ts:69-73` exposes writes only. Labels arrive only via app-state sync (`messaging-history.set`) — a cache hack, not a getter.                                                                                                                                |
-| `getLabelById`          | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                           |
-| `getChatLabels`         | lib   | Same; `Types/LabelAssociation.d.ts` defines the type but no query fn (only `addChatLabel`/`removeChatLabel` writes, `chats.d.ts:70-71`).                                                                                                                                                                                                                 |
-| `getChatsByLabel`       | lib   | Same; listing a label's chats needs an app-state cache fed by label-association sync events.                                                                                                                                                                                                                                                             |
-| `getChatHistory`        | lib   | Only `fetchMessageHistory(count, oldestKey, oldestTs)` (`Socket/business.d.ts:25`), which returns a sync-token _string_; messages arrive later via the `messaging-history.set` event. No synchronous per-chat `fetchMessages`.                                                                                                                           |
-| `getMessageReactions`   | lib   | No on-demand fetch; reactions exist only as event-augmented `WAMessage.reactions` via the `messages.reaction` event, and the adapter does not persist them into its store. Inbound reaction _events_ (`onMessageReaction`) work fine — only the read-back is unavailable.                                                                                |
-| `getContactStatus`      | lib   | `fetchStatus` (`Socket/chats.d.ts:42`, via `USyncStatusProtocol`) returns the _about/profile text_ line, not 24h stories. Stories surface only as `status@broadcast` messages. REST reads are store-backed — see ‡ above.                                                                                                                                |
-| `getContactStatuses`    | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                           |
-| `sendCatalog`           | lib   | `AnyMessageContent` (`Types/Message.d.ts:166-210`) has only `{product}` (single product); the catalog CRUD nodes (`Socket/business.js:294-362`) mutate the catalog, they don't send it.                                                                                                                                                                  |
-| `votePoll`              | lib   | No vote-send helper at all; the library only _decrypts incoming_ votes (`decryptPollVote`). Sending needs a hand-built `proto.Message.PollUpdateMessage` with HMAC-SHA256 encryption keyed by the poll creation's `messageSecret`.                                                                                                                       |
+| Method                  | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                         |
+| ----------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `getChannelMessages`    | gap   | `sock.newsletterFetchMessages(jid,count,since,after)` (`Socket/newsletter.d.ts`) returns the raw `BinaryNode` of `<message_updates>` (`newsletter.js`); the fetch is one line, but no library parser maps `BinaryNode`→`ChannelMessage`, and a hand-written walk can't be verified without a live session. The one remaining Baileys adapter-gap. |
+| `getSubscribedChannels` | lib   | No enumerate-subscribed-newsletters query; 18 of the 19 `Socket/newsletter.d.ts` members address a single newsletter by jid/invite key (the 19th creates one). The `newsletter` event surfaces jids only incrementally.                                                                                                                           |
+| `getLabels`             | lib   | No label read symbol anywhere in `lib/**/*.d.ts`; `Types/Label.d.ts` is types-only, `chats.d.ts` exposes writes only. Labels arrive only via app-state sync (`messaging-history.set`) — a cache hack, not a getter.                                                                                                                               |
+| `getLabelById`          | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                    |
+| `getChatLabels`         | lib   | Same; `Types/LabelAssociation.d.ts` defines the type but no query fn (only `addChatLabel`/`removeChatLabel` writes, `chats.d.ts`).                                                                                                                                                                                                                |
+| `getChatsByLabel`       | lib   | Same; listing a label's chats needs an app-state cache fed by label-association sync events.                                                                                                                                                                                                                                                      |
+| `getChatHistory`        | lib   | Only `fetchMessageHistory(count, oldestKey, oldestTs)` (`Socket/business.d.ts`), which returns a sync-token _string_; messages arrive later via the `messaging-history.set` event. No synchronous per-chat `fetchMessages`.                                                                                                                       |
+| `getMessageReactions`   | lib   | No on-demand fetch; reactions exist only as event-augmented `WAMessage.reactions` via the `messages.reaction` event, and the adapter does not persist them into its store. Inbound reaction _events_ (`onMessageReaction`) work fine — only the read-back is unavailable.                                                                         |
+| `getMessageReceipts`    | lib   | No on-demand fetch; receipts exist only via `message-receipt.update` event, and the adapter does not persist them into its store. Inbound receipt _events_ (`onMessageReceipt`) work on Baileys — only the REST read-back is unavailable.                                                                                                         |
+| `getContactStatus`      | lib   | `fetchStatus` (`Socket/chats.d.ts`, via `USyncStatusProtocol`) returns the _about/profile text_ line, not 24h stories. Stories surface only as `status@broadcast` messages. REST reads are store-backed — see ‡ above.                                                                                                                            |
+| `getContactStatuses`    | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                    |
+| `sendCatalog`           | lib   | `AnyMessageContent` (`Types/Message.d.ts`) has only `{product}` (single product); the catalog CRUD nodes (`Socket/business.js`) mutate the catalog, they don't send it.                                                                                                                                                                           |
+| `votePoll`              | lib   | No vote-send helper at all; the library only _decrypts incoming_ votes (`decryptPollVote`). Sending needs a hand-built `proto.Message.PollUpdateMessage` with HMAC-SHA256 encryption keyed by the poll creation's `messageSecret`.                                                                                                                |
 
-### 29.6.2 wwjs adapter (15 cells)
+### 29.6.2 wwjs adapter (16 cells)
 
-| Method                     | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| -------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subscribeToChannel`       | gap   | `Client.subscribeToChannel(channelId)` (`Client.js:2542`) takes a channel **id** and resolves a boolean — it cannot satisfy the subscribe-by-invite-code contract alone. Correct wiring is two-step: `getChannelByInviteCode(inviteCode)` (`Client.js:1716`) → `subscribeToChannel(channel.id)`, unverified against a live session (the previous one-step call was a phantom success). The one remaining wwjs adapter-gap.                                                                                                                                                                                                                                                                                                                     |
-| `createGroup`              | lib   | `Client.createGroup` exists and is typed `Promise<CreateGroupResult \| string>`, but its injected evaluate reaches a WhatsApp Web internal that no longer exposes `findImpl` (`Client.js:2325`). Measured live on **two** builds — `2.3000.1044858477-alpha` auto-resolved and `2.3000.1044770897-alpha` pinned — both `TypeError: this.findImpl is not a function`, reaching the caller as a bare 500. Bare and `@c.us`-qualified participant ids fail identically, so the id shape is not the variable; varying the build is what separates this from registry pin drift. `findImpl` is in neither the installed `Client.js` nor any OpenWA patcher, so it belongs to the page and cannot be patched around. Baileys serves this capability. |
-| `demoteChannelAdmin`       | lib   | `Client.demoteChannelAdmin` exists (`index.d.ts:35`) but its page body calls `window.require('WAWebDemoteNewsletterAdminAction').demoteNewsletterAdmin` (`Client.js:1907-1925`), and a module probe on a live session (Web `2.3000.1044824727-alpha`, unpinned) returned that module resolving with `demoteNewsletterAdmin: undefined`. The sibling path used inside `transferChannelOwnership` (`WAWebNewsletterDemoteAdminJob.demoteNewsletterAdminAction`) is undefined too, so there is nothing to retarget. Baileys serves this capability.                                                                                                                                                                                               |
-| `transferChannelOwnership` | lib   | `Client.transferChannelOwnership` exists (`index.d.ts:375`) and its page function `WAWebChangeNewsletterOwnerAction.changeNewsletterOwnerAction` is present, but on Web `2.3000.1044824727-alpha` it rejects every call **locally** with `contact-not-found-in-newsletter-subscriber-list` — 4-9ms against a 352-531ms known-server baseline measured in the same page, so it never reaches WhatsApp. Unchanged by subscribing the target, promoting it to admin, or restarting the session; the only repopulation path, `WAWebCollections.NewsletterMetadataCollection.update`, is `undefined`. Baileys serves this capability.                                                                                                               |
-| `upsertLabel`              | lib   | 1.34.7 reads labels and assigns them (`getLabels`, `getLabelById`, `getChatLabels`, `getChatsByLabelId`, `addOrRemoveLabels`, `index.d.ts:129-154`) but exposes nothing that creates/edits a label definition.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `deleteLabel`              | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `subscribeToPresence`      | lib   | Only `sendPresenceAvailable`/`sendPresenceUnavailable` (`index.d.ts:230,233`), which publish the _account's own_ presence; no subscribe call and no presence event is emitted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `rejectCall`               | lib   | `Call.reject()` exists and is typed `Promise<void>` (`index.d.ts:2417`), but measured live on 2026-09-17 on OpenWA 0.23.4 with WhatsApp Web `2.3000.1047471845-alpha` the reject resolved and OpenWA logged the call as auto-rejected while the caller's phone kept ringing until it timed out. The cause is not established. The page function it runs, `WWebJS.rejectCall`, is modified by OpenWA patch 🔧¹ (`wwebjs-201832`), which reads the own user id from `getMaybeMePnUser()._serialized` or `$1`. Baileys serves this capability, and its auto-reject stopped the caller's phone at once in a live test the same day.                                                                                                                |
-| `getCatalog`               | lib   | No `Client.getCatalog` in `index.d.ts` (0 hits); `Product`/`Order` are inbound-only parsers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `getProducts`              | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `getProduct`               | lib   | Only page-internal `getProductMetadata` (`Utils.js:1290`), not a public Client fn.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `sendProduct`              | lib   | No outbound product content type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `sendCatalog`              | lib   | No `Client.sendCatalog` in `index.d.ts` (0 hits).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `setGroupEphemeral`        | lib   | No disappearing-timer setter (0 hits for `ephemeral` in `index.d.ts`); only the create-time `messageTimer` option (`Client.js:2328`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `clickButton`              | lib   | No interactive button-reply send path; inbound buttons are not exposable as a clickable Client action. Baileys uses `sendMessage({buttonReply})` / `sendMessage({listReply})` for classic prompts. Native-flow `interactiveMessage` replies are unverified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Method                     | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscribeToChannel`       | gap   | `Client.subscribeToChannel(channelId)` (`Client.js`) takes a channel **id** and resolves a boolean — it cannot satisfy the subscribe-by-invite-code contract alone. Correct wiring is two-step: `getChannelByInviteCode(inviteCode)` (`Client.js`) → `subscribeToChannel(channel.id)`, unverified against a live session (the previous one-step call was a phantom success). The one remaining wwjs adapter-gap.                                                                                                                                                                                                                                                                                                                          |
+| `createGroup`              | lib   | `Client.createGroup` exists and is typed `Promise<CreateGroupResult \| string>`, but its injected evaluate reaches a WhatsApp Web internal that no longer exposes `findImpl` (`Client.js`). Measured live on **two** builds — `2.3000.1044858477-alpha` auto-resolved and `2.3000.1044770897-alpha` pinned — both `TypeError: this.findImpl is not a function`, reaching the caller as a bare 500. Bare and `@c.us`-qualified participant ids fail identically, so the id shape is not the variable; varying the build is what separates this from registry pin drift. `findImpl` is in neither the installed `Client.js` nor any OpenWA patcher, so it belongs to the page and cannot be patched around. Baileys serves this capability. |
+| `demoteChannelAdmin`       | lib   | `Client.demoteChannelAdmin` exists (`index.d.ts`) but its page body calls `window.require('WAWebDemoteNewsletterAdminAction').demoteNewsletterAdmin` (`Client.js`), and a module probe on a live session (Web `2.3000.1044824727-alpha`, unpinned) returned that module resolving with `demoteNewsletterAdmin: undefined`. The sibling path used inside `transferChannelOwnership` (`WAWebNewsletterDemoteAdminJob.demoteNewsletterAdminAction`) is undefined too, so there is nothing to retarget. Baileys serves this capability.                                                                                                                                                                                                       |
+| `transferChannelOwnership` | lib   | `Client.transferChannelOwnership` exists (`index.d.ts`) and its page function `WAWebChangeNewsletterOwnerAction.changeNewsletterOwnerAction` is present, but on Web `2.3000.1044824727-alpha` it rejects every call **locally** with `contact-not-found-in-newsletter-subscriber-list` — 4-9ms against a 352-531ms known-server baseline measured in the same page, so it never reaches WhatsApp. Unchanged by subscribing the target, promoting it to admin, or restarting the session; the only repopulation path, `WAWebCollections.NewsletterMetadataCollection.update`, is `undefined`. Baileys serves this capability.                                                                                                              |
+| `upsertLabel`              | lib   | 1.34.8 reads labels and assigns them (`getLabels`, `getLabelById`, `getChatLabels`, `getChatsByLabelId`, `addOrRemoveLabels`, `index.d.ts`) but exposes nothing that creates/edits a label definition.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `deleteLabel`              | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `subscribeToPresence`      | lib   | Only `sendPresenceAvailable`/`sendPresenceUnavailable` (`index.d.ts`), which publish the _account's own_ presence; no subscribe call and no presence event is emitted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `rejectCall`               | lib   | `Call.reject()` exists and is typed `Promise<void>` (`index.d.ts`), but measured live on 2026-09-17 on OpenWA 0.23.4 with WhatsApp Web `2.3000.1047471845-alpha` the reject resolved and OpenWA logged the call as auto-rejected while the caller's phone kept ringing until it timed out. The cause is not established. The page function it runs, `WWebJS.rejectCall`, carries upstream `#201832` (shipped in `1.34.8`), which reads the own user id from `getMaybeMePnUser()._serialized` or `$1`. Baileys serves this capability, and its auto-reject stopped the caller's phone at once in a live test the same day.                                                                                                                 |
+| `getCatalog`               | lib   | No `Client.getCatalog` in `index.d.ts` (0 hits); `Product`/`Order` are inbound-only parsers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `getProducts`              | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `getProduct`               | lib   | Only page-internal `getProductMetadata` (`Utils.js`), not a public Client fn.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `sendProduct`              | lib   | No outbound product content type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `sendCatalog`              | lib   | No `Client.sendCatalog` in `index.d.ts` (0 hits).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `setGroupEphemeral`        | lib   | No disappearing-timer setter (0 hits for `ephemeral` in `index.d.ts`); only the create-time `messageTimer` option (`Client.js`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `setGroupMemberLabel`      | lib   | No member-label setter (0 hits for `memberLabel` or member tag in `index.d.ts` and `src/`). Baileys relays it with `updateMemberLabel` (`Socket/messages-send.js`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `clickButton`              | lib   | No interactive button-reply send path; inbound buttons are not exposable as a clickable Client action. Baileys uses `sendMessage({buttonReply})` / `sendMessage({listReply})` for classic prompts. Native-flow `interactiveMessage` replies are unverified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 ## 29.7 Caveats on supported rows
 
 ✅ means works end-to-end — but these rows carry behavioral differences worth knowing:
 
+- **1:1 sends prefer a resolved LID on both engines.** A phone-number destination can be sent to the contact's `@lid` when the engine already knows it or obtains it from a lookup, including for a cold, unsaved contact on the first send. Baileys uses `getLIDForPN` (which can query WhatsApp); whatsapp-web.js uses `getNumberId`. WhatsApp can reject phone-addressed sends to LID-migrated accounts with ack `463` (missing privacy token), so a successful number check does not force phone addressing. If no LID is resolved, the existing phone-addressed fallback applies. The linked account's own phone may show a first message to an unsaved contact under an unnamed id; see [troubleshooting](./12-troubleshooting-faq.md#issue-a-first-outbound-message-appears-under-an-unnamed-id).
+- **The stored `body` of an API-sent contact card, poll, location or captionless document differs by
+  engine.** The gateway writes its own text for the row (`📇 <contact name>`, `📊 <poll name>`,
+  `📍 <description or Location>`, the file name) and each engine reports the send back with a text of
+  its own (a card's vCard with the phone, the poll question, a location's map thumbnail or nothing, no
+  file name for a document); the row keeps whichever the database received first. On Baileys that is
+  the gateway's text in practice; on whatsapp-web.js the engine's record may be stored instead.
+  `message.sent` carries the engine's form on both, and the dashboard renders either.
 - **`clickButton` (Baileys), native-flow is unverified.** Classic `buttonsMessage` /
   `templateMessage` / `listMessage` prompts go through Baileys' `buttonReply` / `listReply`
   helpers. A native-flow `interactiveMessage` prompt is answered with the same template
@@ -923,10 +956,20 @@ adapter boundary — none silently stubs.
   `status@broadcast` or a broadcast list, and a poll or a sticker to `status@broadcast` or a
   broadcast list. `ensureSendable` (`wwebjs-messaging.ts`) refuses them before the library is
   called, so nothing is sent. The Baileys adapter refuses none of them.
+- **`sendVideoMessage` and `postVideoStatus` (wwjs) depend on the page loading the video.** Before
+  the upload, WhatsApp Web loads the file into a `<video>` element and throws its own bare
+  `TimeoutError` when that load neither finishes nor fails within 20 seconds, so the send answers
+  `500` `ENGINE_PAGE_ERROR` with `TimeoutError: TimeoutError`. A file the browser cannot decode fails
+  in under a second with a named error instead. On that timeout the adapter logs
+  `video_load_timeout` with the page's visibility, the browser's `canPlayType` answer for an H.264/AAC
+  MP4 and the browser version (`wwebjs-video-load-timeout.ts`). A hidden page reproduced the timeout
+  in a test; that has not been seen in OpenWA. How to read the line: 12.4 in
+  `docs/12-troubleshooting-faq.md`. Baileys runs no browser, so it has no such step.
 - **`sendStickerMessage` — what each engine converts.** Both engines guarantee the payload really is
   WebP, but they reach it differently and they do not accept the same inputs. whatsapp-web.js passes
   `sendMediaAsSticker: true`, and `Util.formatToWebpSticker` converts `image/*` **and** `video/*`
-  (the latter via ffmpeg), rejecting anything else with `Invalid media format`. Baileys stamps
+  (the latter via ffmpeg). It throws `Invalid media format` for anything else, so the adapter refuses
+  that with a `400` before the send, as Baileys does. Baileys stamps
   `image/webp` on the payload unconditionally and transcodes nothing
   (`prepareWAMessageMedia` → `MIMETYPE_MAP.sticker`), so the adapter converts before the socket:
   WebP passes through byte-identical (preserving its sticker-pack EXIF), other raster `image/*`
@@ -937,8 +980,9 @@ adapter boundary — none silently stubs.
   whatsapp-web.js hands to the page like any other `image/*`. Sticker conversion is deliberately
   not wired to ffmpeg on the Baileys side: the binary ships only in the Docker image, so depending
   on it would make the same request succeed or fail depending on how the gateway was installed. A
-  Baileys voice note's waveform does read its audio through ffmpeg when the binary is there; without
-  it the note goes out with flat bars.
+  Baileys voice note's waveform and a Baileys video's inline preview do read their media through
+  ffmpeg when the binary is there; without it (or past the preview's 10 s deadline) the note goes
+  out with flat bars and the video without a preview.
 - **`deleteStatus` (baileys).** Baileys sends a status stanza, the revoke included, to exactly its
   `statusJidList`, so the revoke is addressed to the recipients the adapter remembered when it posted
   the status. It keeps them in memory for 24 hours, so a status this session did not post in the last
@@ -949,43 +993,199 @@ adapter boundary — none silently stubs.
   the same engine, and the list with it.
   The `sendMessage(status@broadcast, {delete})` revoke shape is _empirically unverified_: only posting
   was live-spiked. On wwjs it calls `revokeStatusMessage(statusId)` (own status only).
+- **Status post acks (baileys).** An own status post reports no aggregate `delivered` or `read`
+  `message.ack`: the tracker in `baileys-group-ack.ts` follows group messages only, and a status post
+  has no stored row. Baileys raises each viewer's receipt through `message-receipt.update`, which the
+  gateway forwards as `message.receipt` under the chat `status@broadcast`. The viewers of a status are
+  the distinct `participant` values with `status` `read` for its id; a viewer whose read receipts are
+  off never appears among them, and the per-webhook bound on `message.receipt` applies. whatsapp-web.js
+  broadcasts a status to the account's status-privacy audience, so there is no recipient list there.
 - **`getChats` after a restart (baileys).** Baileys keeps no chat list of its own, and WhatsApp
   skips history sync on every connect after the first link, so a new engine (a process restart, a
   session stop and start, or a reconnect the gateway runs itself, as for `deleteStatus` above) starts
-  with an empty one. `GET /chats` then lists the groups, re-fetched on every connect, and every chat
-  with a persisted archive, pin or mute state (bounded by `BAILEYS_CHAT_STATE_CACHE_MAX`); any other
-  1:1 chat comes back when its next message arrives and stays out of the list until then. Rows
-  rebuilt this way carry timestamp `0` and no `lastMessage` until a message arrives. The transient
-  reconnects Baileys runs on its own keep the list. whatsapp-web.js reads WhatsApp Web's own chat
-  list and is unaffected.
+  with an empty one. On its first connect, before the socket opens, it lists every chat the gateway
+  stored a message of, groups included, with the newest stored message as `timestamp`,
+  `lastMessage` and `lastMessageType`, and names a contact the address book does not by the
+  pushname its newest received message came with. Only the rows of the account the session is
+  linked to count, so a session linked to another number does not list the chats of the one before,
+  and a row without a WhatsApp id (a pending or failed send) shows no chat, nor does a send the
+  gateway stored before it knew the account's number, which names no account. A chat with a
+  persisted archive, pin or mute state is listed too, and a chat deleted on the phone stays out
+  until a newer message arrives, for as long as its deletion mark exists: an unlink removes the
+  marks, and a chat deleted before 0.27.0 has none, so such a chat is listed again while the gateway
+  still stores its messages. Limits: the read takes the `BAILEYS_SESSION_STORE_MAX_ENTRIES` chats
+  (default 5000) with the newest rows, and a chat that holds only another account's rows, or only
+  rows without a WhatsApp id, uses a slot and lists nothing; on PostgreSQL a start waits ten seconds
+  for the read at most, and lists as it did before chats were seeded when the read takes longer, while
+  on SQLite the read is one synchronous statement that holds the event loop until it ends, so the
+  start waits for all of it; a chat with no stored message (not kept under
+  `STORE_EPHEMERAL_MESSAGES=false`, or removed by retention) and no persisted state comes back when
+  its next message arrives; `unreadCount` reads `0` until a message arrives, since nothing stored
+  records it; a contact stored under both its phone and its lid lists as two rows, as the live
+  listing keeps them; and when the chat states outgrow
+  `BAILEYS_CHAT_STATE_CACHE_MAX`, a deleted chat whose state row was not cached can show in the
+  first listing after the start, and is left out once that row is read.
+  A first link gets its chats from history sync instead. The transient reconnects Baileys runs on
+  its own keep the list. whatsapp-web.js reads WhatsApp Web's own chat list and is unaffected.
 - **`getContactStatus` / `getContactStatuses` (wwjs).** `Status.type` is the `text|image|video|voice`
   union: a voice note reads back as `voice`, and any other story type collapses to `text`.
 - **`requestPairingCode` (wwjs) for a number that already has a linked session.** Both engines
   return a code, but on whatsapp-web.js the request runs in the shared WhatsApp Web page and checks
   no precondition: measured twice, a request for a number that already had a linked session was
   followed within about a minute by WhatsApp revoking that device, whatsapp-web.js deleting its
-  credentials and the session returning to `qr_ready`. Baileys writes only its own credentials and
-  showed no such effect. Link by QR when the session of that number must stay up.
+  credentials and the session returning to `qr_ready`. The gateway now answers `409` on whatsapp-web.js
+  for a number that is the stored phone of another of its sessions (the mobile-marker spellings of a
+  Brazilian, Mexican or Argentine number count as one), but it cannot see a link made on another gateway
+  or only on the phone. Baileys writes only its own credentials, showed no such effect and is not
+  refused. Link by QR when the session of that number must stay up.
 - **`archiveChat` / `clearChatMessages` / `deleteChat` / `sendSeen` / `markUnread` (baileys).** The
-  four `chatModify` actions (archive, clear, delete, unread) need the chat's last known message, which
-  the patch carries. `sendSeen` without message ids is `readMessages([key])` for the newest _received_
-  (not `fromMe`) message, since Baileys drops own keys from a receipt. A chat with no such message
-  resolves `false` rather than throwing, so a chat the session has seen no message in, or one holding
-  only this account's own sends, answers `POST chats/read` with `{"success": false}`, where
-  whatsapp-web.js marks it read from the page-side chat object without needing any local history.
+  four `chatModify` actions (archive, clear, delete, unread) are keyed to the chat's newest message:
+  the one the session holds in memory, else the newest one the gateway stored (#1891). Only the rows
+  of the account the session is linked to count, as in the chat list above: a stored message names
+  that account in `to` when it was received and in `from` when it was sent, so a session linked to
+  another number never keys a write to a message of the one before. A send stored before the gateway
+  knew the account's number names no account and keys nothing, and no stored message is used while
+  the engine reports no number. The patch is
+  indexed by the same jid as that message's key: a message in memory under the jid it arrived with,
+  a stored one under the lid its row is filed under, or the chat's only reported lid, else a lid the
+  session's cache holds for it, else its phone jid; an own group message goes without its participant.
+  A stored message filed under the phone of a chat the persisted table maps to two or more lids, or
+  received in a group from a sender it maps to two or more, is not used, since keying it to any one of
+  them would be a guess: the write proceeds as for a chat with no stored message. A key that does not
+  belong to the chat is not used. Nor is a message sent at or before WhatsApp deleted the chat (on the
+  phone, or through the API), and it does not make the chat known either: the gateway keeps a deleted
+  chat's stored messages, and a write keyed to one names a message the phone no longer holds, while
+  Baileys applies the write locally and the deleted chat would be listed again. Such a chat is not
+  listed, and the four writes and a `sendSeen` without message ids resolve `false`, until a newer
+  message re-creates it. A deletion synced on a reconnect is dated when it arrives, so a message
+  delivered in the same reconnect counts as older. A message whose second is earlier than the gateway's deletion date, because the gateway's clock runs ahead or a deletion made on the phone reaches it late, counts as older too. A send keeps the chat's disappearing timer; for a phone the gateway maps to more than one lid (a reassigned number), a send addressed to that phone alone goes without one, since the timer cannot be told apart between the two holders. A chat id not spelled the way the engine keys chats (`<id>@g.us`,
+  `<lid>@lid` or a phone jid, lowercase, with no device suffix), such as `120363@G.US` or a bare
+  number, is served only by a message in memory: without one, the four writes and a `sendSeen` without
+  message ids resolve `false`. With no usable message, clear and delete resolve `false`, and archive
+  and unread are sent
+  without a range for a chat the session knows (a chat record, a persisted state row or a stored
+  message, under its lid or its phone whichever the caller names) whose jid belongs to it, and resolve
+  `false` otherwise; unread also resolves `false` for an archived chat, which the phone leaves unmarked
+  without a range. `sendSeen`
+  without message ids is `readMessages([key])` for the newest _received_ (not `fromMe`) message, in
+  memory or stored, since Baileys drops own keys from a receipt. A chat with no such message resolves
+  `false`, so one holding only this account's own sends answers `POST chats/read` with
+  `{"success": false}`, where whatsapp-web.js marks it read from the page-side chat object without
+  needing any local history.
+  With message ids, a group id the message store never held (history backfill) takes its receipt's
+  participant from the author the gateway stored for it; one with no stored author is left out of the
+  receipt, and the answer is `false` when no id could be named.
+  Once a receipt that names the chat's newest received message has gone out, `sendSeen` sets the chat's
+  `unreadCount` back to `0` in the session's own chat list and sends nothing for it: Baileys reports the
+  chat unread with each message received and lowers that for no receipt the session sends, so a chat read
+  through the gateway stayed listed as unread. The value is what Baileys last reported for the chat, an
+  increment and not a running total: a chat whose unread messages arrived one at a time is listed with
+  `1`. Baileys also counts a contact's encrypted edit or reaction, a pin, a keep-in-chat toggle, an album header, an
+  event RSVP, an encrypted comment and a lone fast-ratchet sender-key distribution as a received message; one that
+  arrives on its own does not raise the count,
+  lists no chat the session holds no record of, and is no message that brings back a chat WhatsApp deleted, as a message
+  of its own does. Such a message that arrives while Baileys holds a history chunk of the chat (a new link's first sync or
+  a history fetch) or an upsert of it is merged into that chunk. When the chunk then counts only that message (a count of
+  one), it neither becomes the chat's last message nor brings back a deleted chat, and its time does not replace a time
+  the chat already has; a chat the session holds no other time for is listed at the time the phone gave it, with no
+  `lastMessage`. The count Baileys adds for it stays in the chunk's, so the chat can be listed with one unread message
+  more than it holds; a chunk that held a count of its own, or that a text was merged into as well, counts more and is
+  left as Baileys hands it over, so the message can still date the chat and bring back a deleted one.
+  Two or more such messages for one chat that reach the socket in one batch, as the offline queue does after a reconnect,
+  are recognised the same way when Baileys counted no message of its own for the chat in that batch: the chat update
+  loses their time and message, and the count they explain (Baileys adds one for each and lowers the sum for one the
+  account read on another device), so the chat is left as it was. A chunk is recognised when its count is exactly their
+  number, and its count stays the sum. When a message of its own came in the same batch, the sum is kept, and adds to
+  the count, lists a chat the session holds no record of and brings back a chat WhatsApp deleted, as that message does.
+  A count they do not explain stays on the update, without their time and message: an unread mark set on the phone
+  after them is listed, and so is a count above their number.
+  An unread mark set on the phone that Baileys delivers in the same batch just before such a message, as after a
+  reconnect, is folded into that message's count by the library and is therefore not listed; the mark stays on the
+  account. A read synced from the phone in the same batch is folded in the same way, since its zero adds nothing to
+  their count, so it is not seen either: the chat keeps the count it had until the next read. A receipt that names only older messages, or only the account's own (which Baileys leaves out of a
+  receipt), leaves the count, and so does one a newer message overtook, recorded or still being processed; a session restarted since holds
+  no received message to compare, and takes any received id for the read. Only a chat marked unread by
+  hand (listed with `unreadCount` `-1`, by `markUnread` or on the phone) takes a second write,
+  `chatModify` with `markRead: true`, which undoes the mark in the account's app state. A message received after
+  the mark puts its count in place of the `-1`; the session remembers a mark it has listed, and the read that
+  covers the message undoes it as well. A mark the session never listed is not remembered: one that Baileys
+  delivers in one batch with a message, as after a reconnect, arrives as that message's count alone, so the read
+  sends the receipt and the mark stays on the account. A read on the phone delivered in one batch with a newer
+  message is not seen either, and the next read then sends the write once more than needed.
+  That write is keyed as the four writes are, except that the stored message standing in for a session
+  with none in memory is the newest _received_ one, and it is never sent without a range: what the
+  phone does with a read mark that names no message is not established. It does not change the answer.
+  When WhatsApp refuses it or does not confirm it within the request budget, a warning is logged,
+  `POST chats/read` still answers `{"success": true}` for the receipt, and the chat stays marked unread: it is
+  listed with `-1`, also where a message's count stood in place of the mark. A write WhatsApp confirms only
+  after that budget is replayed by Baileys as a count of `0`, which also clears the count of a message received
+  in the meantime. A write confirmed in time is replayed before the read returns, or while Baileys' event buffer
+  still holds it, and the session then keeps the count of a message received after the read reset the counts; a read
+  made on the phone while the buffer still holds that replay (a tenth of a second, longer while other work keeps the
+  buffer open) reaches the session together with it, is taken for it, and leaves the count of the message it read
+  listed until the next read.
+  A session restarted since the mark was set no longer lists it (`unreadCount` reads `0`, as above), so
+  its read sends the receipt alone and the mark stays on the account.
 - **`setProfileName` / `setProfilePicture` / `deleteProfilePicture` refusals (baileys).**
-  whatsapp-web.js reads a page-side verdict for all three (`setDisplayName` and `setProfilePicture`
-  resolve `false`, `deleteProfilePicture` resolves an explicit `false`) and raises a `403`. The
+  whatsapp-web.js raises a `403` for a name change its page says cannot be made (`setDisplayName` resolves
+  `false` only then) and for a picture change or removal WhatsApp refuses: both picture writes are sent in the page
+  and answered by WhatsApp's status, as the group and profile writes below. The
   Baileys calls resolve with no acceptance signal, so a change WhatsApp declined answers `200`. Only
   `setProfileStatus` is symmetric: neither engine surfaces a refusal for it.
+- **`setProfileStatus` (wwjs) needs a WhatsApp Web build that still has `setMyStatus`.** `Client.setStatus` calls
+  `setMyStatus` of `WAWebContactStatusBridge`, which WhatsApp Web builds from about mid November 2026 no longer
+  export: the About text became a text status that expires (a day by default), set through modules the library
+  does not call. The adapter asks the page whether the call exists and answers `501` where it does not, without
+  asking WhatsApp. On an earlier build the text is set as before. The gateway does not set the new text status:
+  its expiry and its gating by account cannot be settled without a linked account to check against.
+- **Group and profile writes (wwjs) answer by WhatsApp's status.** The subject, description, picture, announce,
+  locked and member-add-mode writes of a group, the account's own profile picture and its removal, and the invite
+  revoke are sent by the adapter in the page, through the WhatsApp Web job whatsapp-web.js calls, so that the status WhatsApp gave
+  decides the answer: 2xx is done, a rate limit, a timeout or a server error (`408`, `423`, `429`, `5xx`) is a `503`
+  that changed nothing (member add mode, which is two writes when it sets admins on a group whose link mode is open, can
+  have applied the first), and any other code, or the page's own refusal of an account that may not make the change, is a
+  `403`. The library reads every such status as `false`, which the adapter used to read as missing admin rights. The announce
+  and locked jobs of the current build resolve a response (`SetPropertyResponse*`) where an earlier build rejected a
+  status, and the library reads a resolved response as success; the adapter reads the response. A page that cannot
+  run the write answers before anything is asked of WhatsApp (see the note on the write jobs below).
+  The engines do not classify every status alike on these writes. `408` is a `503` on both. `429` is a `503` on both.
+  `423` is a `503` on whatsapp-web.js and a `403` on Baileys, which maps `408` and `429` to a `503` and every other `4xx` to
+  a `403`. A `5xx` is a `503` on whatsapp-web.js and is rethrown as it came on Baileys (a `500`). Baileys is left as it
+  is: whether WhatsApp sends `423` or a `5xx` to these writes has not been traced on a live account.
+- **Channel writes (wwjs) answer by WhatsApp's status.** The delete, the mute and unmute, and the unsubscription of a
+  channel are sent by the adapter in the page, with the lookups, the job and the arguments whatsapp-web.js uses
+  (`Client.deleteChannel`, `Channel.mute` and `unmute`, `Client.unsubscribeFromChannel`), so that the status the job
+  rejects with decides the answer. Unlike the group writes above, no retryable status promises that nothing was
+  changed: `408`, `423`, `429` and `5xx` are all a `503` that says the operation may or may not have been applied, and
+  any other status the `403`. The page's Mex client sends a delete or a mute again on a `429` or a `500`, up to four
+  attempts in all, and only the error of the last attempt surfaces, so a lost first attempt can be followed by a rate
+  limit, an outage or a refusal that hides it. The Mex client also makes a `500` with the text `MexIqError:` of any send
+  that fails, a socket that dropped after the request left included, and an IQ error that WhatsApp did answer with a
+  `500` carries the same text. The unsubscription job is sent once, and its reply may not have come; a `408` is a
+  timeout. A repeat of a delete after such an answer may meet a channel that is gone, which answers `403`, and a repeat
+  of an unsubscription may meet a channel that is no longer followed. The library reads that class of error as `false`,
+  which the adapter read as a refusal; the Mex subclass that carries the error of a query itself
+  (`MexServerStatusCodeError`) was not caught by the library at all and was a bare `500`, and both are answered by
+  their status now. What the library answered `false` for without asking WhatsApp, a channel the page does not hold and
+  a channel the account owns when it unsubscribes, is still the `403` and sends nothing. The jobs make up a `423` and
+  three `500`s themselves: the unsubscription job reports a suspended channel as a `423`, and the delete, the
+  unsubscription and the mute and unmute each report an answer of the query that holds nothing as a `500` in their own
+  words (`xwa2_newsletter_delete_v2 is null`, `unexpected-null-mex-response`, `unexpected_mex_mutation_response`),
+  which is how WhatsApp can refuse an account that may not make the change. None is a status WhatsApp sent or a failure
+  to retry, so all are the `403` too, matched by their exact text and status. A page without one of the jobs dies on it
+  as the library's call did, and answers a bare `500`. The delete and the unsubscription read the channel through the
+  helpers whatsapp-web.js installs in the page (`window.WWebJS`): a page that has `require` and not those helpers is
+  reloading, and answers the retryable `409` before anything is asked of WhatsApp. Baileys maps `408` and `429` to a
+  `503` and every other `4xx` to a `403`, and rethrows a `5xx` as it came.
 - **`editMessage` / `pinMessage` / `unpinMessage` refusals (baileys).** Both engines refuse what they
   can judge locally: the target must be addressable inside the given chat, and the Baileys adapter
-  additionally refuses an edit of a message the account did not send. Past those guards they diverge.
-  whatsapp-web.js reads a page-side verdict (`message.edit()` resolves `null`, `message.pin()`
-  resolves `false`) and raises a `403`; Baileys sends the edit or pin as an ordinary protocol message
-  and is never told the outcome. So a pin refused because the account is not a group admin, or an
-  edit refused because the target is not a text message, answers `403` on whatsapp-web.js and `200`
-  on Baileys.
+  additionally refuses an edit of a message the account did not send or of one with no text or caption
+  to edit (a location, sticker, poll, contact card or audio), the two edits whatsapp-web.js also
+  refuses. Past those guards they diverge. whatsapp-web.js reads a page-side verdict
+  (`message.edit()` resolves `null`; a pin the page's sender does not take is refused the same way) and raises a `403`; Baileys
+  sends the edit or pin as an ordinary protocol message and is never told the outcome. So a pin
+  refused because the account is not a group admin answers `403` on whatsapp-web.js and `200` on
+  Baileys.
 - **Inbound edits and reactions (baileys).** WhatsApp sends a contact's edit, and a reaction in some
   chats, encrypted under the secret of the message it changes, which the library does not decrypt. The
   adapter reads them with the stored copy of that message (the session's message store, bounded by
@@ -993,20 +1193,136 @@ adapter boundary — none silently stubs.
   delivered. A message the session sent is held the same way as one it received, and an edit the
   account makes from its own phone is applied under the account's own id, plain or encrypted.
   whatsapp-web.js receives both already decrypted from WhatsApp Web.
+- **Disappearing messages under `STORE_EPHEMERAL_MESSAGES=false` (baileys).** The flag also keeps the adapter's own
+  copy of a message received in a disappearing-messages chat out of `baileys_stored_messages`, which has no age limit
+  and is part of a backup. Without the copy, a reply to, forward of, edit of, reaction to, star of, pin or unpin of,
+  delete of, button click on or quote of such a message answers `404`, a group read receipt that names one leaves it
+  out, an encrypted edit, reaction or poll vote aimed at it is not delivered once the message has been processed, and
+  an RSVP to an event it carries is not reported. A plain edit,
+  reaction or delete of it is announced as before, and so is a message the account sent or typed on its phone in that
+  chat, which keeps its copy, and a status. A redelivery of one is handed to the session again and dropped there.
+  Rows written before the flag was turned off stay until the count cap evicts them. While such a message is a chat's
+  newest, the chat is listed with an empty `lastMessage`, and its media is not downloaded. whatsapp-web.js has no
+  store of its own to govern: WhatsApp Web holds the message until it expires, so `getChatHistory` and the chat
+  list's `lastMessage` still return it there.
+- **Inbound poll votes (`poll.vote`).** Baileys no longer reads a vote itself, so the adapter does,
+  with the library's `decryptPollVote` and the secret of the poll creation message in the session's
+  message store (`BAILEYS_MESSAGE_STORE_LIMIT`), and names the selected options by their SHA-256
+  hashes. A vote is not reported when its poll is no longer in the store, when it does not
+  authenticate against that poll, when it names an option the poll does not have, or when it arrives
+  in another chat than its poll (aside from a 1:1 vote on the account's own broadcast-list poll).
+  A cleared vote that authenticates is reported with `selectedOptions: []`. Both engines cap
+  `selectedOptions` at 32 entries and option texts and `pollName` at 1024 characters, matching
+  inbound poll creation messages. Votes cast before the store held the poll are not backfilled.
+  whatsapp-web.js receives votes already decrypted from WhatsApp Web.
 - **`muteChat` addressing.** whatsapp-web.js resolves the chat before writing and answers `400` for a
-  chatId it cannot resolve; Baileys writes the app-state patch without a lookup and answers `200` for
-  a chat that does not exist. `pinChat` splits the same way.
+  chatId it cannot resolve. Baileys keys the app-state patch to the id the session holds the chat under
+  (the LID of a LID-migrated contact) and answers `200` for a chat it has never seen. A phone-number
+  chatId for a chat held under a LID is confirmed first, through the persisted mapping or the USync
+  query, and answers `400` when neither pairs the two. `pinChat` splits the same way.
 - **`getChannelById` reach and payload.** Baileys resolves any channel by JID
   (`newsletterMetadata('jid', …)`), including one the account does not follow. whatsapp-web.js 1.34.x
   exposes no per-id lookup, so the adapter scans the subscribed-channel list and returns `null` (a
   `404`) for every channel the account is not subscribed to. The `Channel` payload differs too:
-  Baileys reads `createdAt` off the newsletter metadata and whatsapp-web.js never fills it. Neither
+  Baileys fills `inviteCode`, `subscriberCount`, `verified` and `createdAt` from the newsletter metadata, while
+  whatsapp-web.js fills none of them (its `Channel` keeps that data only inside `channelMetadata`, which the adapter
+  does not read), so a channel there carries `id`, `name` and `description`. Neither
   engine fills `picture`: WhatsApp reports the channel picture as a media path, not a URL.
 - **`starMessage` (baileys).** Needs the stored key's `fromMe` — the same id means different
   messages depending on direction.
 - **`addParticipants` result shape.** wwjs returns a per-participant `{code,message}` object or a
   batch refusal string; Baileys returns per-jid `[{status}]`. Both are mapped onto the HTTP
-  `results` field; a total refusal throws.
+  `results` field; a total refusal throws. A participant whose privacy settings allow joining only by
+  invitation (code `403`) is answered differently: whatsapp-web.js sends that person a private group invite
+  message when WhatsApp allows one and the adapter reports `success: true` with a message saying the invite was
+  sent once it went out (otherwise `success: false, status: 403`), while Baileys sends nothing and reports
+  `success: false, status: 403`, so a batch made only of such participants answers `200` on wwjs when every
+  invite went out and `403` on Baileys. The invite is sent through `sendGroupInviteMessage` of
+  `WAWebChatSendMessages`, which the WhatsApp Web build the gateway selects today no longer exports (the function
+  moved and takes one options object, where the library passes positional arguments). The adapter asks the page
+  whether the export exists and, where it does not, adds the participants without sending invitations: a
+  participant who needs one is reported as `success: false, status: 403` and every other participant keeps their
+  own outcome. Without that, the library's call failed inside its loop and the whole batch answered `500`.
+- **`revokeGroupInviteCode` (wwjs) needs a WhatsApp Web build that has the reset job.** The adapter runs the
+  job in the page: `resetGroupInviteCode` of `WAWebGroupInviteJob`, where the build keeps it, or of
+  `WAWebGroupQueryJob` on a build that still does (the library's own `revokeInvite` reads only the second). Both
+  take the same group id, built by `createWid` of `WAWebWidFactory`, and resolve the same `{code}`, and a refusal is the
+  `403` as before. A build with neither job, or without the factory, answers `501` before anything is asked of
+  WhatsApp, so the current code stays valid.
+- **The group and profile writes (wwjs) need a WhatsApp Web build that has the job each one sends.** The subject and
+  description go through `WAWebGroupModifyInfoJob` (the description also takes its id from `WARandomHex`), the group and
+  profile picture through `sendSetPicture` of `WAWebContactProfilePicThumbBridge`, and the announce, locked and member
+  add mode settings through `setGroupProperty` of `WAWebSetPropertyGroupAction`, all with the group or account id built by
+  `WAWebWidFactory`. A build without one answers `501` before anything is asked of WhatsApp. These writes used to fall
+  back to the library's own call, which reads the same modules, so there it died in the page with a `TypeError` and the
+  route answered a bare `500`. A page into which whatsapp-web.js has not installed its helpers (`window.WWebJS`, with
+  `getChat` for the description and the settings and `cropAndResizeImage` for a picture) is a page that is reloading, and
+  answers the retryable `409` whichever job it lacks. Every job exists on every build examined.
+- **`getGroupInviteCode` (wwjs) needs a WhatsApp Web build that has the invite code job.** The adapter reads
+  `fetchMexGroupInviteCode` of `WAWebMexFetchGroupInviteCodeJob` in the page and answers by the status WhatsApp gives. A
+  page with no such job runs the library's own `getInviteCode`, which reads the same module, so where that call fails
+  for want of the job (the module answers `undefined`, lacks the call, or is not defined) the answer is `501`, before
+  anything is asked of WhatsApp, where it was a bare `500`. A reload during the read is the retryable `409`.
+- **`joinGroupViaInviteCode` (wwjs) needs a WhatsApp Web build that has the join job.** The adapter runs
+  `joinGroupViaInvite` of `WAWebGroupInviteJob` in the page, calling it with the invite code alone as
+  `Client.acceptInvite` does, and answers `501` where the build has no such job, before anything is asked of WhatsApp. The
+  library's own call died in the page there, which the adapter read as a refused invite and answered `400`, so a valid
+  link was reported as bad. A refused invite is still the `400`. A group that has an admin approve new members answers the
+  join with a request, which the job reports as an unexpected response: the adapter tells it apart in the page and says
+  that a request to join was sent and the account has not joined, still as a `400`, where it said the invite was
+  invalid. Baileys reads the same answer as no group id, so it still answers the invalid-invite text. The status the job
+  rejects with is read in the page too: a timeout, a rate limit or a server error (`408`, `423`, `429`, `5xx`) joined
+  nothing and is the retryable `503`, where every status was the `400`, and any other status is the `400`. Baileys
+  answers `503` for `408` and `429`, reads every other `4xx`, `423` included, as the invalid invite, and rethrows a `5xx`
+  as it came (a `500`).
+- **`getGroupJoinInfo` (wwjs) answers by WhatsApp's status.** The preview runs `queryGroupInvite` of `WAWebGroupQueryJob`
+  in the page, as `Client.getInviteInfo` calls it, so that the status the job rejects with decides the answer: a timeout,
+  a rate limit or a server error (`408`, `423`, `429`, `5xx`) is the retryable `503`, and any other status the `404` of an
+  unknown invite, where every rejection was the `404`. The Mex job that a build runs in place of the IQ job makes up a
+  `500` with no text at all when its query answers no group and no error: that is no status WhatsApp sent but an answer
+  that holds no group, so it is the `404`, and a `500` with a text is the retryable `503`. Whether a revoked or unknown
+  link reaches the page as that answer has not been observed on a live account. Baileys answers `503` for `408` and
+  `429`, `404` for every other `4xx`, and
+  rethrows a `5xx` as it came (a `500`). The adapter looks the job up first, as the revoke does: a build whose
+  `WAWebGroupQueryJob` has no `queryGroupInvite` answers `501` before anything is asked of WhatsApp, where the
+  library's call died in the page and every code, valid ones included, was the `404` of an unknown invite.
+- **`deleteGroupPicture` and `deleteProfilePicture` (wwjs) need a WhatsApp Web build that has the picture delete job.**
+  The adapter sends `requestDeletePicture` of `WAWebContactProfilePicThumbBridge` in the page, with the group id (or the
+  account's own) built by `WAWebWidFactory`, and answers `501` where either is missing, before anything is asked of
+  WhatsApp, where it would have been a bare `500`. Both exist on every build examined. The account's own removal used
+  to run the library's `deleteProfilePicture`, which sends the same request only when the page's own copy of the
+  picture allows it and reads every status as `false`; it now sends it whatever that copy says, as the group removal
+  does, so a repeat is the same request. WhatsApp answering `200` for an account with no picture left, as it does for a
+  group with none, has not been observed on an account.
+- **Three whatsapp-web.js calls still hide the status WhatsApp gave.** `createChannel` runs the library's create, which
+  turns every status into the text `CreateChannelError: An error occupied while creating a channel`; the adapter answers
+  it as the `403` refusal and does not call a rate limit retryable, because a create is not safe to repeat (a replay
+  after a server error can leave a second channel). `getProfilePicUrl` reads through a WhatsApp Web bridge that catches
+  every status itself and resolves a record with no picture, so a rate-limited read answers `200` with a `null` url, as a
+  contact with no picture does. Approving or rejecting a membership request reports a status for each requester, but a
+  failure of the whole request that is not a success carries no status and is named `ServerStatusCodeError` in the
+  result. Telling these apart needs a copy of the library's own logic in the page, and the answers err toward the
+  final one: a caller that sees the `403` or the `null` url may retry once if it knows the account is rate limited.
+- **`pinMessage` / `unpinMessage` (wwjs) need a WhatsApp Web build whose pin sender the adapter can call.** whatsapp-web.js
+  calls `sendPinInChatMsg` of `WAWebSendPinMessageAction` with three positional arguments, which the builds up to
+  `2.3000.1050403604` (15 October 2026) declare; the later builds checked (from `2.3000.1052565782`, 1 November, to the
+  newest examined) take one options object instead, so the library's call died inside the page and both routes answered a
+  bare `500`. The adapter asks the page which shape the sender has, calls it the way the build takes it (the page's own
+  pin type and duration option, nothing of the page replaced), and leaves the call to the library on a build whose sender
+  still takes positional arguments. A build with neither shape, or without the pin type, the duration mapper or the message
+  collection, answers `501` before anything is sent. A send that did not go through is the `403` as before. The sender
+  throws the same error for every send the page recorded as failed, a refusal, a rate limit and a timeout alike, and keeps
+  nothing of why, so none of them can be told from the others and a rate limit of the send is a `403` too. Two failures
+  come before the result of the send and are answered: a chat with a contact the account blocked, which the page refuses
+  before it sends, is a `403` (it was a bare `500`), and the read of the group's metadata that the sender makes first,
+  which WhatsApp Web repeats after a reconnect, is answered by the status it rejects with, the retryable `503` for `408`,
+  `423`, `429` and `5xx` and a `403` for any other. The options call follows what the page's own pin dialog sends and has
+  been run offline against the page's modules, not yet on a linked account.
+- **Group owner and group event ids (wwjs).** whatsapp-web.js folds a group's participant list to the phone
+  dialect, but the group `owner` (`getGroupInfo`, `getGroupJoinInfo`) and the actor and participant ids of group
+  events reach the adapter as WhatsApp Web holds them, which on a LID-addressed group is `<lid>@lid` even when the
+  phone is known. Baileys answers the phone form wherever it knows the phone (`ownerPn`, `authorPn`, a learned
+  mapping).
 - **`setGroupMemberAddMode` read side.** The engines disagree (Baileys boolean
   `memberAddMode`, wwjs raw WhatsApp strings — and wwjs's own type declares the opposite sense);
   both are normalized to `'all'|'admins'` at the adapter.
@@ -1018,30 +1334,41 @@ adapter boundary — none silently stubs.
   a revoke while the send still resolves, so sending it would report a deletion that never happened.
   When the group's member list shows no row the gateway can identify as the account, admin status is
   unknown and the revoke is still sent.
+- **Group sends (baileys) reuse the group's participant list.** Rather than query it for every
+  message, the adapter keeps each group's list for `BAILEYS_GROUP_METADATA_CACHE_TTL_MS` (default 5
+  minutes; `0` queries for every send, and for the first receipt of every group message the account
+  sent, whose roster the delivered and read acks are judged against). A membership or settings event
+  for the group, a refresh of the all-groups listing (Baileys runs one on its own and `GET /groups`
+  another), a write to it through the API, and every reconnect drop the cached list early. A member
+  added without the adapter receiving the event gets the group's messages once the entry expires or
+  its client asks for a retry. The same list backs the check of a member's delete of another member's
+  message: with `0`, the delete of a settled message that is not provably the member's own makes one
+  query (up to the 30 second query budget), and a delete of a message still being processed or stored
+  is decided from the cached list alone and let through when it holds none. whatsapp-web.js has no
+  counterpart: the page keeps the member list itself.
 
 ## 29.8 Snapshot summary
 
 Recomputed from `engine-capability-matrix.ts`, `upstream-surface.snapshot.json`, and a scan of the
 adapter sources — re-derive the same way when anything changes:
 
-- **113** interface methods → **226** adapter cells: **199 ✅** / **27 ❌** (2 adapter-gaps, 25
-  library-limitations, 0 uncertain), spanning **26** methods.
-- Of the 199 ✅ cells, **10 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
-  1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 3 × 🔧⁷ participant arity, 1 × 🔧⁹ group
-  description) and one baileys cell
+- **116** interface methods → **232** adapter cells: **203 ✅** / **29 ❌** (2 adapter-gaps, 27
+  library-limitations, 0 uncertain), spanning **28** methods.
+- Of the 203 ✅ cells, **9 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+  1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 3 × 🔧⁷ participant arity) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
   even though no row carries a row-level mark on both.
-- REST caller's view: **89** engine-neutral (87 + 2 store-backed status reads), **14** Baileys-only,
-  **9** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed; three of the 89
-  (`probeLiveness`, `getPhoneNumber`, `getPushName`) are ⚙️ internal and have no route.
+- REST caller's view: **90** engine-neutral (88 + 2 store-backed status reads), **15** Baileys-only,
+  **10** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed; four of the 90
+  (`probeLiveness`, `getPhoneNumber`, `getPushName`, `checkNumberExists`) are ⚙️ internal and have no route.
 - Full engine inventory (29.5), split by the exposure legend rather than lumped: Baileys **152**
-  socket methods — 48 wired into interface methods, 5 internal wiring, 29 plumbing, **70 ❌ not
-  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 41 wired,
-  4 internal wiring, 1 class plumbing, **35 ❌ not exposed** (27 real capabilities + 8
-  session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
-  those 8 settings; 🔩 plumbing is correctly never exposed.
-- Events: Baileys **34** (17 consumed / 17 dropped), wwjs **31** (16 consumed / 15 dropped).
+  socket methods — 50 wired into interface methods, 5 internal wiring, 29 plumbing, **68 ❌ not
+  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 36 wired,
+  4 internal wiring, 1 class plumbing, **40 ❌ not exposed** (26 real capabilities, 6 served in-page
+  by an adapter page function, and 8 session/transport settings that are not WhatsApp capabilities).
+  The backlog is the ❌ rows minus those 6 and those 8 settings; 🔩 plumbing is correctly never exposed.
+- Events: Baileys **34** (18 consumed / 16 dropped), wwjs **31** (18 consumed / 13 dropped).
 - **0** capabilities in 29.5.3: every capability with first-class symbols on both libraries is
   either wired or classified with evidence. Some are Baileys-only despite typed whatsapp-web.js
   symbols: `createGroup`, whose injected evaluate reaches a page internal without `findImpl`;
@@ -1050,7 +1377,7 @@ adapter sources — re-derive the same way when anything changes:
   cannot repopulate; and `rejectCall`, whose `Call.reject()` resolves while the caller's phone
   keeps ringing (all in 29.6.2). Each answers 501 on wwjs. `.d.ts` presence is not capability, and
   only a live call distinguishes the two.
-- **12** install-time patches (9 whatsapp-web.js + 3 Baileys), all exact and self-disabling.
+- **14** install-time patches (7 whatsapp-web.js + 7 Baileys), all exact and self-disabling.
 - **0 phantom-support rows** — every `not-available` cell throws at the adapter boundary.
 - Remaining adapter-gaps (fixable in this repo, ranked): **#1** `getChannelMessages` (Baileys —
   fetch is one line, `BinaryNode`→`ChannelMessage` parser is the work); **#2** `subscribeToChannel`

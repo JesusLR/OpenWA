@@ -1,30 +1,38 @@
 import { z } from 'zod';
 import { ApiKeyRole } from '../../../modules/auth/entities/api-key.entity';
 import type { GroupService } from '../../../modules/group/group.service';
+import type { SessionService } from '../../../modules/session/session.service';
 import {
   GROUP_DESCRIPTION_MAX_LENGTH,
   GROUP_NAME_MAX_LENGTH,
   GROUP_PARTICIPANTS_MAX,
 } from '../../../modules/group/dto/group.dto';
-import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
+import { listLimitSchema } from '../list-limit-schema';
+import { defineTool, sessionIdSchema, type AnyToolDescriptor } from '../tool-descriptor';
 import { paginate } from '../../../common/utils/paginate';
 
-const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
+const sessionId = sessionIdSchema;
 
-export function groupTools(group: GroupService): AnyToolDescriptor[] {
+export function groupTools(group: GroupService, session: Pick<SessionService, 'findOne'>): AnyToolDescriptor[] {
   return [
     defineTool({
       name: 'GroupFindAll',
       chatScope: 'filtered',
-      description: 'List all groups the session is a member of. Use limit/offset to page.',
+      description:
+        'List all groups the session is a member of. Each entry has id and name, plus participantsCount, isAdmin and ' +
+        'linkedParentJID (the parent community, or null) when the engine reports them. Use limit/offset to page.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
       }),
       handler: async (input, apiKey, chatScope) => {
+        // GroupService answers 400 'Session is not started' for any session without an engine, an unknown id
+        // included. REST lists groups through SessionService, which answers 404 for an unknown one first.
+        await session.findOne(input.sessionId);
         if (!chatScope?.isRestricted(apiKey)) {
           return group.getGroups(input.sessionId, { limit: input.limit, offset: input.offset });
         }
@@ -38,6 +46,7 @@ export function groupTools(group: GroupService): AnyToolDescriptor[] {
       description: 'Get detailed info for a specific group including participants list.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
         groupId: z.string().min(1).describe('Group JID (e.g. 120363xxx@g.us)'),
@@ -47,9 +56,9 @@ export function groupTools(group: GroupService): AnyToolDescriptor[] {
     defineTool({
       name: 'GroupGetInviteCode',
       description:
-        'Get the invite code and link for a group. Requires OPERATOR role: the code is a ' +
-        'transferable join capability, not plain read data.',
-      tier: 'read',
+        'Get the invite code and link for a group. Requires OPERATOR role and write-tier MCP access ' +
+        '(MCP_READONLY=false): the code is a transferable join capability, not plain read data.',
+      tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,
       inputSchema: z.object({
@@ -63,7 +72,9 @@ export function groupTools(group: GroupService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'GroupCreate',
-      description: 'Create a new WhatsApp group with a name and initial participants. Requires OPERATOR role.',
+      description:
+        'Create a new WhatsApp group with a name and initial participants. ' +
+        'Requires the Baileys engine; whatsapp-web.js answers 501 and a retry cannot succeed. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,

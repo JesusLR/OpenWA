@@ -56,12 +56,18 @@ type MuteChannelRequest struct {
 	Mute bool `json:"mute"`
 }
 
-// CustomLinkPreview is a caller-supplied link preview. Nothing is fetched for these.
+// CustomLinkPreview is a caller-supplied link preview. The page is not fetched; only ThumbnailURL,
+// when set, is.
 type CustomLinkPreview struct {
 	URL string `json:"url"`
 	// Title is required — WhatsApp will not render a preview without one.
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
+	// ThumbnailURL is the preview image as an http(s) URL, fetched under the media SSRF rules; it
+	// renders the large card. At most 5 MiB.
+	ThumbnailURL string `json:"thumbnailUrl,omitempty"`
+	// ThumbnailBase64 is the preview image as base64, at most 5 MiB decoded. Wins over ThumbnailURL.
+	ThumbnailBase64 string `json:"thumbnailBase64,omitempty"`
 }
 
 // UpsertLabelRequest is a label create-or-update body. The id travels in the path, because WhatsApp
@@ -96,6 +102,7 @@ const (
 	RestrictionReachoutTimelock AccountRestrictionKind = "reachout_timelock"
 	RestrictionTosBlock         AccountRestrictionKind = "tos_block"
 	RestrictionProxyBlock       AccountRestrictionKind = "proxy_block"
+	RestrictionPasskeyRequired  AccountRestrictionKind = "passkey_required"
 )
 
 // PresenceState is a subscribed contact's presence.
@@ -133,10 +140,11 @@ type ChatPresence struct {
 // AccountRestriction is a restriction WhatsApp has in force on a session's account.
 //
 // "reachout_timelock" leaves the session connected and existing chats working -- only starting new
-// conversations is blocked -- whereas "tos_block" and "proxy_block" refuse the connection itself and
-// therefore cannot coexist with a "ready" status.
+// conversations is blocked -- whereas "tos_block", "proxy_block" and "passkey_required" stop a link or
+// the connection itself and therefore cannot coexist with a "ready" status. "passkey_required" means
+// WhatsApp asked for a passkey to finish linking a device, which the Baileys engine cannot answer.
 type AccountRestriction struct {
-	// Kind is one of: reachout_timelock, tos_block, proxy_block.
+	// Kind is one of: reachout_timelock, tos_block, proxy_block, passkey_required.
 	Kind AccountRestrictionKind `json:"kind"`
 	// Code is the engine's own token for the cause, verbatim (TOS_BLOCK, BIZ_QUALITY, ...).
 	Code string `json:"code"`
@@ -251,26 +259,31 @@ type MemoryUsage struct {
 }
 
 // SessionStatsOverview is the aggregate session stats payload.
+// MemoryUsage is nil unless the caller uses an unscoped ADMIN API key.
 type SessionStatsOverview struct {
 	Total        int            `json:"total"`
 	Active       int            `json:"active"`
 	Ready        int            `json:"ready"`
 	Disconnected int            `json:"disconnected"`
-	ByStatus     map[string]int `json:"byStatus,omitempty"`
-	MemoryUsage  MemoryUsage    `json:"memoryUsage"`
+	ByStatus     map[string]int `json:"byStatus"`
+	MemoryUsage  *MemoryUsage   `json:"memoryUsage,omitempty"`
 }
 
 // SessionConfig is a session's effective runtime configuration. A nil MaxReconnectAttempts means
-// unlimited — not unset.
+// unlimited — not unset; a nil LinkPreview means the engine's own default. AutoRejectCalls works on
+// Baileys only: whatsapp-web.js stores the flag but cannot reject a call, so calls keep ringing there.
 type SessionConfig struct {
-	AutoRejectCalls      bool `json:"autoRejectCalls"`
-	MaxReconnectAttempts *int `json:"maxReconnectAttempts"`
-	ReconnectBaseDelay   int  `json:"reconnectBaseDelay"`
+	AutoRejectCalls      bool  `json:"autoRejectCalls"`
+	MaxReconnectAttempts *int  `json:"maxReconnectAttempts"`
+	ReconnectBaseDelay   int   `json:"reconnectBaseDelay"`
+	LinkPreview          *bool `json:"linkPreview"`
 }
 
 // UpdateSessionConfigRequest is a partial update of a session's config, merged in any session state
-// with no restart, re-link or QR scan. AutoRejectCalls applies immediately; MaxReconnectAttempts and
-// ReconnectBaseDelay apply on the next start.
+// with no restart, re-link or QR scan. AutoRejectCalls applies immediately, on Baileys only (whatsapp-web.js
+// stores the flag but cannot reject a call). LinkPreview applies immediately too, on both engines: it is
+// the default preview of a send-text or send-template that sets neither linkPreview nor customLinkPreview.
+// MaxReconnectAttempts and ReconnectBaseDelay apply on the next start.
 //
 // The route needs THREE states per field, not two: a key that is absent leaves the value unchanged, a
 // key sent as explicit null clears it back to the default, and a value sets it. A `*int` with
@@ -282,6 +295,7 @@ type UpdateSessionConfigRequest struct {
 	AutoRejectCalls      *bool `json:"-"`
 	MaxReconnectAttempts *int  `json:"-"`
 	ReconnectBaseDelay   *int  `json:"-"`
+	LinkPreview          *bool `json:"-"`
 
 	// ClearMaxReconnectAttempts sends an explicit null, restoring unlimited reconnect attempts. It
 	// wins over MaxReconnectAttempts if both are set.
@@ -290,6 +304,8 @@ type UpdateSessionConfigRequest struct {
 	ClearAutoRejectCalls bool `json:"-"`
 	// ClearReconnectBaseDelay sends an explicit null, restoring the server default.
 	ClearReconnectBaseDelay bool `json:"-"`
+	// ClearLinkPreview sends an explicit null, restoring the engine's own default.
+	ClearLinkPreview bool `json:"-"`
 }
 
 // MarshalJSON emits only the fields the caller actually addressed: a Clear* flag becomes an explicit
@@ -311,6 +327,11 @@ func (r UpdateSessionConfigRequest) MarshalJSON() ([]byte, error) {
 		out["reconnectBaseDelay"] = nil
 	} else if r.ReconnectBaseDelay != nil {
 		out["reconnectBaseDelay"] = *r.ReconnectBaseDelay
+	}
+	if r.ClearLinkPreview {
+		out["linkPreview"] = nil
+	} else if r.LinkPreview != nil {
+		out["linkPreview"] = *r.LinkPreview
 	}
 	return json.Marshal(out)
 }

@@ -1,4 +1,6 @@
 import {
+  Fragment,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -6,33 +8,69 @@ import {
   useState,
   type FocusEvent,
   type KeyboardEvent,
+  type ReactElement,
   type SyntheticEvent,
   type RefObject,
 } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertCircle, ChevronDown, CornerUpLeft, Loader2, MessageSquare, Smile, Trash2 } from 'lucide-react';
+import {
+  AlertCircle,
+  Check,
+  CheckCheck,
+  ChevronDown,
+  Clock,
+  CornerUpLeft,
+  Download,
+  FileText,
+  Loader2,
+  MessageSquare,
+  Smile,
+  Trash2,
+  User,
+} from 'lucide-react';
 import { useRole } from '../../hooks/useRole';
 import { sessionApi, type Chat } from '../../services/api';
 import {
   buildMentionNameMap,
   getMediaSrc,
+  inlineMediaToBlob,
+  isRenderableMessage,
   resolveMentions,
   senderKey,
+  timestampOf,
   type ChatMessageView,
+  type MessageMedia,
 } from '../../utils/chatMessages';
+import { contactCards, contactSnippet, isVCardBody } from '../../utils/vcard';
+import { formatFileSize } from '../../utils/bulkMedia';
 import { shouldFetchOlderMessages } from '../../utils/scrollDecision';
 import { keepsSameKey } from '../../utils/authLifecycle';
+import { retryThrottled } from '../../utils/fetchAllPages';
+import { scheduleObjectUrlRevoke } from '../../utils/objectUrl';
 import ArchivedMediaPreview, { type ArchivedMediaKind } from './ArchivedMediaPreview';
 import MessageBody from './MessageBody';
 
 // Stable per-sender colour for group message labels, like WhatsApp gives each participant a colour.
-// Hashed from the sender's name so the same person keeps the same colour across a session. The palette
-// is tuned to stay legible on both the light and dark incoming-bubble backgrounds.
-const SENDER_COLORS = ['#d1416f', '#7c5cff', '#0a86c4', '#1a8f5c', '#c26a00', '#c0392b', '#0e7c86', '#8e44ad'];
+// Hashed from the sender's name so the same person keeps the same colour across a session. The colours
+// are the chat palette's --chat-sender-1 to -8 (Chats.css), which each theme sets to clear 4.5:1 on its
+// incoming bubble: no one hex does that on both the light and the dark bubble.
+const SENDER_COLORS = 8;
 const senderColor = (name: string): string => {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
-  return SENDER_COLORS[Math.abs(hash) % SENDER_COLORS.length];
+  return `var(--chat-sender-${(Math.abs(hash) % SENDER_COLORS) + 1})`;
+};
+
+const sameDay = (a: number, b: number): boolean =>
+  new Date(a * 1000).toDateString() === new Date(b * 1000).toDateString();
+
+// Delivered and read share a glyph and differ in colour only; the span around it spells the status out.
+const STATUS_ICONS: Record<NonNullable<ChatMessageView['status']>, ReactElement> = {
+  pending: <Clock size={14} />,
+  sent: <Check size={16} />,
+  delivered: <CheckCheck size={16} />,
+  read: <CheckCheck size={16} />,
+  failed: <AlertCircle size={14} />,
 };
 
 interface ChatThreadProps {
@@ -46,6 +84,10 @@ interface ChatThreadProps {
   /** Whether an older page of this chat's history exists. */
   hasMoreMessages: boolean;
   loadingOlderMessages: boolean;
+  /** Whether the failure shown is that of a refresh of a thread that has pages: the strip retries it when pressed. */
+  refreshFailed?: boolean;
+  /** Whether a request for the thread is running, which a pressed retry of a refresh is. */
+  refreshing?: boolean;
   onLoadOlderMessages: () => void;
   onMediaLoad: (event?: { currentTarget: Element | null }) => void;
   /** Seeds each media element's pre-decode height; see useChatScrollPosition.measureMedia. */
@@ -83,6 +125,8 @@ function ChatThread({
   messagesContainerRef,
   hasMoreMessages,
   loadingOlderMessages,
+  refreshFailed = false,
+  refreshing = false,
   onLoadOlderMessages,
   onMediaLoad,
   measureMedia,
@@ -96,6 +140,7 @@ function ChatThread({
   // Reply, react, delete and prompt taps all need an operator key, like the composer; a viewer
   // would only reach a 403.
   const { canWrite } = useRole();
+  const visibleMessages = useMemo(() => messages.filter(isRenderableMessage), [messages]);
 
   // The message actions sit behind hover, so a keyboard user reaches them through the bubble that carries
   // them: the bubbles are one tab stop (the focused message, else the newest), the arrow keys move between
@@ -107,10 +152,14 @@ function ChatThread({
   );
   const [focusedMessageId, setFocusedMessageId] = useState<string | null>(null);
   const tabStopId = useMemo(() => {
-    if (focusedMessageId && messages.some(m => m.id === focusedMessageId && hasActions(m))) return focusedMessageId;
-    for (let i = messages.length - 1; i >= 0; i--) if (hasActions(messages[i])) return messages[i].id;
+    if (focusedMessageId && visibleMessages.some(m => m.id === focusedMessageId && hasActions(m))) {
+      return focusedMessageId;
+    }
+    for (let i = visibleMessages.length - 1; i >= 0; i--) {
+      if (hasActions(visibleMessages[i])) return visibleMessages[i].id;
+    }
     return null;
-  }, [messages, focusedMessageId, hasActions]);
+  }, [visibleMessages, focusedMessageId, hasActions]);
   const onBubbleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     // Only the bubble itself: a key pressed on an action button, the reaction popover or a link keeps
     // its own meaning.
@@ -211,7 +260,7 @@ function ChatThread({
               )
               .find(Boolean));
     target?.focus({ preventScroll: true });
-  }, [messages, hasActions, messagesContainerRef]);
+  }, [visibleMessages, hasActions, messagesContainerRef]);
 
   // "@<digits>" in a message body only ever means something once resolved against a participant
   // this thread has already seen post (see buildMentionNameMap) — recomputed only when the message
@@ -240,15 +289,25 @@ function ChatThread({
   const [buttonClick, setButtonClick] = useState<
     Record<string, { loadingId?: string; done?: boolean; selectedId?: string }>
   >({});
+
   const downloadMedia = useCallback(
     async (message: ChatMessageView) => {
       const messageId = message.waMessageId;
       if (!sessionId || !messageId) return;
       setMediaFetch(prev => ({ ...prev, [messageId]: 'loading' }));
       let objectUrl: string | null = null;
+      let handedOff = false;
       const sameKey = keepsSameKey();
       try {
-        const blob = await sessionApi.getMessageMediaBlob(sessionId, activeChat.id, messageId);
+        // A 429 and the 503 of a full S3 download pool are refusals to try again, as the archived previews do.
+        const blob = await retryThrottled(
+          () => {
+            if (!sameKey()) throw new DOMException('Aborted', 'AbortError');
+            return sessionApi.getMessageMediaBlob(sessionId, activeChat.id, messageId);
+          },
+          1000,
+          [429, 503],
+        );
         if (!sameKey()) return;
         objectUrl = URL.createObjectURL(blob);
         const link = document.createElement('a');
@@ -257,21 +316,42 @@ function ChatThread({
         // downloads from the same thread apart.
         link.download = message.metadata?.media?.filename || messageId;
         link.click();
+        handedOff = true;
+        scheduleObjectUrlRevoke(objectUrl);
         setMediaFetch(prev => {
           const next = { ...prev };
           delete next[messageId];
           return next;
         });
       } catch {
+        if (!sameKey()) return;
         // 404 covers every "there are no bytes" case the route documents (URL-based send, media
         // download disabled, over the inbound cap). Say so on the bubble rather than failing mutely.
         setMediaFetch(prev => ({ ...prev, [messageId]: 'failed' }));
       } finally {
-        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        if (objectUrl && !handedOff) URL.revokeObjectURL(objectUrl);
       }
     },
     [sessionId, activeChat.id],
   );
+
+  const downloadInlineDocument = useCallback((media: MessageMedia, fallbackName: string) => {
+    const blob = inlineMediaToBlob(media);
+    if (!blob) return;
+    let objectUrl: string | null = null;
+    let handedOff = false;
+    try {
+      objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = media.filename || fallbackName;
+      link.click();
+      handedOff = true;
+      scheduleObjectUrlRevoke(objectUrl);
+    } finally {
+      if (objectUrl && !handedOff) URL.revokeObjectURL(objectUrl);
+    }
+  }, []);
 
   const handleClickButton = useCallback(
     async (message: ChatMessageView, button: { id: string; text: string }) => {
@@ -311,7 +391,7 @@ function ChatThread({
   // at 0 the thread is moved down by one pixel, so the next move up is a scroll. The write raises a scroll
   // event of its own, which is not the reader asking again: its position is kept here for the listener below
   // to skip. Once per failure, and never when the reader is anywhere else.
-  const olderFailed = !loadingMessages && !loadingOlderMessages && messagesError && messages.length > 0;
+  const olderFailed = !loadingMessages && !loadingOlderMessages && messagesError && visibleMessages.length > 0;
   const nudgedTopRef = useRef<number | null>(null);
   useEffect(() => {
     const el = messagesContainerRef.current;
@@ -319,33 +399,52 @@ function ChatThread({
     el.scrollTop = 1;
     nudgedTopRef.current = el.scrollTop > 0 ? el.scrollTop : null;
   }, [olderFailed, hasMoreMessages, messagesContainerRef]);
+  const olderScrollRef = useRef({ hasMoreMessages, loadingOlderMessages, onLoadOlderMessages });
+  useEffect(() => {
+    olderScrollRef.current = { hasMoreMessages, loadingOlderMessages, onLoadOlderMessages };
+  });
   useEffect(() => {
     const el = messagesContainerRef.current;
     if (!el) return undefined;
-    const onScroll = (event?: Event) => {
+    const onScroll = () => {
       // 120px gap = a couple of message bubbles before counting as "scrolled up".
       setShowJumpToBottom(el.scrollHeight - el.scrollTop - el.clientHeight > 120);
       const nudged = nudgedTopRef.current;
-      if (event && nudged !== null) {
+      if (nudged !== null) {
         nudgedTopRef.current = null;
         if (el.scrollTop === nudged) return;
       }
+      const {
+        hasMoreMessages: hasMore,
+        loadingOlderMessages: isFetching,
+        onLoadOlderMessages: loadOlder,
+      } = olderScrollRef.current;
       const geometry = { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
       if (
         shouldFetchOlderMessages({
-          isUserScroll: Boolean(event),
+          isUserScroll: true,
           geometry,
-          hasMore: hasMoreMessages,
-          isFetching: loadingOlderMessages,
+          hasMore,
+          isFetching,
         })
       ) {
-        onLoadOlderMessages();
+        loadOlder();
       }
     };
-    onScroll(); // sync initial position (e.g. saved restore landed above the bottom)
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  });
+  }, [messagesContainerRef]);
+
+  // Sync the jump button when the active chat changes, finishes loading, or changes length
+  // (e.g. saved scroll restore landed above the bottom without firing a user scroll event).
+  useEffect(() => {
+    const el = messagesContainerRef.current;
+    if (!el || loadingMessages) {
+      setShowJumpToBottom(false);
+      return;
+    }
+    setShowJumpToBottom(el.scrollHeight - el.scrollTop - el.clientHeight > 120);
+  }, [activeChat?.id, loadingMessages, visibleMessages.length, messagesContainerRef]);
 
   // The reaction popover is centred on its icon and opens above it. The icon of a short bubble is a few pixels
   // from the pane's side edge, and a message at the top of the pane has no room above it, so the emoji
@@ -377,19 +476,32 @@ function ChatThread({
     el.scrollTo({ top: el.scrollHeight });
   }, [messagesContainerRef]);
 
-  // Reset the jump button whenever the active chat changes: the new chat's content is restored by
-  // useChatScrollPosition and our listener will resync on its first scroll tick. The prompt-answer
-  // map goes with it: its ids belong to the chat being left, and holding them would disable a
-  // button in the chat being entered if the two ever shared a message id.
+  // Reset the prompt-answer map whenever the active chat changes: its ids belong to the chat being
+  // left, and holding them would disable a button in the chat being entered if the two ever shared a message id.
   useEffect(() => {
-    setShowJumpToBottom(false);
     setButtonClick({});
   }, [activeChat?.id]);
 
-  // Helper formats
+  // Helper formats. Times and dates follow the browser's locale, as on the other pages.
   const formatTime = (timestamp?: number) => {
     if (!timestamp) return '';
     return new Date(timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
+  // The pill above the first message of each day: Today, Yesterday, else a short date (with the year
+  // once it is not this year's).
+  const formatDayLabel = (timestamp: number) => {
+    const date = new Date(timestamp * 1000);
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (date.toDateString() === new Date().toDateString()) return t('chats.today');
+    if (date.toDateString() === yesterday.toDateString()) return t('chats.yesterday');
+    return date.toLocaleDateString([], {
+      weekday: 'short',
+      day: '2-digit',
+      month: 'short',
+      ...(date.getFullYear() !== new Date().getFullYear() ? { year: 'numeric' } : {}),
+    });
   };
 
   return (
@@ -447,49 +559,70 @@ function ChatThread({
           messages already loaded, which must not fall through to the full-screen error below: that would
           replace the loaded thread with a placeholder, collapsing the scroll container so the failed
           page can never be retried by scrolling. */}
-      {!loadingMessages && (loadingOlderMessages || (messagesError && messages.length > 0)) && (
-        <div className={loadingOlderMessages ? 'messages-loading-older' : 'messages-loading-older failed'}>
-          {loadingOlderMessages ? (
-            <>
-              <Loader2 className="animate-spin" size={18} />
-              <span>{t('chats.loadingOlderMessages')}</span>
-            </>
-          ) : (
-            <>
-              <AlertCircle size={18} />
-              {/* The whole sentence, or only the retry instruction when the thread is too narrow to fit
-                  the whole one in two lines: Chats.css shows one of them, and hides the other from
-                  assistive technology as well. */}
-              <span className="older-failure-full">{t('chats.loadOlderMessagesError')}</span>
-              <span className="older-failure-hint">{t('chats.loadOlderMessagesRetryHint')}</span>
-            </>
-          )}
-        </div>
-      )}
+      {!loadingMessages &&
+        (loadingOlderMessages || (messagesError && visibleMessages.length > 0)) &&
+        // A refresh that failed is not retried by scrolling up (a thread with no older page has no such trigger, and
+        // one too short to scroll cannot raise it), so its strip is the retry.
+        (refreshFailed && !loadingOlderMessages ? (
+          <button
+            type="button"
+            className="messages-loading-older failed retry"
+            disabled={refreshing}
+            aria-busy={refreshing}
+            onClick={onLoadOlderMessages}
+          >
+            {refreshing ? <Loader2 className="animate-spin" size={18} /> : <AlertCircle size={18} />}
+            <span className="older-failure-full">{t('chats.refreshMessagesError')}</span>
+            <span className="older-failure-hint">{t('chats.refreshMessagesRetryHint')}</span>
+          </button>
+        ) : (
+          <div className={loadingOlderMessages ? 'messages-loading-older' : 'messages-loading-older failed'}>
+            {loadingOlderMessages ? (
+              <>
+                <Loader2 className="animate-spin" size={18} />
+                <span>{t('chats.loadingOlderMessages')}</span>
+              </>
+            ) : (
+              <>
+                <AlertCircle size={18} />
+                {/* The whole sentence, or only the retry instruction when the thread is too narrow to fit
+                    the whole one in two lines: Chats.css shows one of them, and hides the other from
+                    assistive technology as well. */}
+                <span className="older-failure-full">{t('chats.loadOlderMessagesError')}</span>
+                <span className="older-failure-hint">{t('chats.loadOlderMessagesRetryHint')}</span>
+              </>
+            )}
+          </div>
+        ))}
       {loadingMessages ? (
         <div className="messages-loading">
           <Loader2 className="animate-spin" size={32} />
           <span>{t('chats.loadingMessages')}</span>
         </div>
-      ) : messagesError && messages.length === 0 ? (
+      ) : messagesError && visibleMessages.length === 0 ? (
         <div className="messages-empty">
           <MessageSquare size={32} />
           <span>{t('chats.loadMessagesError')}</span>
         </div>
-      ) : messages.length === 0 ? (
+      ) : visibleMessages.length === 0 ? (
         <div className="messages-empty">
           <MessageSquare size={32} />
           <span>{t('chats.noMessagesInChat')}</span>
         </div>
       ) : (
-        messages.map((msg, index) => {
+        visibleMessages.map((msg, index) => {
           const isMe = msg.direction === 'outgoing';
-          const formattedTime = formatTime(msg.timestamp || Math.floor(new Date(msg.createdAt).getTime() / 1000));
+          const ts = timestampOf(msg);
+          const formattedTime = formatTime(ts);
 
           // Label who posted, WhatsApp-style: only in groups, only on incoming messages,
           // and only on the first of a consecutive run from the same sender (so a burst
           // from one person isn't repeated on every bubble).
-          const prev = messages[index - 1];
+          const prev = visibleMessages[index - 1];
+          // A day pill heads the first message of each day. The first bubble of a run from one side
+          // carries the tail and the wider gap, like WhatsApp; a new day starts a new run.
+          const startsNewDay = !prev || !sameDay(timestampOf(prev), ts);
+          const startsRun = startsNewDay || prev.direction !== msg.direction;
           const showSender = Boolean(
             activeChat?.isGroup &&
             !isMe &&
@@ -534,29 +667,103 @@ function ChatThread({
                 </div>
               );
             }
+            if (msg.type === 'contact') {
+              // The body is the raw vCard, or `📇 <name>` for a contact the gateway sent; paint a card either way.
+              const cards = contactCards(msg.body);
+              const label = t('chats.media.contact');
+              return (
+                <div className="message-contact" role="group" aria-label={label}>
+                  {(cards.length > 0 ? cards : [{ name: '', phone: '', waid: '' }]).map((card, index) => (
+                    <div
+                      key={`${card.waid || card.phone || card.name || 'contact'}:${index}`}
+                      className="message-contact-card"
+                    >
+                      <span className="message-contact-avatar" aria-hidden="true">
+                        <User size={22} />
+                      </span>
+                      <span className="message-contact-fields">
+                        <span className="message-contact-name" title={card.name || label}>
+                          {card.name || label}
+                        </span>
+                        {card.phone ? (
+                          <span className="message-contact-phone">
+                            <bdi dir="ltr">{card.phone}</bdi>
+                          </span>
+                        ) : null}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              );
+            }
             if (!mediaInfo) return null;
+            const isPdf =
+              mediaInfo.mimetype === 'application/pdf' ||
+              Boolean(mediaInfo.filename && /\.pdf$/i.test(mediaInfo.filename));
+            // The bytes of a document the list left out are fetched when its card is pressed.
+            const fetchState = mediaInfo.omitted && msg.waMessageId ? mediaFetch[msg.waMessageId] : undefined;
+            // What a document is called and how large it is; a click on the card downloads it. The card stays whole
+            // while it fetches and after a fetch that found nothing: a spinner takes the place of the download mark,
+            // the failure the place of the size.
+            const documentName = mediaInfo.filename || t('chats.downloadDocument');
+            const documentMeta = [mediaInfo.sizeBytes ? formatFileSize(mediaInfo.sizeBytes) : '', isPdf ? 'PDF' : '']
+              .filter(Boolean)
+              .join(' \u2022 ');
+            const documentCard = (
+              <span className="chat-document-card-content">
+                <span className={`chat-document-icon-box ${isPdf ? 'pdf' : ''}`}>
+                  {isPdf ? (
+                    <span className="chat-document-pdf-badge">
+                      <FileText size={18} />
+                      <span className="chat-document-pdf-tag" aria-hidden="true">
+                        PDF
+                      </span>
+                    </span>
+                  ) : (
+                    <FileText size={18} />
+                  )}
+                </span>
+                <span className="chat-document-info">
+                  <span className="chat-document-title" title={documentName}>
+                    {documentName}
+                  </span>
+                  {fetchState === 'failed' ? (
+                    <span className="chat-document-meta">{t('chats.status.mediaUnavailable')}</span>
+                  ) : (
+                    documentMeta && <span className="chat-document-meta">{documentMeta}</span>
+                  )}
+                </span>
+                <span className="chat-document-action">
+                  {fetchState === 'loading' ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
+                </span>
+              </span>
+            );
             if (mediaInfo.omitted) {
               // Not a plain label: the bytes exist behind the per-message media route, so this is the
               // only handle the viewer has on them.
-              const fetchState = msg.waMessageId ? mediaFetch[msg.waMessageId] : undefined;
               const downloadButton = (
                 <button
                   type="button"
-                  className="message-media-omitted"
+                  className={`message-media-omitted ${msg.type === 'document' ? 'chat-document-card' : ''}`}
                   onClick={() => void downloadMedia(msg)}
                   disabled={!sessionId || !msg.waMessageId || fetchState === 'loading'}
                 >
-                  {fetchState === 'loading' ? (
+                  {msg.type === 'document' ? (
+                    documentCard
+                  ) : fetchState === 'loading' ? (
                     <Loader2 size={14} className="animate-spin" />
+                  ) : fetchState === 'failed' ? (
+                    <>📎 {t('chats.status.mediaUnavailable')}</>
                   ) : (
-                    <>📎 {t(fetchState === 'failed' ? 'chats.status.mediaUnavailable' : 'chats.media.omitted')}</>
+                    <>📎 {t('chats.media.omitted')}</>
                   )}
                 </button>
               );
               // `archived` marks a copy MESSAGE_INLINE_MEDIA=archive moved off the row once the archive
               // store held it: the bubble rendered inline before, so it previews inline still, fetched
               // lazily from the same route. Documents keep the button (there is nothing to preview),
-              // and so does a plain over-budget marker, see ArchivedMediaPreview for why.
+              // and so does a plain over-budget marker, see ArchivedMediaPreview for why. So does a marker
+              // with no `mediaPath`: retention deleted the archived copy, and the fetch would only 404.
               const previewKind: ArchivedMediaKind | null =
                 msg.type === 'image' || msg.type === 'sticker'
                   ? 'image'
@@ -566,7 +773,7 @@ function ChatThread({
                       ? 'audio'
                       : null;
               const waMessageId = msg.waMessageId;
-              if (mediaInfo.archived && previewKind && sessionId && waMessageId) {
+              if (mediaInfo.archived && msg.mediaPath && previewKind && sessionId && waMessageId) {
                 return (
                   <ArchivedMediaPreview
                     key={`${sessionId}:${activeChat.id}:${waMessageId}`}
@@ -590,6 +797,8 @@ function ChatThread({
             switch (msg.type) {
               case 'image':
               case 'sticker':
+                // A control of its own, as an archived preview is (ArchivedMediaPreview): the bubble's keys only move
+                // between messages, so without this the viewer opens for a pointer alone.
                 return (
                   <div className="message-media-image">
                     <img
@@ -598,7 +807,16 @@ function ChatThread({
                       className="chat-image-media"
                       ref={measureMedia}
                       onLoad={onMediaLoad}
+                      role="button"
+                      aria-haspopup="dialog"
+                      tabIndex={0}
                       onClick={() => onOpenImage(msg.id)}
+                      onKeyDown={event => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          onOpenImage(msg.id);
+                        }
+                      }}
                     />
                   </div>
                 );
@@ -623,18 +841,32 @@ function ChatThread({
                 );
               case 'document':
               default:
+                if (/^https?:\/\//i.test(mediaSrc)) {
+                  return (
+                    <div className="message-media-document">
+                      {/* A document sent by URL links off-site, where browsers ignore `download`, so a plain
+                          click would navigate the dashboard away; open it in a new tab instead. */}
+                      <a
+                        href={mediaSrc}
+                        download={mediaInfo.filename || 'document'}
+                        className="chat-document-media chat-document-card"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {documentCard}
+                      </a>
+                    </div>
+                  );
+                }
                 return (
                   <div className="message-media-document">
-                    {/* A document sent by URL links off-site, where browsers ignore `download`, so a plain
-                        click would navigate the dashboard away; open it in a new tab instead. */}
-                    <a
-                      href={mediaSrc}
-                      download={mediaInfo.filename || 'document'}
-                      className="chat-document-media"
-                      {...(/^https?:\/\//i.test(mediaSrc) ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+                    <button
+                      type="button"
+                      className="chat-document-media chat-document-card"
+                      onClick={() => downloadInlineDocument(mediaInfo, 'document')}
                     >
-                      📎 {mediaInfo.filename || t('chats.downloadDocument')}
-                    </a>
+                      {documentCard}
+                    </button>
                   </div>
                 );
             }
@@ -643,186 +875,208 @@ function ChatThread({
           const reactions = msg.metadata?.reactions || {};
           const hasReactions = Object.keys(reactions).length > 0;
           const isRevoked = msg.type === 'revoked';
+          const isEdited = !isRevoked && Boolean(msg.metadata?.edited);
           const isMasked = msg.type === 'masked';
 
           return (
-            <div
-              key={msg.id}
-              className={`message-bubble-wrapper ${isMe ? 'outgoing' : 'incoming'}`}
-              data-wa-message-id={msg.waMessageId}
-              data-scroll-anchor=""
-            >
+            <Fragment key={msg.id}>
+              {/* A sibling of the bubbles, not an anchor: the scroll hook holds the reader by messages only. */}
+              {startsNewDay && (
+                <div className="day-separator">
+                  <span>{formatDayLabel(ts)}</span>
+                </div>
+              )}
               <div
-                className="message-bubble-container"
-                {...(hasActions(msg)
-                  ? {
-                      'data-roving-message': '',
-                      tabIndex: tabStopId === msg.id ? 0 : -1,
-                      // Only focus on the bubble itself: a link or a button inside it is a stop of its own and
-                      // must not turn the bubble into the thread's tab stop as well.
-                      onFocus: (event: FocusEvent<HTMLDivElement>) => {
-                        if (event.target === event.currentTarget) setFocusedMessageId(msg.id);
-                      },
-                      onKeyDown: onBubbleKeyDown,
-                    }
-                  : {})}
+                className={`message-bubble-wrapper ${isMe ? 'outgoing' : 'incoming'}${startsRun ? ' run-start' : ''}${
+                  hasReactions ? ' has-reactions' : ''
+                }`}
+                data-wa-message-id={msg.waMessageId}
+                data-scroll-anchor={msg.id}
               >
                 <div
-                  className={`message-bubble ${isMe ? 'outgoing' : 'incoming'} ${msg.status} ${
-                    isMediaMessage ? 'media-type' : ''
-                  } ${isRevoked ? 'revoked-type' : ''}`}
+                  className="message-bubble-container"
+                  {...(hasActions(msg)
+                    ? {
+                        'data-roving-message': '',
+                        tabIndex: tabStopId === msg.id ? 0 : -1,
+                        // Only focus on the bubble itself: a link or a button inside it is a stop of its own and
+                        // must not turn the bubble into the thread's tab stop as well.
+                        onFocus: (event: FocusEvent<HTMLDivElement>) => {
+                          if (event.target === event.currentTarget) setFocusedMessageId(msg.id);
+                        },
+                        onKeyDown: onBubbleKeyDown,
+                      }
+                    : {})}
                 >
-                  {/* Group sender label (WhatsApp-style: coloured name atop the bubble) */}
-                  {/* Group sender label (WhatsApp-style: coloured name atop the bubble).
+                  <div
+                    className={`message-bubble ${isMe ? 'outgoing' : 'incoming'}${msg.status ? ` ${msg.status}` : ''} ${
+                      isMediaMessage ? 'media-type' : ''
+                    } ${isRevoked ? 'revoked-type' : ''}`}
+                  >
+                    {/* Group sender label (WhatsApp-style: coloured name atop the bubble) */}
+                    {/* Group sender label (WhatsApp-style: coloured name atop the bubble).
                       Colour keys on the stable sender id, so same-named participants
                       still get distinct colours; the label shows the human name. */}
-                  {showSender && (
-                    <div className="message-sender" style={{ color: senderColor(senderKey(msg)!) }}>
-                      {msg.chatName}
-                    </div>
-                  )}
+                    {showSender && (
+                      <div className="message-sender" style={{ color: senderColor(senderKey(msg)!) }}>
+                        {msg.chatName}
+                      </div>
+                    )}
 
-                  {/* Quoted message display */}
-                  {msg.metadata?.quotedMessage && (
-                    <div className="message-quote-box">
-                      <MessageBody
-                        text={resolveMentions(msg.metadata.quotedMessage.body, mentionNames)}
-                        className="quote-body"
-                      />
-                    </div>
-                  )}
+                    {/* Quoted message display */}
+                    {msg.metadata?.quotedMessage && (
+                      <div className="message-quote-box">
+                        <MessageBody
+                          text={resolveMentions(
+                            isVCardBody(msg.metadata.quotedMessage.body)
+                              ? contactSnippet(msg.metadata.quotedMessage.body, t('chats.media.contact'))
+                              : msg.metadata.quotedMessage.body,
+                            mentionNames,
+                          )}
+                          className="quote-body"
+                        />
+                      </div>
+                    )}
 
-                  {renderMedia()}
+                    {renderMedia()}
 
-                  {isRevoked ? (
-                    <div className="message-text">{t('chats.messageDeleted')}</div>
-                  ) : isMasked ? (
-                    <div className="message-text message-masked">{t('chats.messageMasked')}</div>
-                  ) : (
-                    displayBody &&
-                    (!mediaInfo || displayBody !== mediaInfo.filename) &&
-                    msg.type !== 'location' &&
-                    msg.type !== 'call' && (
-                      <MessageBody text={resolveMentions(displayBody, mentionNames)} className="message-text" />
-                    )
-                  )}
+                    {/* Text flows inline and ends in an invisible spacer as wide as the time and ticks, so the
+                      meta tucks into the last line when it fits and wraps below it only when it does not. */}
+                    <div className="message-content">
+                      {isRevoked ? (
+                        <div className="message-text">{t('chats.messageDeleted')}</div>
+                      ) : isMasked ? (
+                        <div className="message-text message-masked">{t('chats.messageMasked')}</div>
+                      ) : (
+                        displayBody &&
+                        (!mediaInfo || displayBody !== mediaInfo.filename) &&
+                        msg.type !== 'location' &&
+                        msg.type !== 'call' &&
+                        msg.type !== 'contact' && (
+                          <MessageBody text={resolveMentions(displayBody, mentionNames)} className="message-text" />
+                        )
+                      )}
 
-                  {!isRevoked && msg.type === 'poll' && (msg.metadata?.poll?.options?.length ?? 0) > 0 && (
-                    <ul className="message-text" aria-label={t('messageTester.pollOptions')}>
-                      {msg.metadata!.poll!.options.map((option, index) => (
-                        <li key={index}>
-                          <bdi>{option}</bdi>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
+                      {!isRevoked && msg.type === 'poll' && (msg.metadata?.poll?.options?.length ?? 0) > 0 && (
+                        <ul className="message-text message-poll-options" aria-label={t('messageTester.pollOptions')}>
+                          {msg.metadata!.poll!.options.map((option, index) => (
+                            <li key={index}>
+                              <bdi>{option}</bdi>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
 
-                  {/* Inbound business prompt choices; a tap calls POST .../messages/click-button. */}
-                  {!isMe && !isRevoked && !isMasked && (msg.metadata?.buttons?.length ?? 0) > 0 && (
-                    <div className="message-prompt-buttons" role="group" aria-label={t('chats.promptButtons')}>
-                      {msg.metadata!.buttons!.map((btn, idx) => {
-                        const clickKey = msg.waMessageId || msg.id;
-                        const state = buttonClick[clickKey];
-                        const loading = state?.loadingId === btn.id;
-                        const disabled = Boolean(state?.loadingId || state?.done);
-                        return (
-                          <button
-                            key={`${idx}:${btn.id}`}
-                            type="button"
-                            className={`message-prompt-button${state?.selectedId === btn.id ? ' selected' : ''}${state?.done ? ' answered' : ''}`}
-                            disabled={disabled || !canWrite}
-                            onClick={() => void handleClickButton(msg, btn)}
-                          >
-                            {loading ? <Loader2 size={14} className="animate-spin" /> : btn.text}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
+                      {/* Inbound business prompt choices; a tap calls POST .../messages/click-button. */}
+                      {!isMe && !isRevoked && !isMasked && (msg.metadata?.buttons?.length ?? 0) > 0 && (
+                        <div className="message-prompt-buttons" role="group" aria-label={t('chats.promptButtons')}>
+                          {msg.metadata!.buttons!.map((btn, idx) => {
+                            const clickKey = msg.waMessageId || msg.id;
+                            const state = buttonClick[clickKey];
+                            const loading = state?.loadingId === btn.id;
+                            const disabled = Boolean(state?.loadingId || state?.done);
+                            return (
+                              <button
+                                key={`${idx}:${btn.id}`}
+                                type="button"
+                                className={`message-prompt-button${state?.selectedId === btn.id ? ' selected' : ''}${state?.done ? ' answered' : ''}`}
+                                disabled={disabled || !canWrite}
+                                onClick={() => void handleClickButton(msg, btn)}
+                              >
+                                {loading ? <Loader2 size={14} className="animate-spin" /> : btn.text}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
 
-                  <div className="message-meta">
-                    <span className="message-time">{formattedTime}</span>
-                    {/* delivered and read render the SAME glyph and differ only in colour, which
-                        carries the meaning nowhere a screen reader or a colour-blind reader can
-                        reach it. The status is spelled out for both. */}
-                    {isMe && (
-                      <span
-                        className={`message-status-icon ${msg.status}`}
-                        role="img"
-                        aria-label={t(`chats.messageStatus.${msg.status}`)}
-                        title={t(`chats.messageStatus.${msg.status}`)}
-                      >
-                        {msg.status === 'pending' && '🕒'}
-                        {msg.status === 'sent' && '✓'}
-                        {msg.status === 'delivered' && '✓✓'}
-                        {msg.status === 'read' && '✓✓'}
-                        {msg.status === 'failed' && '⚠️'}
+                      {/* Holds the room the time (and an edited label, whose width the language decides) takes
+                          at the end of the last line, so the text never runs under them. */}
+                      <span className={`meta-spacer${isMe && msg.status ? ' with-status' : ''}`} aria-hidden="true">
+                        {isEdited && <span className="meta-spacer-edited">{t('chats.edited')}</span>}
                       </span>
+                      <span className="message-meta">
+                        {isEdited && <span className="message-edited">{t('chats.edited')}</span>}
+                        <span className="message-time">{formattedTime}</span>
+                        {/* delivered and read render the SAME glyph and differ only in colour, which
+                          carries the meaning nowhere a screen reader or a colour-blind reader can
+                          reach it. The status is spelled out for both. */}
+                        {isMe && msg.status && (
+                          <span
+                            className={`message-status-icon ${msg.status}`}
+                            role="img"
+                            aria-label={t(`chats.messageStatus.${msg.status}`)}
+                            title={t(`chats.messageStatus.${msg.status}`)}
+                          >
+                            {STATUS_ICONS[msg.status]}
+                          </span>
+                        )}
+                      </span>
+                    </div>
+
+                    {/* Reactions display */}
+                    {hasReactions && (
+                      <div className="message-reactions-badge">
+                        {Object.values(reactions)
+                          .slice(0, 3)
+                          .map((emoji, idx) => (
+                            <span key={idx} className="reaction-emoji-span">
+                              {emoji}
+                            </span>
+                          ))}
+                        {Object.keys(reactions).length > 1 && (
+                          <span className="reactions-count-span">{Object.keys(reactions).length}</span>
+                        )}
+                      </div>
                     )}
                   </div>
 
-                  {/* Reactions display */}
-                  {hasReactions && (
-                    <div className="message-reactions-badge">
-                      {Object.values(reactions)
-                        .slice(0, 3)
-                        .map((emoji, idx) => (
-                          <span key={idx} className="reaction-emoji-span">
-                            {emoji}
-                          </span>
-                        ))}
-                      {Object.keys(reactions).length > 1 && (
-                        <span className="reactions-count-span">{Object.keys(reactions).length}</span>
+                  {/* Message actions menu (hover, or focus inside the bubble). Every action addresses the message by its WhatsApp
+                    id, so an optimistic bubble still on its local temp_ id (pending, or failed for
+                    good) offers none: the gateway could never resolve it. */}
+                  {canWrite && !isRevoked && Boolean(msg.waMessageId) && (
+                    <div className="message-actions-menu">
+                      <button
+                        type="button"
+                        className="action-btn"
+                        onClick={() => onReply(msg)}
+                        title={t('chats.actions.reply')}
+                      >
+                        <CornerUpLeft size={14} />
+                      </button>
+
+                      <div
+                        className="reaction-trigger-wrapper"
+                        onMouseEnter={fitReactionPopover}
+                        onFocus={fitReactionPopover}
+                      >
+                        <button type="button" className="action-btn reaction-btn" title={t('chats.actions.react')}>
+                          <Smile size={14} />
+                        </button>
+                        <div className="reaction-quick-popover">
+                          {['👍', '❤️', '😂', '😮', '😢', '🙏'].map(emoji => (
+                            <button key={emoji} type="button" onClick={() => onReact(msg, emoji)}>
+                              {emoji}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {isMe && msg.status !== 'pending' && (
+                        <button
+                          type="button"
+                          className="action-btn delete-btn"
+                          onClick={() => onDelete(msg)}
+                          title={t('chats.actions.delete')}
+                        >
+                          <Trash2 size={14} />
+                        </button>
                       )}
                     </div>
                   )}
                 </div>
-
-                {/* Message actions menu (hover, or focus inside the bubble). Every action addresses the message by its WhatsApp
-                    id, so an optimistic bubble still on its local temp_ id (pending, or failed for
-                    good) offers none: the gateway could never resolve it. */}
-                {canWrite && !isRevoked && Boolean(msg.waMessageId) && (
-                  <div className="message-actions-menu">
-                    <button
-                      type="button"
-                      className="action-btn"
-                      onClick={() => onReply(msg)}
-                      title={t('chats.actions.reply')}
-                    >
-                      <CornerUpLeft size={14} />
-                    </button>
-
-                    <div
-                      className="reaction-trigger-wrapper"
-                      onMouseEnter={fitReactionPopover}
-                      onFocus={fitReactionPopover}
-                    >
-                      <button type="button" className="action-btn reaction-btn" title={t('chats.actions.react')}>
-                        <Smile size={14} />
-                      </button>
-                      <div className="reaction-quick-popover">
-                        {['👍', '❤️', '😂', '😮', '😢', '🙏'].map(emoji => (
-                          <button key={emoji} type="button" onClick={() => onReact(msg, emoji)}>
-                            {emoji}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {isMe && msg.status !== 'pending' && (
-                      <button
-                        type="button"
-                        className="action-btn delete-btn"
-                        onClick={() => onDelete(msg)}
-                        title={t('chats.actions.delete')}
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    )}
-                  </div>
-                )}
               </div>
-            </div>
+            </Fragment>
           );
         })
       )}
@@ -845,4 +1099,4 @@ function ChatThread({
   );
 }
 
-export default ChatThread;
+export default memo(ChatThread);

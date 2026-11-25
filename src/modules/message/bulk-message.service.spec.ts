@@ -1,3 +1,4 @@
+import { captureSessionWrites, SessionWriteScope } from '../../common/utils/session-write-scope';
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
@@ -8,7 +9,8 @@ import {
 import { LoggerService } from '../../common/services/logger.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { In, IsNull } from 'typeorm';
+import { DataSource, In, IsNull, Repository } from 'typeorm';
+import { failUnfinishedSessionBatches } from './batch-media.util';
 import {
   BulkMessageService,
   resolveFinalBatchStatus,
@@ -23,12 +25,15 @@ import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.in
 import { MessageService } from './message.service';
 import { SendPacingService, SEND_PACING_LIMITED } from './send-pacing.service';
 import { SessionOwnershipService } from '../session/session-ownership.service';
+import { SessionService } from '../session/session.service';
 import { HookManager } from '../../core/hooks';
-import { SsrfBlockedError } from '../../common/security/ssrf-guard';
+import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
 import { EnginePageError } from '../../common/errors/engine-page.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { markNothingSent, markOutcomeUnknown } from '../../common/errors/engine-not-sent.error';
 
 /** Regression lock for the terminal-status decision (cancel-clobber + stopOnError overwrite bugs). */
 describe('resolveFinalBatchStatus', () => {
@@ -70,7 +75,7 @@ describe('resolveMaxConcurrentBatches', () => {
 /** Regression lock: orphaned (restart-interrupted) PROCESSING batches are transitioned. */
 describe('BulkMessageService.onApplicationBootstrap', () => {
   let service: BulkMessageService;
-  let repo: { find: jest.Mock; save: jest.Mock; update: jest.Mock };
+  let repo: { find: jest.Mock; findOne: jest.Mock; save: jest.Mock; update: jest.Mock };
   const failedWrite = (id: string): [object, unknown] => [
     { id, status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) },
     expect.objectContaining({ status: BatchStatus.FAILED }) as unknown,
@@ -79,6 +84,11 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
   beforeEach(async () => {
     repo = {
       find: jest.fn().mockResolvedValue([]),
+      // A reaper scans ids, then reads each row whole: that read answers from the rows the scan was given.
+      findOne: jest.fn(async ({ where }: { where: { id: string } }) => {
+        const scanned = (await repo.find.mock.results.at(-1)?.value) as MessageBatch[] | undefined;
+        return scanned?.find(batch => batch.id === where.id) ?? null;
+      }),
       save: jest.fn().mockImplementation(b => Promise.resolve(b)),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
@@ -118,6 +128,7 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
     await service.onApplicationBootstrap();
 
     expect(repo.find).toHaveBeenCalledWith({
+      select: { id: true, sessionId: true },
       where: { status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) },
     });
     expect(repo.update).toHaveBeenCalledWith(...failedWrite('b1'));
@@ -184,6 +195,7 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
     const reaped = await service.reapProcessingBatches('sess-a', 'session adopted from a lapsed node');
 
     expect(repo.find).toHaveBeenCalledWith({
+      select: { id: true },
       where: { status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]), sessionId: 'sess-a' },
     });
     expect(reaped).toBe(1);
@@ -242,6 +254,7 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
     await onAdoption.mock.calls[0][0]('sess-a');
 
     expect(repo.find).toHaveBeenCalledWith({
+      select: { id: true },
       where: { status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]), sessionId: 'sess-a' },
     });
     expect(repo.update).toHaveBeenCalledWith(...failedWrite('b-dead'));
@@ -319,6 +332,109 @@ describe('BulkMessageService.onApplicationBootstrap', () => {
   });
 });
 
+/**
+ * An unfinished batch still holds its media payloads (they are dropped on its terminal write), so a reaper
+ * that reads every unfinished row at once holds all of them together, a live peer's included: after a crash
+ * mid-run that can be more than the restart has room for.
+ */
+describe('reaping unfinished batches', () => {
+  const payload = 'QUJD'.repeat(256);
+  let db: DataSource;
+  let repository: Repository<MessageBatch>;
+  /** Per read, the batches it brought in with their stored messages. */
+  let reads: string[][];
+
+  beforeEach(async () => {
+    db = await new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [MessageBatch],
+      synchronize: true,
+    }).initialize();
+    repository = db.getRepository(MessageBatch);
+    reads = [];
+    const record = <T extends MessageBatch | MessageBatch[] | null>(rows: T): T => {
+      reads.push(([rows ?? []].flat() as MessageBatch[]).filter(row => row.messages).map(row => row.batchId));
+      return rows;
+    };
+    const find = repository.find.bind(repository);
+    const findOne = repository.findOne.bind(repository);
+    jest.spyOn(repository, 'find').mockImplementation(async options => record(await find(options)));
+    jest.spyOn(repository, 'findOne').mockImplementation(async options => record(await findOne(options)));
+  });
+
+  afterEach(() => db.destroy());
+
+  const store = (batchId: string, sessionId: string): Promise<MessageBatch> =>
+    repository.save({
+      batchId,
+      sessionId,
+      status: BatchStatus.PROCESSING,
+      messages: [{ chatId: '628111111111@c.us', type: 'image', content: { image: { base64: payload } } }],
+      options: { delayBetweenMessages: 1000, randomizeDelay: false, stopOnError: false },
+      progress: { total: 1, pending: 1, sent: 0, failed: 0, cancelled: 0 },
+      results: [],
+      currentIndex: 0,
+    } as Partial<MessageBatch>);
+
+  /** A process that may claim only `owned` sessions; every other one is held by a live peer. */
+  const reaper = (owned: string[]): BulkMessageService =>
+    new BulkMessageService(
+      repository,
+      new EngineRegistry(),
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        claimable: (ids: string[]) => Promise.resolve(ids.filter(id => owned.includes(id))),
+      } as never,
+    );
+
+  const stateOf = async (batchId: string): Promise<[BatchStatus, boolean]> => {
+    const row = await db.manager.findOneByOrFail(MessageBatch, { batchId });
+    return [row.status, JSON.stringify(row.messages).includes(payload)];
+  };
+
+  it('reads the batches it fails one at a time at boot, and never one a live peer holds', async () => {
+    await store('mine-1', 'my-session');
+    await store('mine-2', 'my-session');
+    await store('peers', 'peer-session');
+
+    await reaper(['my-session']).onApplicationBootstrap();
+
+    expect(reads.flat().sort()).toEqual(['mine-1', 'mine-2']);
+    expect(Math.max(...reads.map(read => read.length))).toBe(1);
+    expect(await stateOf('mine-1')).toEqual([BatchStatus.FAILED, false]);
+    expect(await stateOf('peers')).toEqual([BatchStatus.PROCESSING, true]);
+  });
+
+  it('reads the batches it fails one at a time on a takeover, and never one this process still runs', async () => {
+    const running = await store('running', 's1');
+    await store('dead-1', 's1');
+    await store('dead-2', 's1');
+    const bulk = reaper(['s1']);
+    (bulk as unknown as { processingBatches: Map<string, boolean> }).processingBatches.set(running.id, true);
+
+    expect(await bulk.reapProcessingBatches('s1', 'session taken from a lapsed node')).toBe(2);
+
+    expect(reads.flat().sort()).toEqual(['dead-1', 'dead-2']);
+    expect(Math.max(...reads.map(read => read.length))).toBe(1);
+    expect(await stateOf('dead-1')).toEqual([BatchStatus.FAILED, false]);
+    expect(await stateOf('running')).toEqual([BatchStatus.PROCESSING, true]);
+  });
+
+  it("reads a session's batches one at a time when it fails them all", async () => {
+    await store('one', 's1');
+    await store('two', 's1');
+
+    await failUnfinishedSessionBatches(db, 's1');
+
+    expect(reads.flat().sort()).toEqual(['one', 'two']);
+    expect(Math.max(...reads.map(read => read.length))).toBe(1);
+    expect(await stateOf('two')).toEqual([BatchStatus.FAILED, false]);
+  });
+});
+
 /** Regression lock: an SSRF block (which names the internal host/IP) must not be stored verbatim. */
 describe('sanitizeBatchError', () => {
   it('replaces an SSRF block message with a generic one (no internal address leak)', () => {
@@ -353,6 +469,7 @@ describe('BulkMessageService.processBatch', () => {
     sendImageMessage?: jest.Mock;
     sendVideoMessage?: jest.Mock;
     sendAudioMessage?: jest.Mock;
+    sendDocumentMessage?: jest.Mock;
   };
   let engines: EngineRegistry;
   let hookManager: { execute: jest.Mock };
@@ -419,7 +536,11 @@ describe('BulkMessageService.processBatch', () => {
   });
 
   const runProcessBatch = (): Promise<void> =>
-    (service as unknown as { processBatch: (id: string) => Promise<void> }).processBatch('b1');
+    (
+      service as unknown as {
+        processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+      }
+    ).processBatch('b1', false, captureSessionWrites(repo, 's1'));
 
   const inFlightMarkers = (): Map<string, boolean> =>
     (service as unknown as { processingBatches: Map<string, boolean> }).processingBatches;
@@ -912,6 +1033,98 @@ describe('BulkMessageService.processBatch', () => {
     expect(finalPartial.results[0].error?.message).toMatch(/caption/i);
   });
 
+  it('fails an item that would render to hundreds of megabytes without building it', async () => {
+    // 1365 single-brace placeholders fit in a 4096-character text and one 394 KB variable fills each of them:
+    // 537 MB, past the longest string V8 can build, so a render-then-check could only have thrown a RangeError.
+    repo.findOne.mockResolvedValue(batchWithVariables('{a}'.repeat(1365), { a: 'x'.repeat(394_000) }));
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toContain(`Rendered text is ${1365 * 394_000} characters`);
+  });
+
+  // A personalised media send puts its placeholder in `base64`; a 100 KB image is about 137,000 characters.
+  const mediaBatch = (content: Record<string, unknown>, variables: Record<string, string>) => ({
+    ...makeBatch(1),
+    messages: [{ chatId: 'c0@c.us', type: 'image', content, variables }],
+  });
+
+  it('sends a media item whose base64 comes from a variable, past the text cap', async () => {
+    engine.sendImageMessage = jest.fn().mockResolvedValue({ id: 'waimg', timestamp: 222 });
+    const picture = Buffer.alloc(100_000, 7).toString('base64');
+    repo.findOne.mockResolvedValue(
+      mediaBatch({ image: { base64: '{{pic}}', mimetype: 'image/png' } }, { pic: picture }),
+    );
+
+    await runProcessBatch();
+
+    expect(picture.length).toBeGreaterThan(65_536);
+    expect(engine.sendImageMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds text and caption one by one, not as a total', async () => {
+    engine.sendImageMessage = jest.fn().mockResolvedValue({ id: 'waimg', timestamp: 222 });
+    const grown = 'x'.repeat(40 * 1024);
+    repo.findOne.mockResolvedValue(
+      mediaBatch({ text: '{{v}}', caption: '{{v}}', image: { base64: 'AAAA', mimetype: 'image/png' } }, { v: grown }),
+    );
+
+    await runProcessBatch();
+
+    // Each is 40 KiB, under the 64 KiB cap; together they are not, and nothing asks for them together.
+    expect(engine.sendImageMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails a media item whose base64 would render past the media cap without building it', async () => {
+    // 1000 repeats of a 1 MB variable are a billion characters, past what V8 can build as one string.
+    repo.findOne.mockResolvedValue(
+      mediaBatch({ image: { base64: '{{p}}'.repeat(1000), mimetype: 'image/png' } }, { p: 'A'.repeat(1_000_000) }),
+    );
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).not.toHaveBeenCalled();
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toContain('exceeds the maximum allowed size');
+  });
+
+  it('bounds what the other strings of an item may grow by, together', async () => {
+    // Neither the URL nor the filename is text or caption, and each grows by 40 KB, under the cap on its own.
+    const grown = 'x'.repeat(40 * 1024);
+    repo.findOne.mockResolvedValue({
+      ...makeBatch(1),
+      messages: [
+        {
+          chatId: 'c0@c.us',
+          type: 'image',
+          content: { image: { url: 'https://cdn.example/{{v}}.jpg', filename: '{{v}}.jpg', mimetype: 'image/jpeg' } },
+          variables: { v: grown },
+        },
+      ],
+    });
+
+    await runProcessBatch();
+
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toMatch(/grows by \d+ characters, over the 65536-character limit/);
+  });
+
+  it('fails an item whose variable has no text form with the reason, not a TypeError', async () => {
+    repo.findOne.mockResolvedValue(batchWithVariables('hi {{v}}', { v: { toString: 1 } as unknown as string }));
+
+    await runProcessBatch();
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+    const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+    expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results[0].error?.message).toBe("Variable 'v' cannot be rendered as text");
+  });
+
   it('still sends an item whose render stays under the cap', async () => {
     repo.findOne.mockResolvedValue(batchWithVariables('hello {{v}}', { v: 'world' }));
 
@@ -997,6 +1210,7 @@ describe('BulkMessageService.processBatch', () => {
         type: 'text',
         status: MessageStatus.SENT,
       }),
+      expect.anything(),
     );
   });
 
@@ -1027,10 +1241,12 @@ describe('BulkMessageService.processBatch', () => {
         body: 'clip',
         metadata: { media: { mimetype: 'video/mp4', data: 'AAAA', filename: undefined } },
       }),
+      expect.anything(),
     );
     expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
       's1',
       expect.objectContaining({ chatId: 'c1@c.us', body: 'hi', metadata: undefined }),
+      expect.anything(),
     );
   });
 
@@ -1048,6 +1264,7 @@ describe('BulkMessageService.processBatch', () => {
     expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
       's1',
       expect.objectContaining({ metadata: { media: { mimetype: 'image/jpeg', data: 'AAAA', filename: undefined } } }),
+      expect.anything(),
     );
   });
 
@@ -1154,6 +1371,33 @@ describe('BulkMessageService.processBatch', () => {
     expect(warn.mock.calls.flat().join(' ')).not.toContain('10.0.0.1');
   });
 
+  it('logs the guard detail of a blocked media URL, and stores and hands the hook only the generic text', async () => {
+    const batch = makeBatch(1);
+    repo.findOne.mockResolvedValue(batch);
+    engine.sendTextMessage.mockRejectedValueOnce(new SsrfBlockedError('Blocked internal address: 10.0.0.1'));
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation();
+
+    try {
+      await runProcessBatch();
+
+      expect(warn).toHaveBeenCalledWith(
+        'Outbound media fetch blocked by SSRF guard: Blocked internal address: 10.0.0.1',
+      );
+    } finally {
+      warn.mockRestore();
+    }
+    const result = batch.results[0];
+    expect(result.status).toBe(BatchMessageStatus.FAILED);
+    expect(result.error).toEqual({ code: 'SEND_BLOCKED', message: SSRF_BLOCKED_CLIENT_MESSAGE });
+    expect(JSON.stringify(batch.results)).not.toContain('10.0.0.1');
+    expect(hookManager.execute).toHaveBeenCalledWith(
+      'message:failed',
+      expect.objectContaining({ error: SSRF_BLOCKED_CLIENT_MESSAGE }),
+      expect.anything(),
+    );
+    expect(JSON.stringify(hookManager.execute.mock.calls)).not.toContain('10.0.0.1');
+  });
+
   it('does NOT fire message:failed when the gate blocks a bulk item (a block is a moderation decision, not a delivery failure)', async () => {
     repo.findOne.mockResolvedValue(makeBatch(1));
     hookManager.execute.mockResolvedValueOnce({ continue: false, data: {} }); // block message 0
@@ -1212,6 +1456,10 @@ describe('BulkMessageService.processBatch', () => {
       () => engine.sendTextMessage.mockRejectedValueOnce(new EngineThrottledError('rate-overlimit')),
     ],
     ['its media URL is blocked', () => engine.sendTextMessage.mockRejectedValueOnce(new SsrfBlockedError('blocked'))],
+    [
+      'the engine answers not-ready before it handed the message over',
+      () => engine.sendTextMessage.mockRejectedValueOnce(markNothingSent(new EngineNotReadyError())),
+    ],
   ])('releases the pacing admission of an item that fails before its row when %s', async (_label, arrange) => {
     const release = jest.fn();
     pacing.assertSendAllowed.mockResolvedValue(release);
@@ -1233,6 +1481,10 @@ describe('BulkMessageService.processBatch', () => {
     [
       'the engine transport fails',
       () => engine.sendTextMessage.mockRejectedValueOnce(new EngineTransportError('timeout')),
+    ],
+    [
+      'the engine answers not-ready after it attempted the send',
+      () => engine.sendTextMessage.mockRejectedValueOnce(markOutcomeUnknown(new EngineNotReadyError())),
     ],
   ])('keeps the pacing admission held for a window from the engine return when %s', async (_label, arrange) => {
     const release = jest.fn();
@@ -1285,7 +1537,40 @@ describe('BulkMessageService.processBatch', () => {
       'c0@c.us',
       expect.objectContaining({ ptt: true, mimetype: 'audio/ogg; codecs=opus' }),
     );
-    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith('s1', expect.objectContaining({ type: 'voice' }));
+    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ type: 'voice' }),
+      expect.anything(),
+    );
+  });
+
+  // One voice note carries one type end to end, as on a single voice send: message:sending reads the item
+  // the gate is offered, message:failed the content that was attempted (after a gate rewrite).
+  it.each([
+    ['a ptt item as voice', { url: 'https://x/v', ptt: true }, undefined, ['voice', 'voice']],
+    ['a plain audio item as audio', { url: 'https://x/v' }, undefined, ['audio', 'audio']],
+    [
+      'a ptt item the gate rewrites to plain audio as voice, then audio',
+      { url: 'https://x/v', ptt: true },
+      { audio: { url: 'https://x/v', ptt: false } },
+      ['voice', 'audio'],
+    ],
+  ])('reports %s to message:sending and message:failed', async (_label, audio, rewrite, expected) => {
+    engine.sendAudioMessage = jest.fn().mockRejectedValue(new Error('boom'));
+    const batch = makeBatch(1);
+    batch.messages = [{ chatId: 'c0@c.us', type: 'audio', content: { audio } }];
+    repo.findOne.mockResolvedValue(batch);
+    if (rewrite) {
+      hookManager.execute.mockResolvedValueOnce({ continue: true, data: { input: { ...rewrite, chatId: 'c0@c.us' } } });
+    }
+
+    await runProcessBatch();
+
+    const typesOf = (event: string): string[] =>
+      hookManager.execute.mock.calls
+        .filter(([name]) => name === event)
+        .map(([, data]) => (data as { type: string }).type);
+    expect([...typesOf('message:sending'), ...typesOf('message:failed')]).toEqual(expected);
   });
 
   it('strips base64 media payloads from the stored batch once it completes (footprint)', async () => {
@@ -1770,6 +2055,598 @@ describe('BulkMessageService.processBatch', () => {
       delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
     }
   });
+
+  it('applies the session linkPreview default once per batch and omits the 4th arg when unset', async () => {
+    const findOne = jest.fn().mockResolvedValue({ id: 's1', config: { linkPreview: false } });
+    const withSession = new BulkMessageService(
+      repo as unknown as Repository<MessageBatch>,
+      engines,
+      messageService as unknown as MessageService,
+      hookManager as unknown as HookManager,
+      pacing as unknown as SendPacingService,
+      undefined,
+      undefined,
+      shutdown,
+      { findOne } as unknown as SessionService,
+    );
+    const batch = makeBatch(2);
+    batch.messages[0].content = { text: 'https://example.com' };
+    batch.messages[1].content = { text: 'hi @62811', mentions: ['62811@c.us'] };
+    repo.findOne.mockResolvedValue(batch);
+
+    await (
+      withSession as unknown as {
+        processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+      }
+    ).processBatch('b1', false, captureSessionWrites(repo, 's1'));
+
+    expect(findOne).toHaveBeenCalledTimes(1);
+    expect(findOne).toHaveBeenCalledWith('s1');
+    expect(engine.sendTextMessage).toHaveBeenNthCalledWith(1, 'c0@c.us', 'https://example.com', undefined, {
+      linkPreview: false,
+    });
+    expect(engine.sendTextMessage).toHaveBeenNthCalledWith(2, 'c1@c.us', 'hi @62811', ['62811@c.us'], {
+      linkPreview: false,
+    });
+
+    // When the session config has no linkPreview default, preserve the 2-arg call shape.
+    engine.sendTextMessage.mockClear();
+    findOne.mockResolvedValueOnce({ id: 's1', config: {} });
+    repo.findOne.mockResolvedValue(makeBatch(1));
+    await (
+      withSession as unknown as {
+        processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+      }
+    ).processBatch('b1', false, captureSessionWrites(repo, 's1'));
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('c0@c.us', 'hi');
+  });
+
+  it('uses the data URI mimetype before type fallbacks while letting explicit mimetype win', async () => {
+    engine.sendDocumentMessage = jest.fn().mockResolvedValue({ id: 'wadoc', timestamp: 222 });
+    const batch = makeBatch(3);
+    batch.messages = [
+      { chatId: 'c0@c.us', type: 'image', content: { image: { base64: 'data:image/png;base64,QUJD' } } },
+      {
+        chatId: 'c1@c.us',
+        type: 'document',
+        content: { document: { base64: 'data:application/pdf;base64,JVBERi0=' } },
+      },
+      {
+        chatId: 'c2@c.us',
+        type: 'image',
+        content: { image: { base64: 'data:image/png;base64,QUJD', mimetype: 'image/webp' } },
+      },
+    ];
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).toHaveBeenNthCalledWith(
+      1,
+      'c0@c.us',
+      expect.objectContaining({ mimetype: 'image/png', data: 'QUJD' }),
+    );
+    expect(engine.sendDocumentMessage).toHaveBeenCalledWith(
+      'c1@c.us',
+      expect.objectContaining({ mimetype: 'application/pdf', data: 'JVBERi0=' }),
+    );
+    expect(engine.sendImageMessage).toHaveBeenNthCalledWith(
+      2,
+      'c2@c.us',
+      expect.objectContaining({ mimetype: 'image/webp', data: 'QUJD' }),
+    );
+    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({
+        chatId: 'c0@c.us',
+        metadata: { media: { mimetype: 'image/png', data: 'QUJD', filename: undefined } },
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('forwards filename on image, video, and audio sends and stores captionless document filename as body', async () => {
+    engine.sendVideoMessage = jest.fn().mockResolvedValue({ id: 'wavid', timestamp: 222 });
+    engine.sendDocumentMessage = jest.fn().mockResolvedValue({ id: 'wadoc', timestamp: 222 });
+    const batch = makeBatch(5);
+    batch.messages = [
+      {
+        chatId: 'c0@c.us',
+        type: 'image',
+        content: { image: { base64: 'QUJD', mimetype: 'image/png', filename: 'photo.png' } },
+      },
+      {
+        chatId: 'c1@c.us',
+        type: 'video',
+        content: { video: { base64: 'QUJD', mimetype: 'video/mp4', filename: 'clip.mp4' } },
+      },
+      {
+        chatId: 'c2@c.us',
+        type: 'audio',
+        content: { audio: { base64: 'QUJD', mimetype: 'audio/mpeg', filename: 'track.mp3' } },
+      },
+      {
+        chatId: 'c3@c.us',
+        type: 'document',
+        content: { document: { base64: 'QUJD', mimetype: 'application/pdf', filename: 'invoice.pdf' } },
+      },
+      {
+        chatId: 'c4@c.us',
+        type: 'document',
+        content: {
+          caption: 'Attached invoice',
+          document: { base64: 'QUJD', mimetype: 'application/pdf', filename: 'invoice.pdf' },
+        },
+      },
+    ];
+    repo.findOne.mockResolvedValue(batch);
+
+    await runProcessBatch();
+
+    expect(engine.sendImageMessage).toHaveBeenCalledWith('c0@c.us', expect.objectContaining({ filename: 'photo.png' }));
+    expect(engine.sendVideoMessage).toHaveBeenCalledWith('c1@c.us', expect.objectContaining({ filename: 'clip.mp4' }));
+    expect(engine.sendAudioMessage).toHaveBeenCalledWith('c2@c.us', expect.objectContaining({ filename: 'track.mp3' }));
+    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ chatId: 'c3@c.us', type: 'document', body: 'invoice.pdf' }),
+      expect.anything(),
+    );
+    expect(messageService.saveOutgoingMessage).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ chatId: 'c4@c.us', type: 'document', body: 'Attached invoice' }),
+      expect.anything(),
+    );
+  });
+
+  it('aborts the inter-message delay immediately on cancelBatch', async () => {
+    const batch = makeBatch(2);
+    batch.options = { delayBetweenMessages: 600, randomizeDelay: false, stopOnError: false };
+    repo.findOne
+      .mockResolvedValueOnce(batch) // pickup
+      .mockResolvedValueOnce(batch) // cancelBatch lookup
+      .mockResolvedValueOnce({ status: BatchStatus.CANCELLED }); // finalizeBatch re-read
+
+    let item0Sent!: () => void;
+    const item0Done = new Promise<void>(resolve => (item0Sent = resolve));
+    engine.sendTextMessage.mockImplementationOnce(() => {
+      setImmediate(item0Sent);
+      return Promise.resolve({ id: 'wa1', timestamp: 111 });
+    });
+
+    const startedAt = Date.now();
+    const run = runProcessBatch();
+    await item0Done;
+    await new Promise(resolve => setImmediate(resolve));
+
+    await service.cancelBatch('s1', 'bx');
+    await run;
+
+    expect(Date.now() - startedAt).toBeLessThan(300);
+    expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts the inter-message delay and drains running batches during onModuleDestroy', async () => {
+    const batch = makeBatch(2);
+    batch.options = { delayBetweenMessages: 600, randomizeDelay: false, stopOnError: false };
+    repo.findOne
+      .mockResolvedValueOnce(batch) // pickup
+      .mockResolvedValueOnce(batch) // shutdown read
+      .mockResolvedValueOnce({ status: BatchStatus.FAILED }); // finalizeBatch re-read
+
+    let item0Sent!: () => void;
+    const item0Done = new Promise<void>(resolve => (item0Sent = resolve));
+    engine.sendTextMessage.mockImplementationOnce(() => {
+      setImmediate(item0Sent);
+      return Promise.resolve({ id: 'wa1', timestamp: 111 });
+    });
+
+    const startedAt = Date.now();
+    let runFinished = false;
+    const run = runProcessBatch().finally(() => {
+      runFinished = true;
+    });
+    await item0Done;
+    await new Promise(resolve => setImmediate(resolve));
+
+    await service.onModuleDestroy();
+    expect(Date.now() - startedAt).toBeLessThan(300);
+    expect(runFinished).toBe(true);
+    await run;
+    expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for an in-flight batch to finish finalizing before onModuleDestroy returns', async () => {
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>(resolve => (releaseSend = resolve));
+    let sendStarted!: () => void;
+    const enteredSend = new Promise<void>(resolve => (sendStarted = resolve));
+
+    const batch = makeBatch(2);
+    repo.findOne
+      .mockResolvedValueOnce(batch) // pickup
+      .mockResolvedValueOnce(batch) // shutdown read
+      .mockResolvedValueOnce({ status: BatchStatus.FAILED }); // noteRowLeftProcessing re-read
+    repo.update
+      .mockResolvedValueOnce({ affected: 1 }) // start transition
+      .mockResolvedValueOnce({ affected: 1 }) // shutdown FAILED write
+      .mockResolvedValueOnce({ affected: 0 }) // progress write sees FAILED
+      .mockResolvedValueOnce({ affected: 1 }); // keepResultsOnEndedRow
+
+    engine.sendTextMessage.mockImplementationOnce(async () => {
+      sendStarted();
+      await sendGate;
+      return { id: 'wa1', timestamp: 111 };
+    });
+
+    const run = runProcessBatch();
+    await enteredSend;
+
+    let destroySettled = false;
+    const destroying = service.onModuleDestroy().then(() => {
+      destroySettled = true;
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(destroySettled).toBe(false);
+
+    releaseSend();
+    await destroying;
+    await run;
+
+    expect(destroySettled).toBe(true);
+    expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
+    const [, finalPartial] = (repo.update.mock.calls as Array<[unknown, Partial<MessageBatch>]>).at(-1)!;
+    expect(finalPartial.results).toHaveLength(1);
+  });
+
+  it('writes results aligned with progress on every item commit and merges committed live results in getBatchStatus', async () => {
+    const batch = makeBatch(12);
+    repo.findOne.mockResolvedValueOnce(batch); // pickup
+
+    let pauseAtItem3!: () => void;
+    const resumeItem3 = new Promise<void>(resolve => (pauseAtItem3 = resolve));
+    let reachedItem3!: () => void;
+    const atItem3 = new Promise<void>(resolve => (reachedItem3 = resolve));
+    let sendCount = 0;
+    engine.sendTextMessage.mockImplementation(async () => {
+      sendCount++;
+      if (sendCount === 3) {
+        reachedItem3();
+        await resumeItem3;
+      }
+      return { id: `wa-${sendCount}`, timestamp: 100 + sendCount };
+    });
+
+    const run = runProcessBatch();
+    await atItem3;
+
+    // Simulate a stale DB read whose stored results lag behind committed progress, while 2 items committed.
+    repo.findOne.mockResolvedValueOnce({ ...batch, results: [] });
+    const liveStatus = await service.getBatchStatus('s1', 'bx');
+    expect(liveStatus.results).toHaveLength(2);
+    expect(liveStatus.results.map(r => r.messageId)).toEqual(['wa-1', 'wa-2']);
+
+    pauseAtItem3();
+    await run;
+
+    const progressWrites = (repo.update.mock.calls as Array<[unknown, Partial<MessageBatch>]>).filter(
+      ([criteria, partial]) =>
+        JSON.stringify(criteria) === JSON.stringify({ id: 'b1', status: BatchStatus.PROCESSING }) &&
+        partial.status === undefined,
+    );
+    expect(progressWrites).toHaveLength(12);
+    // Every per-item progress commit carries the matching results snapshot so crash/reap never leaves progress ahead of results.
+    expect(
+      progressWrites.map(([, partial]) => ({ index: partial.currentIndex, count: partial.results?.length })),
+    ).toEqual(Array.from({ length: 12 }, (_, idx) => ({ index: idx + 1, count: idx + 1 })));
+
+    const [, finalPartial] = (repo.update.mock.calls as Array<[unknown, Partial<MessageBatch>]>).at(-1)!;
+    expect(finalPartial.status).toBe(BatchStatus.COMPLETED);
+    expect(finalPartial.results).toHaveLength(12);
+
+    // After completion, activeResults is cleaned up so stored results are returned as-is.
+    repo.findOne.mockResolvedValueOnce({ ...batch, results: [] });
+    const afterStatus = await service.getBatchStatus('s1', 'bx');
+    expect(afterStatus.results).toHaveLength(0);
+  });
+
+  it('marks an incomplete batch FAILED instead of COMPLETED when shutdown DB fail throws during inter-message sleep', async () => {
+    const batch = makeBatch(2);
+    batch.options = { delayBetweenMessages: 600, randomizeDelay: false, stopOnError: false };
+    repo.findOne
+      .mockResolvedValueOnce(batch) // pickup
+      .mockRejectedValueOnce(new Error('transient shutdown read error')) // onModuleDestroy read fails
+      .mockResolvedValueOnce({ status: BatchStatus.PROCESSING }); // finalizeBatch re-read still sees PROCESSING
+
+    let item0Sent!: () => void;
+    const item0Done = new Promise<void>(resolve => (item0Sent = resolve));
+    engine.sendTextMessage.mockImplementationOnce(() => {
+      setImmediate(item0Sent);
+      return Promise.resolve({ id: 'wa1', timestamp: 111 });
+    });
+
+    const run = runProcessBatch();
+    await item0Done;
+    await new Promise(resolve => setImmediate(resolve));
+
+    await service.onModuleDestroy();
+    await run;
+
+    expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
+    const [, finalPartial] = (repo.update.mock.calls as Array<[unknown, Partial<MessageBatch>]>).at(-1)!;
+    expect(finalPartial.status).toBe(BatchStatus.FAILED);
+    expect(finalPartial.results).toHaveLength(1);
+  });
+
+  it('does not expose uncommitted item results in getBatchStatus before the DB progress update commits', async () => {
+    const batch = makeBatch(2);
+    repo.findOne.mockResolvedValueOnce(batch); // pickup
+
+    let enteredProgressWrite!: () => void;
+    const atProgressWrite = new Promise<void>(resolve => (enteredProgressWrite = resolve));
+    let releaseProgressWrite!: () => void;
+    const progressWriteGate = new Promise<void>(resolve => (releaseProgressWrite = resolve));
+
+    repo.update
+      .mockResolvedValueOnce({ affected: 1 }) // start transition
+      .mockImplementationOnce(async () => {
+        enteredProgressWrite();
+        await progressWriteGate;
+        return { affected: 1 };
+      })
+      .mockResolvedValue({ affected: 1 });
+
+    const run = runProcessBatch();
+    await atProgressWrite;
+
+    // DB progress update for item 0 has not committed yet (progress.sent is still 0).
+    repo.findOne.mockResolvedValueOnce({
+      ...batch,
+      progress: { total: 2, sent: 0, failed: 0, pending: 2, cancelled: 0 },
+      results: [],
+    });
+    const duringWrite = await service.getBatchStatus('s1', 'bx');
+    expect(duringWrite.results).toHaveLength(0);
+
+    releaseProgressWrite();
+    await run;
+  });
+
+  it('rejects array gate input, strips prototype-pollution keys, and isolates nested input mutations in bulk sends', async () => {
+    const batch = makeBatch(3);
+    batch.messages = [
+      { chatId: 'c0@c.us', type: 'text', content: { text: 'array-return' } },
+      { chatId: 'c1@c.us', type: 'text', content: { text: 'proto-keys' } },
+      {
+        chatId: 'c2@c.us',
+        type: 'text',
+        content: { text: 'nested', mentions: ['62811@c.us'] },
+      },
+    ];
+    repo.findOne.mockResolvedValue(batch);
+
+    const polluted = JSON.parse(
+      '{"text":"clean","__proto__":{"polluted":true},"constructor":{"bad":1},"prototype":{"bad":2}}',
+    ) as Record<string, unknown>;
+
+    engine.sendTextMessage
+      .mockRejectedValueOnce(new Error('send failed after gate')) // item 1 fails after gate so message:failed exposes sanitized content
+      .mockResolvedValueOnce({ id: 'wa-3', timestamp: 333 });
+
+    hookManager.execute
+      .mockResolvedValueOnce({ continue: true, data: { input: ['not-an-object'] } }) // item 0: array input refused
+      .mockResolvedValueOnce({ continue: true, data: { input: polluted } }) // item 1: polluted keys stripped
+      .mockResolvedValueOnce({ continue: true, data: {} }) // item 1: message:failed hook
+      .mockImplementationOnce((_event: string, data: { input: { mentions: string[] } }) => {
+        // item 2: plugin mutates nested array in place and returns no data
+        data.input.mentions.push('62999@c.us');
+        return Promise.resolve({ continue: true });
+      });
+
+    await runProcessBatch();
+
+    // Item 0 refused as a plugin block (no message:failed emitted for item 0); item 1's message:failed carries stripped content.
+    const failedCalls = hookManager.execute.mock.calls.filter(([event]) => event === 'message:failed') as Array<
+      [string, { input: Record<string, unknown> }, unknown]
+    >;
+    expect(failedCalls).toHaveLength(1);
+    const failedInput = failedCalls[0][1].input;
+    expect(failedInput).toEqual({ chatId: 'c1@c.us', text: 'clean' });
+    expect(Object.hasOwn(failedInput, '__proto__')).toBe(false);
+    expect(Object.hasOwn(failedInput, 'constructor')).toBe(false);
+    expect(Object.hasOwn(failedInput, 'prototype')).toBe(false);
+
+    // Item 1 reached engine with clean text; item 2 sent with uncorrupted caller mentions.
+    expect(engine.sendTextMessage).toHaveBeenNthCalledWith(1, 'c1@c.us', 'clean');
+    expect(engine.sendTextMessage).toHaveBeenNthCalledWith(2, 'c2@c.us', 'nested', ['62811@c.us']);
+    expect((batch.messages[2].content as { mentions?: string[] }).mentions).toEqual(['62811@c.us']);
+
+    const [, finalPartial] = (repo.update.mock.calls as Array<[unknown, Partial<MessageBatch>]>).at(-1)!;
+    expect(finalPartial.results?.[0].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results?.[0].error?.message).toMatch(/message:sending/);
+    expect(finalPartial.results?.[1].status).toBe(BatchMessageStatus.FAILED);
+    expect(finalPartial.results?.[2].status).toBe(BatchMessageStatus.SENT);
+  });
+
+  it('with a real HookManager, isolates nested mutations, strips nested pollution keys, and blocks inter-plugin chatId spoofing', async () => {
+    const realHooks = new HookManager();
+    const realBulk = new BulkMessageService(
+      repo as unknown as Repository<MessageBatch>,
+      engines,
+      messageService as unknown as MessageService,
+      realHooks,
+      pacing as unknown as SendPacingService,
+      undefined,
+      undefined,
+      shutdown,
+    );
+
+    const observedChatIds: string[] = [];
+    const failedInputs: Array<Record<string, unknown>> = [];
+
+    // Plugin A mutates nested image.url/mentions on throw/error/no-data for item 0,
+    // injects nested __proto__ for item 1, and spoofs chatId for item 2.
+    realHooks.register(
+      'mutator-throw',
+      'message:sending',
+      ctx => {
+        const d = ctx.data as { input: { chatId: string; image?: { url: string }; mentions?: string[] } };
+        if (d.input.chatId === 'c0@c.us') {
+          d.input.image!.url = 'https://evil.example/from-throw.jpg';
+          d.input.mentions!.push('62991@c.us');
+          throw new Error('plugin crash');
+        }
+        return Promise.resolve({ continue: true });
+      },
+      10,
+    );
+    realHooks.register(
+      'mutator-no-data',
+      'message:sending',
+      ctx => {
+        const d = ctx.data as { input: { chatId: string; image?: { url: string }; mentions?: string[] } };
+        if (d.input.chatId === 'c0@c.us') {
+          d.input.image!.url = 'https://evil.example/from-no-data.jpg';
+          d.input.mentions!.push('62992@c.us');
+          return Promise.resolve({ continue: true });
+        }
+        if (d.input.chatId === 'c1@c.us') {
+          const polluted = JSON.parse(
+            '{"image":{"url":"https://example.com/a.jpg","__proto__":{"polluted":true}}}',
+          ) as Record<string, unknown>;
+          return Promise.resolve({ continue: true, data: { ...d, input: polluted } });
+        }
+        if (d.input.chatId === 'c2@c.us') {
+          return Promise.resolve({
+            continue: true,
+            data: { ...d, input: { ...d.input, chatId: 'exempt@c.us', text: 'spoofed' } },
+          });
+        }
+        return Promise.resolve({ continue: true, data: d });
+      },
+      20,
+    );
+    realHooks.register(
+      'moderator',
+      'message:sending',
+      ctx => {
+        const d = ctx.data as { input: { chatId: string } };
+        observedChatIds.push(d.input.chatId);
+        if (d.input.chatId === 'c2@c.us') {
+          return Promise.resolve({ continue: false });
+        }
+        return Promise.resolve({ continue: true, data: d });
+      },
+      30,
+    );
+    realHooks.register('failure-observer', 'message:failed', ctx => {
+      const d = ctx.data as { input: Record<string, unknown> };
+      failedInputs.push(d.input);
+      return Promise.resolve({ continue: true });
+    });
+
+    engine.sendImageMessage = jest
+      .fn()
+      .mockResolvedValueOnce({ id: 'wa-img-0', timestamp: 100 })
+      .mockRejectedValueOnce(new Error('fail-item-1'));
+
+    const batch = makeBatch(3);
+    batch.messages = [
+      {
+        chatId: 'c0@c.us',
+        type: 'image',
+        content: { image: { url: 'https://example.com/orig.jpg' }, mentions: ['62811@c.us'] },
+      },
+      {
+        chatId: 'c1@c.us',
+        type: 'image',
+        content: { image: { url: 'https://example.com/before.jpg' } },
+      },
+      {
+        chatId: 'c2@c.us',
+        type: 'text',
+        content: { text: 'should be vetoed' },
+      },
+    ];
+    repo.findOne.mockResolvedValue(batch);
+
+    await (
+      realBulk as unknown as {
+        processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+      }
+    ).processBatch('b1', false, captureSessionWrites(repo, 's1'));
+
+    // Item 0 sent with uncorrupted nested URL and mentions.
+    expect(engine.sendImageMessage).toHaveBeenNthCalledWith(
+      1,
+      'c0@c.us',
+      expect.objectContaining({ data: 'https://example.com/orig.jpg', mentions: ['62811@c.us'] }),
+    );
+    // Item 1's nested __proto__ key was recursively stripped before message:failed observed content.
+    expect(failedInputs).toHaveLength(1);
+    const failedImg = failedInputs[0].image as Record<string, unknown>;
+    expect(failedImg).toEqual({ url: 'https://example.com/a.jpg' });
+    expect(Object.hasOwn(failedImg, '__proto__')).toBe(false);
+    // Item 2: moderator saw real chatId 'c2@c.us' (not 'exempt@c.us') and vetoed it.
+    expect(observedChatIds).toEqual(['c0@c.us', 'c1@c.us', 'c2@c.us']);
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  it('blocks bulk items without sending or emitting message:failed when message:sending fails in fail-closed mode', async () => {
+    const prevEnv = process.env.HOOK_PRE_EGRESS_FAIL_CLOSED;
+    process.env.HOOK_PRE_EGRESS_FAIL_CLOSED = 'true';
+    const warnSpy = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const realHooks = new HookManager();
+      const failedHookSpy = jest.fn();
+      realHooks.register('dlp-guard', 'message:sending', () => {
+        throw new Error('policy service down');
+      });
+      realHooks.register('observer', 'message:failed', () => {
+        failedHookSpy();
+        return Promise.resolve({ continue: true });
+      });
+
+      const realBulk = new BulkMessageService(
+        repo as unknown as Repository<MessageBatch>,
+        engines,
+        messageService as unknown as MessageService,
+        realHooks,
+        pacing as unknown as SendPacingService,
+        undefined,
+        undefined,
+        shutdown,
+      );
+
+      const batch = makeBatch(1);
+      repo.findOne.mockResolvedValue(batch);
+
+      await (
+        realBulk as unknown as {
+          processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+        }
+      ).processBatch('b1', false, captureSessionWrites(repo, 's1'));
+
+      expect(engine.sendTextMessage).not.toHaveBeenCalled();
+      expect(failedHookSpy).not.toHaveBeenCalled();
+      expect(pacing.recordSendFailure).not.toHaveBeenCalled();
+      const finalPartial = (repo.update.mock.calls as Array<[unknown, { results: BatchMessageResult[] }]>).at(-1)![1];
+      expect(finalPartial.results[0].status).toBe(BatchMessageStatus.FAILED);
+      expect(finalPartial.results[0].error?.message).toMatch(/pre-send plugin hook failed/i);
+      expect(finalPartial.results[0].error?.message).not.toContain('policy service down');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('message:sending'),
+        expect.objectContaining({
+          pluginId: 'dlp-guard',
+          sessionId: 's1',
+          source: 'BulkMessageService',
+        }),
+      );
+    } finally {
+      warnSpy.mockRestore();
+      if (prevEnv === undefined) delete process.env.HOOK_PRE_EGRESS_FAIL_CLOSED;
+      else process.env.HOOK_PRE_EGRESS_FAIL_CLOSED = prevEnv;
+    }
+  });
 });
 
 describe('BulkMessageService.cancelBatch', () => {
@@ -2121,7 +2998,11 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
     // createBatch's own fire-and-forget processBatch saw no persisted row (findOne → undefined);
     // drive the processing explicitly with the created batch now "in the DB".
     repo.findOne.mockResolvedValue(batch);
-    await (service as unknown as { processBatch: (id: string) => Promise<void> }).processBatch(batch.id);
+    await (
+      service as unknown as {
+        processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+      }
+    ).processBatch(batch.id, false, captureSessionWrites(repo, batch.sessionId));
 
     expect(engine.sendTextMessage).toHaveBeenCalledTimes(2);
     expect(engine.sendTextMessage).toHaveBeenNthCalledWith(1, 'a@c.us', 'first');
@@ -2145,12 +3026,58 @@ describe('BulkMessageService.createBatch base64 media cap', () => {
     const batch = await service.createBatch('s1', dto);
     // Same fire-and-forget caveat as above — drive processing explicitly with the batch "in the DB".
     repo.findOne.mockResolvedValue(batch);
-    await (service as unknown as { processBatch: (id: string) => Promise<void> }).processBatch(batch.id);
+    await (
+      service as unknown as {
+        processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+      }
+    ).processBatch(batch.id, false, captureSessionWrites(repo, batch.sessionId));
 
     expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
     expect(engine.sendTextMessage).toHaveBeenCalledWith('a@c.us', 'part 1');
     expect(engine.sendImageMessage).toHaveBeenCalledTimes(1);
     expect(batch.progress.sent).toBe(2);
     expect(batch.results).toHaveLength(2);
+  });
+
+  it('refuses message dispatch in processBatchMessage when session ownership was lost', async () => {
+    const engine = {
+      sendTextMessage: jest.fn().mockResolvedValue({ id: 'wa-owned', timestamp: 1 }),
+    };
+    engines.set('s1', engine as unknown as IWhatsAppEngine);
+    let owns = true;
+    const ownedHookManager = {
+      execute: jest.fn((_ev: string, data: unknown) => {
+        // Simulate lease loss occurring while the pre-send hook awaits.
+        owns = false;
+        return Promise.resolve({ continue: true, data });
+      }),
+    };
+    const svcWithOwnership = new BulkMessageService(
+      repo as never,
+      engines,
+      { saveOutgoingMessage: jest.fn() } as never,
+      ownedHookManager as never,
+      {
+        assertSendAllowed: jest.fn().mockResolvedValue(undefined),
+        recordSendFailure: jest.fn(),
+        recordSendSuccess: jest.fn(),
+      } as never,
+      { owns: jest.fn(() => owns) } as never,
+    );
+
+    const dto = {
+      messages: [{ chatId: 'a@c.us', type: 'text' as const, content: { text: 'after lease loss' } }],
+      options: { delayBetweenMessages: 0, randomizeDelay: false, stopOnError: true },
+    } as unknown as SendBulkMessageDto;
+
+    const batch = await svcWithOwnership.createBatch('s1', dto);
+    repo.findOne.mockResolvedValue(batch);
+    await (
+      svcWithOwnership as unknown as {
+        processBatch: (id: string, reserved: boolean, lifetime: SessionWriteScope) => Promise<void>;
+      }
+    ).processBatch(batch.id, false, captureSessionWrites(repo, batch.sessionId));
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
   });
 });

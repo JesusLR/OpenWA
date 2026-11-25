@@ -4,45 +4,45 @@
  * Conditional steps, each skipped when its target is absent so the hook is a no-op where the
  * piece is missing (the Docker builder stage copies package*.json long before any source):
  *
- *   1. `npm ci` inside dashboard/ when dashboard/ exists — the dashboard carries its own lockfile and
+ *   1. `npm ci` inside dashboard/ when dashboard/ exists: the dashboard carries its own lockfile and
  *      the root install would otherwise leave it without dependencies. We run `npm ci` directly in
  *      dashboard/ with any `npm_config_allow_scripts` environment variable stripped so that npm 11
  *      does not reject `allow-scripts=true` from user `.npmrc` with EALLOWSCRIPTS. A failure here
  *      MUST abort the install: the old inline hook swallowed spawnSync's exit status, so a red
  *      dashboard install still reported `npm install` success and the breakage surfaced only at
  *      build/run time.
- *   2. `node scripts/patch-wwebjs-201832.js --best-effort` when the patcher exists. The patcher
- *      itself decides fatality: under --best-effort it warns and exits 0 for a pristine-but-
- *      unpatched tree (no `patch` binary, Baileys-only user), but exits 1 for a HALF-patched
- *      tree — which must never be waved through. So a non-zero status here is propagated as-is.
- *   3. `node scripts/patch-wwebjs-newsletter-preview.js --best-effort` when present. The production
+ *   2. `node scripts/patch-wwebjs-newsletter-preview.js --best-effort` when present. The production
  *      Docker stage runs it again without best-effort, making dependency drift a build failure.
- *   4. `node scripts/patch-wwebjs-status.js --best-effort` when present — the status posting
- *      repairs, gated the same way as step 3.
- *   5. `node scripts/patch-wwebjs-ready-sync.js --best-effort` when present — the readiness
- *      marker + hasSynced level-check, gated the same way.
- *   6. `node scripts/patch-wwebjs-participant-arity.js --best-effort` when present — makes the group
+ *   3. `node scripts/patch-wwebjs-status.js --best-effort` when present: the status posting
+ *      repairs, gated the same way as step 2.
+ *   4. `node scripts/patch-wwebjs-ready-sync.js --best-effort` when present: the readiness
+ *      marker, gated the same way.
+ *   5. `node scripts/patch-wwebjs-participant-arity.js --best-effort` when present: makes the group
  *      participant writes report which requested ids resolved to members, gated the same way.
- *   7. `node scripts/patch-wwebjs-block.js --best-effort` when present, restoring block and
- *      unblock after WhatsApp Web removed the contact resolver they used.
- *   8. `node scripts/patch-wwebjs-group-description.js --best-effort` when present, realigning the
- *      group-description job call with the options object the page now takes, gated the same way.
- *   9. `node scripts/patch-wwebjs-media-id.js --best-effort` when present, stripping the media
+ *   6. `node scripts/patch-wwebjs-media-id.js --best-effort` when present, stripping the media
  *      model's private id from the outgoing message so media sends work again, gated the same way.
- *  10. `node scripts/patch-wwebjs-send-error.js --best-effort` when present, making a failed send
- *      report what the page threw instead of `t: t`, gated the same way. It runs after the other
- *      two Client.js patchers (steps 2 and 5), so theirs still meet the tree they were written for.
- *  11. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *   7. `node scripts/patch-wwebjs-send-error.js --best-effort` when present, making a failed send
+ *      report what the page threw instead of `t: t`, gated the same way.
+ *   8. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  12. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 11-13 are the Baileys patches. Every patcher runs whenever
+ *   9. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *      newsletter-create parse fix. Steps 8-14 are the Baileys patches. Every patcher runs whenever
  *      its script is present, whatever ENGINE_TYPE is set to.
- *
- *  13. `node scripts/patch-baileys-pairing.js --best-effort` when present, preserving pre-login
+ *  10. `node scripts/patch-baileys-pairing.js --best-effort` when present, preserving pre-login
  *      notification ACKs and refreshing pairing credentials. A partial patch remains fatal.
+ *  11. `node scripts/patch-baileys-media-stream.js --best-effort` when present, so an abandoned
+ *      inbound media download cannot crash the process.
+ *  12. `node scripts/patch-baileys-media-signal.js --best-effort` when present, forwarding
+ *      `options.signal` into `getHttpStream`'s `fetch()` call so aborted downloads cancel promptly.
+ *  13. `node scripts/patch-baileys-status-ack.js --best-effort` when present, decoding and
+ *      acknowledging the top-level `<status>` stanza, so its status is delivered and the server stops
+ *      ending the stream over it.
+ *  14. `node scripts/patch-baileys-event-buffer.js --best-effort` when present, so the library's
+ *      event buffer keeps every group update, history sync lid to phone pair and RSVP it holds.
+ *  15. `node scripts/patch-wwebjs-puppeteer.js` when present. Browser teardown must use the
+ *      connected getter required by Puppeteer 25; an unknown source shape aborts the install.
  *
- * An additional auth-ready patch waits for the socket module before reading it to create a QR.
- * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
+ * Structured with pure planning + injectable spawn, so the spec
  * (scripts/postinstall.spec.js, node:test) exercises every branch without a real npm run.
  */
 'use strict';
@@ -84,15 +84,6 @@ function planSteps(root, env = process.env) {
       options: { stdio: 'inherit', shell: true, cwd: path.join(root, 'dashboard'), env: cleanEnv },
     });
   }
-  const patcher = path.join(root, 'scripts', 'patch-wwebjs-201832.js');
-  if (fs.existsSync(patcher)) {
-    steps.push({
-      name: 'whatsapp-web.js backport (scripts/patch-wwebjs-201832.js --best-effort)',
-      command: process.execPath,
-      args: [patcher, '--best-effort'],
-      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
-    });
-  }
   const previewPatcher = path.join(root, 'scripts', 'patch-wwebjs-newsletter-preview.js');
   if (fs.existsSync(previewPatcher)) {
     steps.push({
@@ -129,26 +120,6 @@ function planSteps(root, env = process.env) {
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }
-  const blockPatcher = path.join(root, 'scripts', 'patch-wwebjs-block.js');
-  if (fs.existsSync(blockPatcher)) {
-    steps.push({
-      name: 'whatsapp-web.js block/unblock LID repair (scripts/patch-wwebjs-block.js --best-effort)',
-      command: process.execPath,
-      args: [blockPatcher, '--best-effort'],
-      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
-    });
-  }
-  const groupDescriptionPatcher = path.join(root, 'scripts', 'patch-wwebjs-group-description.js');
-  if (fs.existsSync(groupDescriptionPatcher)) {
-    steps.push({
-      name:
-        'whatsapp-web.js group description job signature ' +
-        '(scripts/patch-wwebjs-group-description.js --best-effort)',
-      command: process.execPath,
-      args: [groupDescriptionPatcher, '--best-effort'],
-      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
-    });
-  }
   const mediaIdPatcher = path.join(root, 'scripts', 'patch-wwebjs-media-id.js');
   if (fs.existsSync(mediaIdPatcher)) {
     steps.push({
@@ -164,15 +135,6 @@ function planSteps(root, env = process.env) {
       name: 'whatsapp-web.js send error capture (scripts/patch-wwebjs-send-error.js --best-effort)',
       command: process.execPath,
       args: [sendErrorPatcher, '--best-effort'],
-      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
-    });
-  }
-  const authReadyPatcher = path.join(root, 'scripts', 'patch-wwebjs-auth-ready.js');
-  if (fs.existsSync(authReadyPatcher)) {
-    steps.push({
-      name: 'whatsapp-web.js pre-auth socket readiness (scripts/patch-wwebjs-auth-ready.js --best-effort)',
-      command: process.execPath,
-      args: [authReadyPatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }
@@ -200,6 +162,51 @@ function planSteps(root, env = process.env) {
       name: 'Baileys pairing refresh (scripts/patch-baileys-pairing.js --best-effort)',
       command: process.execPath,
       args: [baileysPairingPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const baileysMediaStreamPatcher = path.join(root, 'scripts', 'patch-baileys-media-stream.js');
+  if (fs.existsSync(baileysMediaStreamPatcher)) {
+    steps.push({
+      name: 'Baileys media download stream fix (scripts/patch-baileys-media-stream.js --best-effort)',
+      command: process.execPath,
+      args: [baileysMediaStreamPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const baileysMediaSignalPatcher = path.join(root, 'scripts', 'patch-baileys-media-signal.js');
+  if (fs.existsSync(baileysMediaSignalPatcher)) {
+    steps.push({
+      name: 'Baileys media download AbortSignal forwarding (scripts/patch-baileys-media-signal.js --best-effort)',
+      command: process.execPath,
+      args: [baileysMediaSignalPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const baileysStatusAckPatcher = path.join(root, 'scripts', 'patch-baileys-status-ack.js');
+  if (fs.existsSync(baileysStatusAckPatcher)) {
+    steps.push({
+      name: 'Baileys status stanza ack (scripts/patch-baileys-status-ack.js --best-effort)',
+      command: process.execPath,
+      args: [baileysStatusAckPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const baileysEventBufferPatcher = path.join(root, 'scripts', 'patch-baileys-event-buffer.js');
+  if (fs.existsSync(baileysEventBufferPatcher)) {
+    steps.push({
+      name: 'Baileys event buffer merges (scripts/patch-baileys-event-buffer.js --best-effort)',
+      command: process.execPath,
+      args: [baileysEventBufferPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const puppeteerPatcher = path.join(root, 'scripts', 'patch-wwebjs-puppeteer.js');
+  if (fs.existsSync(puppeteerPatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js Puppeteer compatibility (scripts/patch-wwebjs-puppeteer.js)',
+      command: process.execPath,
+      args: [puppeteerPatcher],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }

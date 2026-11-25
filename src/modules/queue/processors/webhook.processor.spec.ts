@@ -2,7 +2,7 @@ import { DelayedError, Job } from 'bullmq';
 import { FindOperator, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { WebhookOutboxService } from '../../webhook/webhook-outbox.service';
-import { WebhookProcessor } from './webhook.processor';
+import { FAILING_WEBHOOKS_MAX, WebhookProcessor } from './webhook.processor';
 import { MAX_WORKER_CLOSE_WAIT_MS } from './close-worker';
 import { Webhook } from '../../webhook/entities/webhook.entity';
 import { WebhookDeliveryFailure } from '../../webhook/entities/webhook-delivery-failure.entity';
@@ -57,6 +57,10 @@ describe('WebhookProcessor', () => {
         ...overrides,
       },
     }) as unknown as Job<WebhookJobData>;
+
+  // What BullMQ hands the 'failed' listener for a job it failed for stalling: the reason is its deferred failure.
+  const makeStalledJob = (overrides: Partial<WebhookJobData> = {}, attemptsMade = 1): Job<WebhookJobData> =>
+    Object.assign(makeJob(overrides, attemptsMade), { deferredFailure: 'job stalled more than allowable limit' });
 
   beforeEach(() => {
     repo = {
@@ -246,11 +250,33 @@ describe('WebhookProcessor', () => {
     );
   });
 
+  // The outbox copy is closed after this record, so a row recorded while retention was off has to take the copy now.
+  it('hands the replay copy to a terminal row of the same delivery recorded without one', async () => {
+    configService.get.mockImplementation((key: string, def?: unknown) =>
+      key === 'webhook.failurePayloadRetentionHours' ? 24 : def,
+    );
+    mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Service Unavailable' });
+    failureRows.push({ webhookId: 'wh-1', idempotencyKey: 'k', attempts: 3 });
+
+    await expect(processor.process(makeJob({ maxRetries: 3, replayData: { body: 'hi' } }, 2))).rejects.toThrow();
+
+    expect(failureRepo.insert).not.toHaveBeenCalled();
+    expect(failureRepo.update).toHaveBeenCalledWith(
+      expect.objectContaining({ webhookId: 'wh-1', idempotencyKey: 'k' }),
+      { payload: { body: 'hi' } },
+    );
+    expect(outbox.close).toHaveBeenCalled();
+  });
+
   it.each(['terminal', 'stalled'])('drops an old queued replay copy after retention is disabled (%s)', async mode => {
     const job = makeJob({ replayData: { body: 'private' } }, 2);
     mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Unavailable' });
     if (mode === 'terminal') await expect(processor.process(job)).rejects.toThrow();
-    else await processor.onWorkerFailed(job, new Error('job stalled more than allowable limit'));
+    else
+      await processor.onWorkerFailed(
+        Object.assign(job, { deferredFailure: 'job stalled more than allowable limit' }),
+        new Error('job stalled more than allowable limit'),
+      );
     expect(failureRepo.insert).toHaveBeenCalledTimes(1);
     expect((failureRepo.insert.mock.calls as unknown[][])[0][0]).not.toHaveProperty('payload');
   });
@@ -490,7 +516,7 @@ describe('WebhookProcessor', () => {
       });
 
       await processor.onWorkerFailed(
-        makeJob({ webhookId: 'wh-stall', url: 'https://8.8.8.8/old' }, 1),
+        makeStalledJob({ webhookId: 'wh-stall', url: 'https://8.8.8.8/old' }),
         new Error('job stalled more than allowable limit'),
       );
 
@@ -520,16 +546,30 @@ describe('WebhookProcessor', () => {
     ])('files nothing for a job whose webhook was %s', async (_label, row) => {
       repo.findOne.mockResolvedValue(row);
 
-      await processor.onWorkerFailed(makeJob({}, 1), new Error('job stalled more than allowable limit'));
+      await processor.onWorkerFailed(makeStalledJob(), new Error('job stalled more than allowable limit'));
 
       expect(failureRepo.insert).not.toHaveBeenCalled();
       expect(hookManager.execute).not.toHaveBeenCalled();
+      expect(outbox.close).toHaveBeenCalledTimes(1);
+      expect(outbox.close).toHaveBeenCalledWith('wh-1', 'k', 'dispatched');
+    });
+
+    it('clears the failing-receiver gate when a stalled job finds its webhook gone', async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 500, statusText: 'Server Error' });
+      await expect(processor.process(makeJob())).rejects.toThrow('HTTP 500');
+      expect((processor as unknown as { failingWebhooks: Set<string> }).failingWebhooks.has('wh-1')).toBe(true);
+
+      repo.findOne.mockResolvedValueOnce(null);
+      await processor.onWorkerFailed(makeStalledJob(), new Error('job stalled more than allowable limit'));
+
+      expect((processor as unknown as { failingWebhooks: Set<string> }).failingWebhooks.has('wh-1')).toBe(false);
+      expect(outbox.close).toHaveBeenCalledWith('wh-1', 'k', 'dispatched');
     });
 
     it("replaces a replayed delivery's attempts-0 shed row with the stall row", async () => {
       failureRows.push({ webhookId: 'wh-1', idempotencyKey: 'k', attempts: 0 });
 
-      await processor.onWorkerFailed(makeJob({}, 1), new Error('job stalled more than allowable limit'));
+      await processor.onWorkerFailed(makeStalledJob(), new Error('job stalled more than allowable limit'));
 
       expect(failureRows).toEqual([
         expect.objectContaining({
@@ -543,7 +583,7 @@ describe('WebhookProcessor', () => {
     it('still files the stall row when the shed-row delete fails', async () => {
       failureRepo.delete.mockRejectedValueOnce(new Error('db down'));
 
-      await processor.onWorkerFailed(makeJob({}, 1), new Error('job stalled more than allowable limit'));
+      await processor.onWorkerFailed(makeStalledJob(), new Error('job stalled more than allowable limit'));
 
       expect(failureRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ idempotencyKey: 'k', attempts: 1 }));
     });
@@ -556,7 +596,7 @@ describe('WebhookProcessor', () => {
     ])('retires the outbox row once the stall is recorded in %s', async (_label, existing) => {
       failureRows.push(...existing);
 
-      await processor.onWorkerFailed(makeJob({}, 1), new Error('job stalled more than allowable limit'));
+      await processor.onWorkerFailed(makeStalledJob(), new Error('job stalled more than allowable limit'));
 
       expect(outbox.close).toHaveBeenCalledTimes(1);
       expect(outbox.close).toHaveBeenCalledWith('wh-1', 'k', 'dispatched');
@@ -565,7 +605,7 @@ describe('WebhookProcessor', () => {
     it('keeps the outbox row when the stall row cannot be written', async () => {
       failureRepo.insert.mockRejectedValue(new Error('disk unavailable'));
 
-      await processor.onWorkerFailed(makeJob({}, 1), new Error('job stalled more than allowable limit'));
+      await processor.onWorkerFailed(makeStalledJob(), new Error('job stalled more than allowable limit'));
 
       expect(failureRepo.insert).toHaveBeenCalledTimes(1);
       expect(outbox.close).not.toHaveBeenCalled();
@@ -574,7 +614,7 @@ describe('WebhookProcessor', () => {
     it('still records the stall against the enqueue-time URL when the webhook row cannot be read', async () => {
       repo.findOne.mockRejectedValue(new Error('db down'));
 
-      await processor.onWorkerFailed(makeJob({}, 1), new Error('job stalled more than allowable limit'));
+      await processor.onWorkerFailed(makeStalledJob(), new Error('job stalled more than allowable limit'));
 
       expect(failureRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://8.8.8.8/hook' }));
     });
@@ -584,6 +624,20 @@ describe('WebhookProcessor', () => {
 
       expect(failureRepo.insert).not.toHaveBeenCalled();
       expect(hookManager.execute).not.toHaveBeenCalled();
+    });
+
+    it('does not dead-letter an ordinary error with the stall message before a successful retry', async () => {
+      const error = new Error('job stalled more than allowable limit');
+      repo.findOne.mockRejectedValueOnce(error);
+      await expect(processor.process(makeJob())).rejects.toBe(error);
+      await processor.onWorkerFailed(makeJob({}, 1), error);
+      mockFetch.mockResolvedValue({ ok: true, status: 200 });
+
+      await expect(processor.process(makeJob({}, 1))).resolves.toMatchObject({ success: true });
+
+      expect(failureRepo.insert).not.toHaveBeenCalled();
+      expect(failureRows).toEqual([]);
+      expect(hookManager.execute).not.toHaveBeenCalledWith('webhook:error', expect.anything(), expect.anything());
     });
 
     it('ignores an undefined job (BullMQ may pass none when removeOnFail deleted it first)', async () => {
@@ -784,6 +838,47 @@ describe('WebhookProcessor', () => {
 
     it('waits no longer than the close cap for a long delivery timeout', async () => {
       expect(await settleAfter(25_000)).toBe(MAX_WORKER_CLOSE_WAIT_MS);
+    });
+  });
+
+  describe('failingWebhooks cap', () => {
+    it('caps failingWebhooks at 10_000, refreshing recency on repeat failure and evicting oldest past cap', async () => {
+      const internal = processor as unknown as { failingWebhooks: Set<string> };
+      for (let i = 0; i < FAILING_WEBHOOKS_MAX; i++) {
+        internal.failingWebhooks.add(`wh-${i}`);
+      }
+      expect(internal.failingWebhooks.size).toBe(FAILING_WEBHOOKS_MAX);
+
+      // Repeat failure on wh-0 refreshes its recency so wh-1 becomes the oldest entry.
+      repo.findOne.mockResolvedValue({
+        id: 'wh-0',
+        sessionId: 'sess-1',
+        url: 'https://8.8.8.8/hook',
+        events: ['message.received'],
+        active: true,
+        secret: null,
+        headers: {},
+      });
+      mockFetch.mockRejectedValueOnce(new Error('connect ECONNREFUSED'));
+      await expect(processor.process(makeJob({ webhookId: 'wh-0', maxRetries: 3 }, 0))).rejects.toThrow();
+
+      // Failing a new webhook wh-10000 must evict wh-1 (oldest) and retain wh-0 and wh-10000.
+      repo.findOne.mockResolvedValue({
+        id: 'wh-10000',
+        sessionId: 'sess-1',
+        url: 'https://8.8.8.8/hook',
+        events: ['message.received'],
+        active: true,
+        secret: null,
+        headers: {},
+      });
+      mockFetch.mockRejectedValueOnce(new Error('connect ECONNREFUSED'));
+      await expect(processor.process(makeJob({ webhookId: 'wh-10000', maxRetries: 3 }, 0))).rejects.toThrow();
+
+      expect(internal.failingWebhooks.size).toBe(FAILING_WEBHOOKS_MAX);
+      expect(internal.failingWebhooks.has('wh-0')).toBe(true);
+      expect(internal.failingWebhooks.has('wh-1')).toBe(false);
+      expect(internal.failingWebhooks.has('wh-10000')).toBe(true);
     });
   });
 });

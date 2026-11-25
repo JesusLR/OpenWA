@@ -192,25 +192,160 @@ test('an @mention of a participant who posted in the thread shows their first na
   assert.equal(container.querySelector('.quote-body bdi')?.textContent, '@Bob');
 });
 
-test('a document sent by URL opens in a new tab instead of navigating the dashboard away', () => {
-  // Browsers ignore `download` on a cross-origin link, so a plain click would unload the dashboard.
-  const doc = (id: string, data: string): ChatMessageView => ({
+test('remote documents open in a new tab while inline documents download via an inert Blob URL button', () => {
+  // Browsers ignore `download` on a cross-origin link, so remote documents open in a new tab;
+  // inline documents avoid exposing clickable `data:` links by downloading an inert octet-stream Blob
+  // and deferring URL revocation so async download pipelines (Safari/Firefox) can open the Blob stream.
+  const doc = (id: string, data: string, mimetype = 'application/pdf', filename = `${id}.pdf`): ChatMessageView => ({
     ...PROMPT,
     id,
     waMessageId: `wamid.${id}`,
     body: '',
     type: 'document',
-    metadata: { media: { mimetype: 'application/pdf', filename: `${id}.pdf`, data } },
+    metadata: { media: { mimetype, filename, data } },
+  });
+  const createdBlobs: Blob[] = [];
+  const revokedUrls: string[] = [];
+  const downloads: Array<{ href: string | null; download: string | null }> = [];
+  const createOriginal = URL.createObjectURL;
+  const revokeOriginal = URL.revokeObjectURL;
+  const clickOriginal = HTMLAnchorElement.prototype.click;
+  URL.createObjectURL = (obj: Blob | MediaSource) => {
+    createdBlobs.push(obj as Blob);
+    return `blob:inline-${createdBlobs.length}`;
+  };
+  URL.revokeObjectURL = (url: string) => {
+    revokedUrls.push(url);
+  };
+  HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+    downloads.push({ href: this.getAttribute('href'), download: this.getAttribute('download') });
+  };
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const { container } = renderThread('operator', [
+      doc('remote', 'https://files.example.com/remote.pdf'),
+      doc('inline', 'JVBERi0='),
+      doc('html', 'data:text/html;base64,PGh0bWw+', 'text/html', 'report.html'),
+    ]);
+    const remoteLinks = Array.from(container.querySelectorAll<HTMLAnchorElement>('a.chat-document-media'));
+    assert.equal(remoteLinks.length, 1);
+    assert.equal(remoteLinks[0].getAttribute('href'), 'https://files.example.com/remote.pdf');
+    assert.equal(remoteLinks[0].getAttribute('target'), '_blank');
+    assert.equal(remoteLinks[0].getAttribute('rel'), 'noopener noreferrer');
+
+    const inlineButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('button.chat-document-media.chat-document-card'),
+    );
+    assert.equal(inlineButtons.length, 2);
+    assert.equal(inlineButtons[0].getAttribute('type'), 'button');
+    assert.equal(inlineButtons[1].getAttribute('type'), 'button');
+
+    rtl.fireEvent.click(inlineButtons[0]);
+    rtl.fireEvent.click(inlineButtons[1]);
+
+    assert.equal(createdBlobs.length, 2);
+    assert.equal(createdBlobs[0].type, 'application/octet-stream');
+    assert.equal(createdBlobs[1].type, 'application/octet-stream');
+    assert.deepEqual(downloads, [
+      { href: 'blob:inline-1', download: 'inline.pdf' },
+      { href: 'blob:inline-2', download: 'report.html' },
+    ]);
+    // Must not revoke synchronously before the browser starts reading the Blob URL.
+    assert.deepEqual(revokedUrls, []);
+
+    mock.timers.tick(1000);
+    assert.deepEqual(revokedUrls, ['blob:inline-1', 'blob:inline-2']);
+  } finally {
+    mock.timers.reset();
+    URL.createObjectURL = createOriginal;
+    URL.revokeObjectURL = revokeOriginal;
+    HTMLAnchorElement.prototype.click = clickOriginal;
+  }
+});
+
+test('inline document download revokes immediately if link click throws before handoff', () => {
+  const revokedUrls: string[] = [];
+  const createOriginal = URL.createObjectURL;
+  const revokeOriginal = URL.revokeObjectURL;
+  const clickOriginal = HTMLAnchorElement.prototype.click;
+  URL.createObjectURL = () => 'blob:failed-click';
+  URL.revokeObjectURL = (url: string) => {
+    revokedUrls.push(url);
+  };
+  HTMLAnchorElement.prototype.click = () => {
+    throw new Error('click blocked');
+  };
+  try {
+    const { container } = renderThread('operator', [
+      {
+        ...PROMPT,
+        id: 'inline-err',
+        waMessageId: 'wamid.inline-err',
+        body: '',
+        type: 'document',
+        metadata: { media: { mimetype: 'application/pdf', filename: 'doc.pdf', data: 'JVBERi0=' } },
+      },
+    ]);
+    const button = container.querySelector<HTMLButtonElement>('button.chat-document-media.chat-document-card');
+    assert.ok(button);
+    // React captures click errors or rethrows via window; ensure revoke ran either way.
+    try {
+      rtl.fireEvent.click(button);
+    } catch {
+      // Expected from throwing stub.
+    }
+    assert.deepEqual(revokedUrls, ['blob:failed-click']);
+  } finally {
+    URL.createObjectURL = createOriginal;
+    URL.revokeObjectURL = revokeOriginal;
+    HTMLAnchorElement.prototype.click = clickOriginal;
+  }
+});
+
+test('a document shows as a card with its name and size, whether the page holds it or has to fetch it', () => {
+  const media = (id: string, type: ChatMessageView['type'], info: Record<string, unknown>): ChatMessageView => ({
+    ...PROMPT,
+    id,
+    waMessageId: `wamid.${id}`,
+    body: '',
+    type,
+    metadata: { media: { mimetype: 'application/pdf', filename: `${id}.pdf`, ...info } },
   });
   const { container } = renderThread('operator', [
-    doc('remote', 'https://files.example.com/remote.pdf'),
-    doc('inline', 'JVBERi0='),
+    media('held', 'document', { data: 'JVBERi0=' }),
+    media('left-out', 'document', { omitted: true, sizeBytes: 2 * 1024 * 1024 }),
+    media('sheet', 'document', {
+      omitted: true,
+      sizeBytes: 3072,
+      mimetype: 'application/vnd.ms-excel',
+      filename: 'sheet.xls',
+    }),
+    media('photo', 'image', { omitted: true, sizeBytes: 3072, mimetype: 'image/jpeg', filename: 'photo.jpg' }),
   ]);
-  const [remote, inline] = Array.from(container.querySelectorAll<HTMLAnchorElement>('a.chat-document-media'));
-  assert.equal(remote.getAttribute('target'), '_blank');
-  assert.equal(remote.getAttribute('rel'), 'noopener noreferrer');
-  assert.equal(inline.getAttribute('target'), null);
-  assert.equal(inline.getAttribute('download'), 'inline.pdf');
+  const card = (id: string) => container.querySelector(`[data-wa-message-id="wamid.${id}"] .chat-document-card`);
+  const text = (id: string, part: string) => card(id)?.querySelector(`.chat-document-${part}`)?.textContent;
+
+  // Held by the page: the card is an inert download button. No size is known for it, so only the kind is named.
+  assert.equal(card('held')?.tagName, 'BUTTON');
+  assert.equal(card('held')?.getAttribute('href'), null);
+  assert.equal(text('held', 'title'), 'held.pdf');
+  assert.equal(text('held', 'meta'), 'PDF');
+
+  // Left out of the list: the card is the button that fetches it, and carries the size the marker gave.
+  assert.equal(card('left-out')?.tagName, 'BUTTON');
+  assert.equal(text('left-out', 'title'), 'left-out.pdf');
+  assert.equal(text('left-out', 'meta'), '2 MB \u2022 PDF');
+
+  // Not a PDF: no PDF mark, the size alone.
+  assert.equal(text('sheet', 'title'), 'sheet.xls');
+  assert.equal(text('sheet', 'meta'), '3 KB');
+  assert.equal(card('sheet')?.querySelector('.chat-document-pdf-tag'), null);
+
+  // Media that is not a document keeps its plain label.
+  const photo = container.querySelector('[data-wa-message-id="wamid.photo"] button.message-media-omitted');
+  assert.ok(photo);
+  assert.equal(photo.classList.contains('chat-document-card'), false);
+  assert.equal(photo.querySelector('.chat-document-title'), null);
 });
 
 test('archive-only media previews inline from the media route; a plain omitted marker and a document keep the button', async () => {
@@ -223,6 +358,7 @@ test('archive-only media previews inline from the media route; a plain omitted m
     waMessageId: `wamid.${id}`,
     body: '',
     type,
+    mediaPath: archived ? `chat-media/${id}` : null,
     metadata: { media: { mimetype: 'image/jpeg', filename: `${id}.jpg`, omitted: true, sizeBytes: 10, archived } },
   });
   const fetched: string[] = [];
@@ -258,6 +394,59 @@ test('archive-only media previews inline from the media route; a plain omitted m
   }
 });
 
+test('an archived marker whose stored copy retention deleted keeps the download button and fetches nothing', async () => {
+  // Retention deletes the archived copy and clears `mediaPath`, while a row an older gateway purged keeps `archived`.
+  // A fetch for such a bubble could only 404, spending the media route's per-minute budget the live previews share.
+  const media = (
+    id: string,
+    type: ChatMessageView['type'],
+    mimetype: string,
+    mediaPath: string | null,
+  ): ChatMessageView => ({
+    ...PROMPT,
+    id,
+    waMessageId: `wamid.${id}`,
+    body: '',
+    type,
+    mediaPath,
+    metadata: { media: { mimetype, filename: `${id}.bin`, omitted: true, sizeBytes: 10, archived: true } },
+  });
+  const fetched: string[] = [];
+  const fetchOriginal = globalThis.fetch;
+  const createOriginal = URL.createObjectURL;
+  const revokeOriginal = URL.revokeObjectURL;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    fetched.push(String(input));
+    return new Response(new Blob(['x'], { type: 'image/jpeg' }), { status: 200 });
+  }) as typeof fetch;
+  URL.createObjectURL = () => 'blob:archived';
+  URL.revokeObjectURL = () => {};
+  try {
+    const { container } = renderThread('viewer', [
+      media('purged-image', 'image', 'image/jpeg', null),
+      media('purged-voice', 'voice', 'audio/ogg; codecs=opus', null),
+      media('kept', 'image', 'image/jpeg', 'chat-media/kept'),
+    ]);
+    await rtl.waitFor(() => {
+      assert.ok(container.querySelector('[data-wa-message-id="wamid.kept"] img.chat-image-media'), 'no preview');
+    });
+    await rtl.act(() => new Promise(resolve => setTimeout(resolve, 0)));
+    assert.deepEqual(
+      fetched.map(url => url.split('/').slice(-2).join('/')),
+      ['wamid.kept/media'],
+      'a bubble with no stored copy was fetched',
+    );
+    for (const id of ['purged-image', 'purged-voice']) {
+      const button = container.querySelector(`[data-wa-message-id="wamid.${id}"] button.message-media-omitted`);
+      assert.ok(button, `${id} lost its download button`);
+    }
+  } finally {
+    globalThis.fetch = fetchOriginal;
+    URL.createObjectURL = createOriginal;
+    URL.revokeObjectURL = revokeOriginal;
+  }
+});
+
 test('an archived image is observed against the thread scroller and saved under its own name, or one unique to its message', async () => {
   // ArchivedMediaPreview is covered on its own; this pins what the thread hands it. The scroll container
   // as observer root keeps the lazy-load lead from being clipped to the container's own box, the stored
@@ -268,6 +457,7 @@ test('an archived image is observed against the thread scroller and saved under 
     waMessageId: `wamid.${id}`,
     body: '',
     type: 'image',
+    mediaPath: `chat-media/${id}`,
     metadata: { media: { mimetype: 'image/jpeg', filename, omitted: true, sizeBytes: 10, archived: true } },
   });
   const roots: unknown[] = [];
@@ -341,7 +531,7 @@ test('a media download answered after sign-out saves no file', async () => {
     type: 'document',
     metadata: { media: { mimetype: 'application/pdf', filename: 'report.pdf', omitted: true, sizeBytes: 10 } },
   };
-  window.sessionStorage.setItem('openwa_api_key', 'key-a');
+  window.sessionStorage.setItem('openwa_api_key_id', 'key-a');
   const fetchOriginal = globalThis.fetch;
   const createOriginal = URL.createObjectURL;
   const revokeOriginal = URL.revokeObjectURL;
@@ -363,7 +553,7 @@ test('a media download answered after sign-out saves no file', async () => {
     assert.ok(button, 'the over-budget document did not render its download button');
     rtl.fireEvent.click(button);
     await rtl.waitFor(() => assert.ok(answer, 'the download did not start'));
-    window.sessionStorage.removeItem('openwa_api_key');
+    window.sessionStorage.removeItem('openwa_api_key_id');
     answer(new Response(new Blob(['x']), { status: 200 }));
     await new Promise(resolve => setTimeout(resolve, 50));
     assert.deepEqual(saved, [], 'the media file was saved after the sign-out');
@@ -372,7 +562,7 @@ test('a media download answered after sign-out saves no file', async () => {
     URL.createObjectURL = createOriginal;
     URL.revokeObjectURL = revokeOriginal;
     document.createElement = createElementOriginal;
-    window.sessionStorage.removeItem('openwa_api_key');
+    window.sessionStorage.removeItem('openwa_api_key_id');
   }
 });
 
@@ -395,7 +585,7 @@ test('poll messages display exact choices, including outgoing and legacy polls',
     Array.from(container.querySelectorAll('li bdi')).map(node => node.textContent),
     [...poll.options, ...poll.options],
   );
-  assert.equal(container.querySelector('script'), null);
+  assert.equal(container.querySelectorAll('script').length, 0);
   assert.ok(container.textContent?.includes('Legacy question'));
 });
 
@@ -413,6 +603,7 @@ test('an archived sticker previews as an image and an archived voice note as aud
     waMessageId: `wamid.${id}`,
     body: '',
     type,
+    mediaPath: `chat-media/${id}`,
     metadata: { media: { mimetype, filename: `${id}.bin`, omitted: true, sizeBytes: 10, archived: true } },
   });
   const fetchOriginal = globalThis.fetch;
@@ -436,6 +627,39 @@ test('an archived sticker previews as an image and an archived voice note as aud
     URL.revokeObjectURL = revokeOriginal;
   }
 });
+
+// An image or sticker whose bytes came with the message opens the media viewer from the keyboard as from a click,
+// the way an archived preview does: a control of its own in the tab order, opened with Enter or Space.
+for (const [role, type] of [
+  ['operator', 'image'],
+  ['viewer', 'image'],
+  ['operator', 'sticker'],
+] as const) {
+  test(`an inline ${type} is a control that Enter and Space open in the viewer (${role} key)`, () => {
+    const opened: string[] = [];
+    const message: ChatMessageView = {
+      ...PROMPT,
+      id: `db-${type}`,
+      waMessageId: `wamid.${type}`,
+      body: '',
+      type,
+      metadata: { media: { mimetype: 'image/png', data: 'iVBORw0KGgo=' } },
+    };
+    const { container } = renderThread(role, [message], CHAT, { onOpenImage: id => opened.push(id) });
+    const image = container.querySelector<HTMLImageElement>('img.chat-image-media');
+    assert.ok(image, `the inline ${type} did not render`);
+    rtl.fireEvent.click(image);
+    assert.deepEqual(opened, [message.id], 'a click did not open the viewer');
+
+    assert.equal(image.tabIndex, 0, `the ${type} is not in the tab order (tabIndex ${image.tabIndex})`);
+    assert.equal(image.getAttribute('role'), 'button', `the ${type} is not exposed as a control`);
+    assert.equal(image.getAttribute('aria-haspopup'), 'dialog');
+    rtl.fireEvent.keyDown(image, { key: 'Enter' });
+    rtl.fireEvent.keyDown(image, { key: ' ' });
+    rtl.fireEvent.keyDown(image, { key: 'a' });
+    assert.deepEqual(opened, [message.id, message.id, message.id], 'Enter or Space did not open the viewer');
+  });
+}
 
 // The message actions appear on hover, so a keyboard user reaches them through the bubble: one tab stop
 // for the thread (the focused message, else the newest) and the arrow keys between messages.
@@ -1307,10 +1531,17 @@ test('the scroll-to-bottom button is sticky inside the scroller, not absolute, a
   const css = readFileSync(new URL('../../pages/Chats.css', import.meta.url), 'utf8');
   const rule = /\.chats-page \.scroll-to-bottom-btn \{([^}]*)\}/.exec(css)?.[1] ?? '';
   assert.match(rule, /position:\s*sticky;/);
-  assert.match(rule, /bottom:\s*1rem;/);
+  assert.match(rule, /bottom:\s*[\d.]+rem;/);
   assert.match(rule, /align-self:\s*flex-end;/);
-  assert.match(rule, /margin-top:\s*calc\(-40px - 0\.75rem\);/);
   assert.doesNotMatch(rule, /position:\s*absolute/);
+  const plain = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const button = declarationsOf(plain, '.chats-page .scroll-to-bottom-btn');
+  const gap = lengthPx(declarationsOf(plain, '.chats-page .room-messages').gap);
+  assert.equal(
+    lengthPx(button['margin-top']),
+    -(lengthPx(button.height) + gap),
+    'the negative margin takes back the height and the gap the button adds to the scroll height',
+  );
   const menu = /\.chats-page \.message-actions-menu \{([^}]*)\}/.exec(css)?.[1] ?? '';
   const level = (text: string): number => Number(/z-index:\s*(\d+);/.exec(text)?.[1]);
   assert.ok(level(rule) < level(menu), 'the jump button paints over the actions menu');
@@ -1363,6 +1594,19 @@ function lengthPx(value: string, vars: Record<string, string> = {}, emPx = 16): 
     .replace(/(-?\d*\.?\d+)em/g, `($1*${emPx})`)
     .replace(/px/g, '');
   return Function(`return (${expression})`)() as number;
+}
+
+// Where the first text of a thread begins, below its padding. A thread opens with the day pill of its first
+// message (see the render test below), so that pill's text is the first a reader at the top of the thread sees.
+function firstTextStartsPx(): number {
+  const thread = declarationsOf(chatsCss, '.chats-page .room-messages');
+  const day = declarationsOf(chatsCss, '.chats-page .day-separator');
+  const pill = declarationsOf(chatsCss, '.chats-page .day-separator span');
+  return (
+    lengthPx(thread.padding) +
+    lengthPx(day['margin-block'].split(' ')[0]) +
+    lengthPx(pill['padding-block'].split(' ')[0])
+  );
 }
 
 // The older-page indicator sat in flow above the oldest bubble, so it pushed the reader's content down by its
@@ -1420,11 +1664,9 @@ test('the older-page indicator takes no room in the thread, loading or failed', 
   const box = Math.max(lineClamp * line + 2 * (border + paddingBlock), lengthPx(failed['min-height'], own));
   // The text paints into the room the clip leaves it below the last line, past the border.
   const ink = border + paddingBlock + lineClamp * line + clipRoom;
-  const bubble = rule('.chats-page .message-bubble');
-  const textStarts = padding + lengthPx(bubble.padding.split(' ')[0], own);
   assert.ok(
-    lengthPx(failed.top, own) + Math.max(box, ink) <= textStarts,
-    "the failure indicator, at two lines, ends above the first message's text",
+    lengthPx(failed.top, own) + Math.max(box, ink) <= firstTextStartsPx(),
+    "the failure indicator, at two lines, ends above the thread's first text",
   );
 });
 
@@ -1538,10 +1780,8 @@ test('the loading label may take two lines in a thread of 18rem or less, and no 
   const border = lengthPx(base.border.split(' ')[0], own);
   const height = lengthPx(base.height, own);
   assert.ok(lines * line + 2 * border <= height, 'the two lines fit inside the height of the pill');
-  const bubble = declarationsOf(chatsCss, '.chats-page .message-bubble');
-  const textStarts = padding + lengthPx(bubble.padding.split(' ')[0], own);
   const top = padding + lengthPx(base['margin-top'], own);
-  assert.ok(top + height <= textStarts, "the wrapped pill ends above the first message's text");
+  assert.ok(top + height <= firstTextStartsPx(), "the wrapped pill ends above the thread's first text");
 });
 
 test('a failed older page renders the whole sentence and the retry instruction as two texts', () => {
@@ -1613,6 +1853,39 @@ function threadWithOlderPageOut(start: number, props: Partial<ComponentProps<typ
   const fail = () => rendered.rerenderProps({ loadingOlderMessages: false, messagesError: true });
   return { ...rendered, requests, scroller, fail };
 }
+
+// A failed refresh of a thread that has pages is retried by pressing the strip, since scrolling up asks for an older page.
+test('the strip of a failed refresh is a button that retries it, and is disabled while the retry runs', () => {
+  let presses = 0;
+  const { container, rerenderProps } = renderThread('operator', [PROMPT], CHAT, {
+    messagesError: true,
+    refreshFailed: true,
+    refreshing: false,
+    onLoadOlderMessages: () => {
+      presses += 1;
+    },
+  });
+  const strip = () => container.querySelector<HTMLButtonElement>('button.messages-loading-older.failed.retry');
+  assert.ok(strip(), 'a failed refresh shows a strip that can be pressed');
+  assert.match(strip()?.textContent ?? '', /refresh the messages/i);
+  assert.ok(!/scroll up/i.test(strip()?.textContent ?? ''), 'a refresh is not retried by scrolling');
+  assert.equal(strip()?.disabled, false);
+
+  rtl.fireEvent.click(strip() as HTMLButtonElement);
+  assert.equal(presses, 1);
+
+  rerenderProps({ refreshing: true });
+  assert.equal(strip()?.disabled, true);
+  assert.equal(strip()?.getAttribute('aria-busy'), 'true');
+  rtl.fireEvent.click(strip() as HTMLButtonElement);
+  assert.equal(presses, 1, 'a retry that is running is not asked for again');
+});
+
+test('the strip of a failed older page is not a button, and a loading older page shows its spinner', () => {
+  const failed = renderThread('operator', [PROMPT], CHAT, { messagesError: true, refreshFailed: false });
+  assert.ok(failed.container.querySelector('.messages-loading-older.failed'));
+  assert.equal(failed.container.querySelector('button.messages-loading-older') === null, true);
+});
 
 test('a failure that lands with the reader at the top moves the thread one pixel, and asks for no page', () => {
   const { requests, scroller, fail } = threadWithOlderPageOut(0);
@@ -1820,4 +2093,447 @@ test('focus that arrives by keyboard clears the pointer mark a click left, and a
 
   bubble.focus();
   assert.equal(thread.hasAttribute('data-pointer'), false);
+});
+
+test('shows the edited indicator for a persisted message and keeps it after remount', () => {
+  const message = { ...PROMPT, metadata: { edited: true } };
+  const { container } = renderThread('viewer', [message]);
+  assert.equal(container.querySelector('.message-edited')?.textContent, 'Edited');
+  rtl.cleanup();
+  const reloaded = renderThread('viewer', [JSON.parse(JSON.stringify(message)) as ChatMessageView]);
+  assert.equal(reloaded.container.querySelector('.message-edited')?.textContent, 'Edited');
+});
+
+test('does not label an unedited or revoked message as edited', () => {
+  const { container } = renderThread('viewer', [
+    { ...PROMPT, metadata: undefined },
+    { ...PROMPT, id: 'revoked', waMessageId: 'revoked', type: 'revoked', metadata: { edited: true } },
+  ]);
+  assert.equal(container.querySelectorAll('.message-edited').length, 0);
+});
+
+// Two messages one day apart, and a reply on the second day from the other side.
+const DAY = 86_400;
+const dayThread = (): ChatMessageView[] => [
+  { ...PROMPT, id: 'd1', waMessageId: 'wamid.d1', body: 'first day', metadata: undefined },
+  {
+    ...PROMPT,
+    id: 'd2',
+    waMessageId: 'wamid.d2',
+    body: 'second day',
+    timestamp: PROMPT.timestamp! + DAY,
+    metadata: undefined,
+  },
+  {
+    ...PROMPT,
+    id: 'd3',
+    waMessageId: 'wamid.d3',
+    body: 'reply',
+    direction: 'outgoing',
+    status: 'read',
+    timestamp: PROMPT.timestamp! + DAY + 60,
+    metadata: undefined,
+  },
+];
+
+// The older-page indicator is measured against the first text of the thread, which this pill is: a thread
+// always opens with the day of its first message.
+test('a thread opens with the day of its first message, and each new day gets a pill of its own', () => {
+  const { container } = renderThread('operator', dayThread());
+  const children = Array.from(container.querySelector('.room-messages')!.children);
+  assert.ok(children[0].classList.contains('day-separator'), 'the thread opens with a day pill');
+  assert.equal(container.querySelectorAll('.day-separator').length, 2, 'one pill per day');
+  // A pill is never an anchor the scroll hook holds the reader by: only messages are.
+  assert.ok(!children[0].hasAttribute('data-scroll-anchor'), 'the day pill is not a scroll anchor');
+});
+
+test('the first bubble of a run from one side starts a run, and a new day starts one too', () => {
+  const { container } = renderThread('operator', dayThread());
+  const starts = Array.from(container.querySelectorAll('.message-bubble-wrapper')).map(wrapper =>
+    wrapper.classList.contains('run-start'),
+  );
+  assert.deepEqual(starts, [true, true, true]);
+
+  rtl.cleanup();
+  const sameDay = dayThread().map(message => ({ ...message, direction: 'incoming' as const }));
+  sameDay[0] = { ...sameDay[0], timestamp: sameDay[1].timestamp };
+  const { container: oneRun } = renderThread('operator', sameDay);
+  const runStarts = Array.from(oneRun.querySelectorAll('.message-bubble-wrapper')).map(wrapper =>
+    wrapper.classList.contains('run-start'),
+  );
+  assert.deepEqual(runStarts, [true, false, false], 'one side on one day is a single run');
+});
+
+const OMITTED_DOCUMENT: ChatMessageView = {
+  ...PROMPT,
+  id: 'big',
+  waMessageId: 'wamid.big',
+  body: '',
+  type: 'document',
+  metadata: { media: { mimetype: 'application/pdf', filename: 'report.pdf', omitted: true, sizeBytes: 10 } },
+};
+
+/** The answer of the S3 gateway while its download pool is full. */
+const poolFull = (): Response =>
+  new Response(JSON.stringify({ statusCode: 503, message: 'Too many media downloads are in progress' }), {
+    status: 503,
+    headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
+  });
+
+/**
+ * Click the download button of OMITTED_DOCUMENT with its media route answered by `answer` (given the request's
+ * number, from 1), and run `check` while the stubs hold. A saved file is recorded by name instead of downloaded.
+ */
+async function clickDownload(
+  answer: (call: number) => Response,
+  check: (state: { container: HTMLElement; saved: string[]; calls: () => number }) => Promise<void>,
+): Promise<void> {
+  window.sessionStorage.setItem('openwa_api_key_id', 'key-a');
+  const fetchOriginal = globalThis.fetch;
+  const createOriginal = URL.createObjectURL;
+  const revokeOriginal = URL.revokeObjectURL;
+  const createElementOriginal = document.createElement;
+  const saved: string[] = [];
+  let calls = 0;
+  globalThis.fetch = (() => Promise.resolve(answer(++calls))) as typeof fetch;
+  URL.createObjectURL = () => 'blob:report';
+  URL.revokeObjectURL = () => {};
+  document.createElement = ((tag: string, options?: ElementCreationOptions) => {
+    const element = createElementOriginal.call(document, tag, options);
+    if (tag === 'a')
+      (element as HTMLAnchorElement).click = () => void saved.push((element as HTMLAnchorElement).download);
+    return element;
+  }) as typeof document.createElement;
+  try {
+    const { container } = renderThread('operator', [OMITTED_DOCUMENT]);
+    const button = container.querySelector('[data-wa-message-id="wamid.big"] button.message-media-omitted');
+    assert.ok(button, 'the over-budget document did not render its download button');
+    rtl.fireEvent.click(button);
+    await check({ container, saved, calls: () => calls });
+  } finally {
+    globalThis.fetch = fetchOriginal;
+    URL.createObjectURL = createOriginal;
+    URL.revokeObjectURL = revokeOriginal;
+    document.createElement = createElementOriginal;
+    window.sessionStorage.removeItem('openwa_api_key_id');
+  }
+}
+
+const saysUnavailable = (container: HTMLElement): boolean =>
+  container.querySelector('[data-wa-message-id="wamid.big"]')?.textContent?.includes('Media unavailable') ?? false;
+
+// On S3 the gateway refuses a media download at once while its download pool is full (503 with Retry-After), and a
+// place frees as soon as one download ends. The bytes are there: the download is tried again after the wait, and the
+// bubble never says they are unavailable.
+test('a media download refused while the download pool is full is tried again and saves the file', async () => {
+  await clickDownload(
+    call => (call === 1 ? poolFull() : new Response(new Blob(['x']), { status: 200 })),
+    async ({ container, saved, calls }) => {
+      await rtl.waitFor(() => assert.deepEqual(saved, ['report.pdf'], 'the refused download was not tried again'), {
+        timeout: 10_000,
+      });
+      assert.equal(calls(), 2);
+      assert.equal(
+        saysUnavailable(container),
+        false,
+        'the bubble says the media is unavailable after a refusal for a full download pool',
+      );
+    },
+  );
+});
+
+test('a media download answered 404 says the media is unavailable without asking again', async () => {
+  await clickDownload(
+    () =>
+      new Response(JSON.stringify({ statusCode: 404, message: 'Media not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    async ({ container, saved, calls }) => {
+      await rtl.waitFor(() => assert.ok(saysUnavailable(container), 'the bubble did not say the media is unavailable'));
+      assert.equal(calls(), 1, 'a missing file was asked for again');
+      assert.deepEqual(saved, []);
+    },
+  );
+});
+
+test('a media download waiting to retry after a refusal is cancelled on sign-out without asking again', async () => {
+  await clickDownload(
+    call => (call === 1 ? poolFull() : new Response(new Blob(['x']), { status: 200 })),
+    async ({ container, saved, calls }) => {
+      await rtl.waitFor(() => assert.equal(calls(), 1));
+      window.sessionStorage.removeItem('openwa_api_key_id');
+      await new Promise(resolve => setTimeout(resolve, 1_250));
+      assert.equal(calls(), 1);
+      assert.deepEqual(saved, [], 'the media file was saved after the sign-out');
+      assert.equal(saysUnavailable(container), false, 'sign-out marked the media as unavailable');
+    },
+  );
+});
+
+test('a media download whose retry is answered after sign-out saves no file', async () => {
+  const retried = new Response(new Blob(['x']), { status: 200 });
+  const readBlob = retried.blob.bind(retried);
+  let read: Promise<Blob> | undefined;
+  retried.blob = () => {
+    window.sessionStorage.removeItem('openwa_api_key_id');
+    return (read = readBlob());
+  };
+  await clickDownload(
+    call => (call === 1 ? poolFull() : retried),
+    async ({ saved, calls }) => {
+      await rtl.waitFor(() => assert.ok(read, 'the refused download was not tried again'), { timeout: 10_000 });
+      await read;
+      // The rest of the download after the body is read is promise jobs, all run before this timer.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(calls(), 2);
+      assert.deepEqual(saved, [], 'the media file was saved after the sign-out');
+    },
+  );
+});
+
+test('outgoing history message without status draws no tick or undefined class while stored message keeps them', () => {
+  const histOutgoing: ChatMessageView = {
+    ...PROMPT,
+    id: 'hist-out',
+    waMessageId: 'true_15551234567@c.us_HIST',
+    from: '15559990000@c.us',
+    to: CHAT.id,
+    body: 'from phone history',
+    direction: 'outgoing',
+    status: undefined,
+    metadata: undefined,
+  };
+  const storedOutgoing: ChatMessageView = {
+    ...histOutgoing,
+    id: 'db-out',
+    waMessageId: 'true_15551234567@c.us_DB',
+    body: 'from stored db',
+    status: 'sent',
+    timestamp: PROMPT.timestamp! + 60,
+  };
+  const { container } = renderThread('operator', [histOutgoing, storedOutgoing]);
+
+  const histWrapper = container.querySelector('[data-wa-message-id="true_15551234567@c.us_HIST"]')!;
+  const histBubble = histWrapper.querySelector('.message-bubble')!;
+  const histSpacer = histWrapper.querySelector('.meta-spacer')!;
+  assert.equal(histWrapper.querySelector('.message-status-icon') === null, true);
+  assert.equal(histSpacer.classList.contains('with-status'), false);
+  assert.equal(histBubble.classList.contains('undefined'), false);
+  assert.ok(histWrapper.querySelector('.delete-btn'), 'outgoing history row with waMessageId stays deletable');
+
+  const dbWrapper = container.querySelector('[data-wa-message-id="true_15551234567@c.us_DB"]')!;
+  assert.ok(dbWrapper.querySelector('.message-status-icon.sent'));
+  assert.equal(dbWrapper.querySelector('.meta-spacer')?.classList.contains('with-status'), true);
+});
+
+test('empty unknown rows render nothing and preserve grouping, day pills, tab stop, and empty state', () => {
+  const groupChat: Chat = {
+    ...CHAT,
+    id: '120363000000000001@g.us',
+    name: 'Group',
+    isGroup: true,
+    kind: 'group',
+  };
+  const baseTs = 1_700_000_000;
+  const rows: ChatMessageView[] = [
+    {
+      ...PROMPT,
+      id: 'g-1',
+      waMessageId: 'wamid.g1',
+      chatId: groupChat.id,
+      from: groupChat.id,
+      author: 'alice@c.us',
+      chatName: 'Alice',
+      body: 'first from alice',
+      timestamp: baseTs,
+      metadata: undefined,
+    },
+    {
+      ...PROMPT,
+      id: 'unk-same-day',
+      waMessageId: 'wamid.unk.1',
+      chatId: groupChat.id,
+      from: groupChat.id,
+      author: 'bob@c.us',
+      chatName: 'Bob',
+      type: 'unknown',
+      body: '',
+      timestamp: baseTs + 30,
+      metadata: undefined,
+    },
+    {
+      ...PROMPT,
+      id: 'g-2',
+      waMessageId: 'wamid.g2',
+      chatId: groupChat.id,
+      from: groupChat.id,
+      author: 'alice@c.us',
+      chatName: 'Alice',
+      body: 'second from alice',
+      timestamp: baseTs + 60,
+      metadata: undefined,
+    },
+    {
+      ...PROMPT,
+      id: 'unk-own-day',
+      waMessageId: 'wamid.unk.2',
+      chatId: groupChat.id,
+      from: groupChat.id,
+      author: 'bob@c.us',
+      chatName: 'Bob',
+      type: 'unknown',
+      body: '',
+      timestamp: baseTs + 86_400,
+      metadata: undefined,
+    },
+    {
+      ...PROMPT,
+      id: 'g-3',
+      waMessageId: 'wamid.g3',
+      chatId: groupChat.id,
+      from: 'me',
+      to: groupChat.id,
+      direction: 'outgoing',
+      status: 'read',
+      body: 'my reply',
+      timestamp: baseTs + 2 * 86_400,
+      metadata: undefined,
+    },
+    {
+      ...PROMPT,
+      id: 'unk-tail',
+      waMessageId: 'wamid.unk.3',
+      chatId: groupChat.id,
+      from: groupChat.id,
+      author: 'bob@c.us',
+      chatName: 'Bob',
+      type: 'unknown',
+      body: '',
+      timestamp: baseTs + 2 * 86_400 + 30,
+      metadata: undefined,
+    },
+  ];
+
+  const { container } = renderThread('operator', rows, groupChat);
+  const wrappers = Array.from(container.querySelectorAll('.message-bubble-wrapper'));
+  assert.deepEqual(
+    wrappers.map(w => w.getAttribute('data-wa-message-id')),
+    ['wamid.g1', 'wamid.g2', 'wamid.g3'],
+  );
+  assert.equal(container.querySelectorAll('.day-separator').length, 2, 'empty unknown on its own day draws no pill');
+  assert.ok(wrappers[0].querySelector('.message-sender')?.textContent === 'Alice');
+  assert.equal(wrappers[0].classList.contains('run-start'), true);
+  assert.equal(
+    wrappers[1].querySelector('.message-sender') === null,
+    true,
+    'same sender run continues past skipped unknown row',
+  );
+  assert.equal(wrappers[1].classList.contains('run-start'), false);
+  const roving = wrappers[2].querySelector<HTMLElement>('[data-roving-message]');
+  assert.equal(roving?.getAttribute('tabindex'), '0', 'trailing skipped unknown row must not steal roving tabIndex');
+
+  rtl.cleanup();
+  const { container: onlyUnknown } = renderThread('operator', [
+    { ...PROMPT, id: 'only-unk', waMessageId: 'wamid.onlyunk', type: 'unknown', body: '', metadata: undefined },
+  ]);
+  assert.equal(onlyUnknown.querySelectorAll('.message-bubble-wrapper').length, 0);
+  assert.ok(
+    onlyUnknown
+      .querySelector('.messages-empty')
+      ?.textContent?.includes('No messages yet. Send the first message to get started!'),
+  );
+});
+
+test('unknown rows with renderable content plus revoked and masked rows still render bubbles', () => {
+  const rows: ChatMessageView[] = [
+    {
+      ...PROMPT,
+      id: 'u-body',
+      waMessageId: 'wamid.ubody',
+      type: 'unknown',
+      body: 'readable fallback',
+      metadata: undefined,
+    },
+    {
+      ...PROMPT,
+      id: 'u-media',
+      waMessageId: 'wamid.umedia',
+      type: 'unknown',
+      body: '',
+      metadata: { media: { mimetype: 'application/pdf', omitted: true } },
+    },
+    {
+      ...PROMPT,
+      id: 'u-quote',
+      waMessageId: 'wamid.uquote',
+      type: 'unknown',
+      body: '',
+      metadata: { quotedMessage: { id: 'q1', body: 'quoted' } },
+    },
+    {
+      ...PROMPT,
+      id: 'u-btn',
+      waMessageId: 'wamid.ubtn',
+      type: 'unknown',
+      body: '',
+      direction: 'incoming',
+      metadata: { buttons: [{ id: 'b1', text: 'Tap' }] },
+    },
+    { ...PROMPT, id: 'rev-1', waMessageId: 'wamid.rev1', type: 'revoked', body: '', metadata: undefined },
+    { ...PROMPT, id: 'mask-1', waMessageId: 'wamid.mask1', type: 'masked', body: '', metadata: undefined },
+  ];
+  const { container } = renderThread('operator', rows);
+  assert.equal(container.querySelectorAll('.message-bubble').length, 6);
+});
+
+test('scroll listener stays attached across re-renders while reading the latest older-page props', () => {
+  let firstCalls = 0;
+  let secondCalls = 0;
+  const { container, rerenderWith, rerenderProps } = renderThread('operator', [PROMPT], CHAT, {
+    hasMoreMessages: false,
+    loadingOlderMessages: false,
+    onLoadOlderMessages: () => {
+      firstCalls++;
+    },
+  });
+  const thread = container.querySelector<HTMLElement>('.room-messages');
+  assert.ok(thread);
+  Object.defineProperty(thread, 'scrollHeight', { value: 2000, configurable: true });
+  Object.defineProperty(thread, 'clientHeight', { value: 400, configurable: true });
+  Object.defineProperty(thread, 'scrollTop', { value: 10, writable: true, configurable: true });
+
+  let scrollAdds = 0;
+  let scrollRemoves = 0;
+  const addOriginal = thread.addEventListener.bind(thread);
+  const removeOriginal = thread.removeEventListener.bind(thread);
+  thread.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: unknown) => {
+    if (type === 'scroll') scrollAdds++;
+    return addOriginal(type, listener, options as AddEventListenerOptions);
+  }) as typeof thread.addEventListener;
+  thread.removeEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: unknown) => {
+    if (type === 'scroll') scrollRemoves++;
+    return removeOriginal(type, listener, options as EventListenerOptions);
+  }) as typeof thread.removeEventListener;
+
+  rerenderWith([PROMPT, { ...PROMPT, id: 'db-2', waMessageId: 'wamid.2', body: 'second' }]);
+  rerenderProps({
+    hasMoreMessages: true,
+    onLoadOlderMessages: () => {
+      secondCalls++;
+    },
+  });
+  rerenderProps({ loadingOlderMessages: true });
+  rerenderProps({ loadingOlderMessages: false });
+
+  assert.equal(scrollAdds, 0, 'scroll listener was re-attached on re-render');
+  assert.equal(scrollRemoves, 0, 'scroll listener was torn down on re-render');
+
+  rtl.fireEvent.scroll(thread);
+  assert.equal(firstCalls, 0);
+  assert.equal(secondCalls, 1, 'scroll listener did not use updated callback and flags');
+});
+
+test('ChatThread is wrapped in React.memo to skip re-renders when props are unchanged', () => {
+  assert.equal((ChatThread as unknown as { $$typeof?: symbol }).$$typeof, Symbol.for('react.memo'));
 });

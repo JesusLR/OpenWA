@@ -17,20 +17,21 @@ export const ENGINE_TEARDOWN_TIMEOUT_MS = 10_000;
  * methods its own core still calls — `teardownEngineSafely`, `trackPendingCredentialTeardown`,
  * `awaitPendingTeardown`, `evictAndForceDestroy` (the baileys forwarder precedent) — so every
  * existing call site and spec poke (`trackPendingCredentialTeardown` is invoked by name in
- * logout-teardown-race.spec) stays byte-identical. The other two methods,
- * `destroyEngineSafely` and `awaitInitialStatus`, are reached by the controls unit through this
- * instance directly (`this.fences.…`) and have no lifecycle delegate.
+ * logout-teardown-race.spec) stays byte-identical. The other three methods, `destroyEngineSafely`,
+ * `destroyWithEscalation` and `awaitInitialStatus`, are reached through this instance directly
+ * (`this.fences.…`), by the controls unit and, for `destroyWithEscalation`, by the lifecycle too, and
+ * have no lifecycle delegate.
  */
 export class SessionLifecycleFences {
   private readonly engines: EngineRegistry;
   private readonly pendingTeardowns: Map<string, Promise<void>>;
-  private readonly pendingInitialStatuses: Map<string, { engine: IWhatsAppEngine; promise: Promise<void> }>;
+  private readonly pendingInitialStatuses: Map<string, { engine: IWhatsAppEngine; promise: Promise<unknown> }>;
   private readonly logger: ReturnType<typeof createLogger>;
 
   constructor(deps: {
     engines: EngineRegistry;
     pendingTeardowns: Map<string, Promise<void>>;
-    pendingInitialStatuses: Map<string, { engine: IWhatsAppEngine; promise: Promise<void> }>;
+    pendingInitialStatuses: Map<string, { engine: IWhatsAppEngine; promise: Promise<unknown> }>;
     logger: ReturnType<typeof createLogger>;
   }) {
     this.engines = deps.engines;
@@ -176,8 +177,9 @@ export class SessionLifecycleFences {
    * Wait for the captured `engine`'s exact in-flight `updateStatus(INITIALIZING)` write to settle.
    * Called by every retiring lifecycle control (stop/logout/delete/forceKill) AFTER the stop mark is
    * set and reconnect cancelled, and BEFORE teardown / the final DISCONNECTED write / parent-row
-   * deletion. This keeps the control action the final persisted owner: a delayed INITIALIZING write
-   * always settles first, so it can never land after the DISCONNECTED write or the row removal.
+   * deletion. A write that settles within the deadline precedes the control's final mutation.
+   * Retirement proceeds at the deadline; a late initial-status reply separately checks its captured
+   * engine before announcing, so it cannot emit after that engine has retired.
    *
    * Identity-checked on the engine object: a control action that captured engine A awaits ONLY A's
    * pending promise, never a replacement B's entry (and never deletes it). A bounded wait mirrors

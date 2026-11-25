@@ -1,10 +1,12 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
+import type { Socket } from 'net';
 import * as path from 'path';
-import { Readable, PassThrough } from 'stream';
+import { Readable, PassThrough, Transform, finished, pipeline } from 'stream';
 import {
   S3Client,
+  S3ClientConfig,
   ListObjectsV2Command,
   GetObjectCommand,
   PutObjectCommand,
@@ -13,15 +15,24 @@ import {
   CreateBucketCommand,
 } from '@aws-sdk/client-s3';
 import { createLogger } from '../services/logger.service';
+import { STORAGE_FALLBACK_SHUTDOWN_WAIT_MS } from '../services/shutdown-budget';
+import { positiveIntFromEnv } from '../utils/env-int';
+import { ensurePrivateDir } from '../utils/private-dir.util';
 import { isSafeStorageKey } from '../utils/path-safety';
 import { DEFAULT_S3_KEY_PREFIX, normalizeS3KeyPrefix } from './s3-key-prefix';
-import { createExportStream, ExportFileSource, importFromStream, isMissingObjectError } from './storage-transfer';
 import {
-  listLocalFiles,
+  createExportStream,
+  DownloadsBusyException,
+  ExportFileSource,
+  importFromStream,
+  isMissingObjectError,
+} from './storage-transfer';
+import {
   iterateLocalFiles,
   getLocalFile,
   openLocalFile,
   putLocalFile,
+  putLocalStream,
   deleteLocalFile,
 } from './storage-local-files';
 
@@ -58,25 +69,93 @@ export const S3_PROBE_TIMEOUT_MS = 10_000;
  * connection and never answers (a paused container, a stuck proxy) leaves the request pending
  * forever, holding its media buffer and the caller. The socket bound is an idle timeout, so a long
  * upload or download that keeps moving bytes is not cut off. A bare requestTimeout would not do:
- * the HTTP handler only logs a warning when it expires.
+ * the HTTP handler only logs a warning when it expires. The HTTP handler stops applying the socket
+ * bound when the response headers arrive within 3 s and keeps it on the body otherwise, so openS3File
+ * turns it off and gives an object body the same idle bound, and a listing page has S3_LIST_TIMEOUT_MS.
  */
 export const S3_CONNECT_TIMEOUT_MS = 5_000;
 export const S3_SOCKET_TIMEOUT_MS = 30_000;
 
-function positiveIntFromEnv(name: string, fallback: number): number {
-  const parsed = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+/**
+ * Cap on one ListObjectsV2 page, the whole request. A page holds at most 1000 keys, a few hundred kilobytes,
+ * so a page that is moving has ample time, while one whose body stalls would hang an orphan sweep for good:
+ * its guarded interval skips every later tick while that run is pending.
+ */
+export const S3_LIST_TIMEOUT_MS = 30_000;
+
+/**
+ * Downloads open at once on the stream client, the SDK's pool size. Each holds a pooled socket until its
+ * stream finishes; one more would wait for a socket until three connect timeouts failed it, about 15 s.
+ */
+export const S3_MAX_OPEN_DOWNLOADS = 50;
+
+/**
+ * How long an S3 download may wait on its reader, from the last chunk that reader let through. An HTTP reader
+ * takes from the body only once the response socket and the kernel buffers on the way to the client have room
+ * again: on Linux, once the client has read about 1.1 MiB (after about 2.7 MiB filled them; about 250 KiB on
+ * macOS), so a client reading 3 to 8 KiB/s pulls every 2 to 6 minutes, and with no Range to resume from a cut
+ * there means a large file never arrives. Ten minutes keeps a client reading about 2 KiB/s or more going; a
+ * reader that stopped holds its download place that long.
+ */
+export const S3_READER_IDLE_MS = 600_000;
+
+/**
+ * Pass an object body on, failing it with a TimeoutError once nothing has come through it for idleMs while it
+ * waits on the store, or for readerIdleMs while its reader holds it back. The reader is behind while the guard's
+ * readable side is full, which also covers the tail once the store has sent the last byte. The timer is cleared
+ * once the whole body has come through, so it only fires while the pipeline still listens for the guard's error.
+ */
+function withIdleBound(body: Readable, idleMs: number, readerIdleMs: number): Readable {
+  // A full readable side can only refill through transform, so this counts from the reader's last take.
+  let heldBackMs = 0;
+  const timer = setTimeout(() => {
+    const readerBehind = guard.readableLength >= guard.readableHighWaterMark;
+    if (readerBehind && (heldBackMs += idleMs) < readerIdleMs) {
+      timer.refresh();
+      return;
+    }
+    const idle = readerBehind ? `reader took nothing for ${heldBackMs} ms` : `body sent nothing for ${idleMs} ms`;
+    guard.destroy(Object.assign(new Error(`S3 object ${idle}`), { name: 'TimeoutError' }));
+  }, idleMs);
+  timer.unref();
+  const guard = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      heldBackMs = 0;
+      timer.refresh();
+      callback(null, chunk);
+    },
+    flush(callback) {
+      clearTimeout(timer);
+      callback();
+    },
+    destroy(error, callback) {
+      clearTimeout(timer);
+      callback(error);
+    },
+  });
+  // pipeline, not pipe: destroying the guard (a client that went away, or the timer) must destroy the body too.
+  pipeline(body, guard, () => undefined);
+  return guard;
 }
 
 @Injectable()
-export class StorageService implements OnModuleDestroy {
+export class StorageService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('StorageService');
   private readonly storageType: string;
   private readonly localPath: string;
   private s3Client: S3Client | null = null;
+  /**
+   * Serves openFile. A stream holds its pooled socket until its reader has taken the whole object, so a slow
+   * HTTP client holds it for its whole download, a stalled store for S3_SOCKET_TIMEOUT_MS and a stopped reader
+   * for S3_READER_IDLE_MS. On a pool of their own, a burst of downloads cannot leave the writes, deletes and
+   * listings on s3Client waiting for a socket.
+   */
+  private s3StreamClient: S3Client | null = null;
+  private s3OpenDownloads = 0;
   private s3Bucket = 'openwa';
   private s3KeyRoot = DEFAULT_S3_KEY_PREFIX;
   private s3Available = false;
+  private s3InitPromise: Promise<void> | null = null;
   private s3ReprobeTimer: NodeJS.Timeout | null = null;
   private readonly s3ReprobeIntervalMs = positiveIntFromEnv('S3_REPROBE_INTERVAL_MS', DEFAULT_S3_REPROBE_INTERVAL_MS);
 
@@ -100,7 +179,7 @@ export class StorageService implements OnModuleDestroy {
       // valid AWS configs to a silent local fallback (#735). forcePathStyle is likewise a path-style
       // concern (MinIO/etc.); AWS S3 uses virtual-hosted addressing — so tie both to the endpoint.
       if (accessKeyId && secretAccessKey) {
-        this.s3Client = new S3Client({
+        const clientConfig: S3ClientConfig = {
           ...(endpoint ? { endpoint } : {}),
           region,
           credentials: {
@@ -109,12 +188,15 @@ export class StorageService implements OnModuleDestroy {
           },
           ...(endpoint ? { forcePathStyle: true } : {}), // Required for path-style stores (MinIO)
           requestHandler: { connectionTimeout: S3_CONNECT_TIMEOUT_MS, socketTimeout: S3_SOCKET_TIMEOUT_MS },
-        });
+        };
+        // Each client builds its own HTTP handler, and with it its own socket pool.
+        this.s3Client = new S3Client(clientConfig);
+        this.s3StreamClient = new S3Client(clientConfig);
         this.s3Bucket = process.env.S3_BUCKET || s3Config.bucket || 'openwa';
         const keyRoot = normalizeS3KeyPrefix(process.env.S3_KEY_PREFIX || s3Config.keyPrefix);
         if (!keyRoot) throw new Error('S3_KEY_PREFIX is not a safe relative key prefix');
         this.s3KeyRoot = keyRoot;
-        void this.initializeS3Bucket();
+        this.s3InitPromise = this.initializeS3Bucket();
         this.startS3Reprobe();
       } else {
         // Every other degradation in this service announces itself, but this one could not: the
@@ -137,14 +219,72 @@ export class StorageService implements OnModuleDestroy {
       }
     }
 
-    // Ensure local directory exists
+    // Ensure the local directory exists and is owner-only: it holds message content as plain files, like the
+    // databases and the engine auth directories, which are already 0600 and 0700. Files written earlier keep
+    // their mode but sit under the 0700 root.
     if (!fs.existsSync(this.localPath)) {
-      fs.mkdirSync(this.localPath, { recursive: true });
+      fs.mkdirSync(this.localPath, { recursive: true, mode: 0o700 });
     }
+    ensurePrivateDir(this.localPath);
+    this.warnWhenLocalRootIsOpen();
   }
 
-  onModuleDestroy(): void {
+  /**
+   * ensurePrivateDir is best effort, so a root the gateway does not own (a volume or bind mount owned by another
+   * user) keeps its mode without a word, and files written earlier with a loose mode stay reachable through it. Say
+   * so once at boot, with what to do. Windows reports no POSIX modes, so there is nothing to read there.
+   */
+  private warnWhenLocalRootIsOpen(): void {
+    if (process.platform === 'win32') return;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(this.localPath);
+    } catch {
+      // A diagnostic never stops the boot: what is wrong with the directory shows at its first use.
+      return;
+    }
+    const { mode, uid } = stat;
+    if ((mode & 0o077) === 0) return;
+    this.logger.warn(
+      `The local media directory '${path.resolve(this.localPath)}' has mode ` +
+        `${(mode & 0o7777).toString(8).padStart(4, '0')} and could not be made owner-only (0700): other users can ` +
+        `list it and read any file in it written with a loose mode. It is owned by uid ${uid} and the gateway runs ` +
+        `as uid ${process.getuid?.()}. Own the directory as the gateway's user (chown it, then restart), or restrict ` +
+        `it from outside: a stricter mode or ACL on the mount, or a parent directory only that user can enter.`,
+    );
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.s3InitPromise;
+  }
+
+  private stopped = false;
+  private mayHaveLocalFallback = false;
+  private inFlightLocalFallbackWrites = 0;
+  private localFallbackWriteEpoch = 0;
+  private localFallbackSyncPending = false;
+  private fallbackSyncInFlight: Promise<void> | null = null;
+  private fallbackSyncRetryTimer: NodeJS.Timeout | null = null;
+  private readonly fallbackKeyLocks = new Map<string, Promise<void>>();
+
+  async onModuleDestroy(): Promise<void> {
+    this.stopped = true;
+    this.localFallbackSyncPending = false;
     this.clearS3Reprobe();
+    this.clearFallbackSyncRetry();
+    if (!this.fallbackSyncInFlight) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.fallbackSyncInFlight,
+        new Promise<void>(resolve => {
+          timer = setTimeout(resolve, STORAGE_FALLBACK_SHUTDOWN_WAIT_MS);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async initializeS3Bucket(): Promise<void> {
@@ -155,6 +295,7 @@ export class StorageService implements OnModuleDestroy {
       this.s3Available = true;
       this.logger.log(`S3 bucket '${this.s3Bucket}' is available`);
     } catch (error: unknown) {
+      this.mayHaveLocalFallback = true;
       this.logger.error('S3 bucket check failed', String(error));
       this.lastS3Error = String(error);
       this.warnLocalFallback();
@@ -233,10 +374,6 @@ export class StorageService implements OnModuleDestroy {
     return this.storageType;
   }
 
-  isS3Available(): boolean {
-    return this.s3Available;
-  }
-
   private lastS3Check = 0;
   /** Why the last probe failed. The fallback warning names it: a store refusing the create is not an outage. */
   private lastS3Error = '';
@@ -261,13 +398,12 @@ export class StorageService implements OnModuleDestroy {
       try {
         await this.ensureS3Bucket();
         this.s3Available = true;
-        // WARN (not log): the degraded window matters — media written to the local fallback dir while
-        // S3 was down stays local-only; reads for those keys keep working via the NoSuchKey
-        // read-through in getS3File, but the operator should reconcile/acknowledge the gap.
+        this.mayHaveLocalFallback = true;
         this.logger.warn(
-          `S3 bucket '${this.s3Bucket}' recovered — media storage back on S3. Files written to the local ` +
-            `fallback dir '${this.localPath}' during the outage remain there (still readable via read-through).`,
+          `S3 bucket '${this.s3Bucket}' recovered: media storage is back on S3; syncing any files ` +
+            `written to local fallback dir '${this.localPath}' during the outage.`,
         );
+        this.scheduleLocalFallbackSync();
       } catch (error: unknown) {
         // still unavailable: leave s3Available false; a later poll retries after the throttle window
         this.lastS3Error = String(error);
@@ -279,46 +415,43 @@ export class StorageService implements OnModuleDestroy {
     return this.s3Available;
   }
 
-  async listFiles(): Promise<string[]> {
-    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      // Union with the local fallback dir: media written locally while S3 was down is otherwise
-      // invisible to enumeration — getFile reads through to it, so a listing that omits it
-      // contradicts what reads serve, and a sweep reconciling against this listing could never
-      // reclaim it.
-      const files = new Set(await this.listS3Files());
-      for (const file of await this.listLocalFiles()) files.add(file);
-      return [...files];
-    }
-    return this.listLocalFiles();
-  }
-
   /**
    * Enumerate every file in the store (all S3 pages unioned with the local fallback dir, each key
-   * once) as a stream — unlike listFiles(), whose STORAGE_LIST_MAX_FILES truncation is a per-call
-   * DoS guard, not a completeness contract. Callers that must reconcile against the full store
-   * (e.g. the status-media orphan sweep) should iterate this instead of a single capped listing.
+   * once) as a stream. The union matters: media written locally while S3 was down is otherwise
+   * invisible to enumeration, although getFile reads through to it, and a sweep reconciling against
+   * the listing could never reclaim it. Callers that must reconcile against the full store (e.g.
+   * the status-media orphan sweep) iterate this.
    *
-   * `prefix` narrows the walk at the source — the S3 ListObjectsV2 prefix and the local traversal
-   * root — so a caller reconciling one subtree neither pages the whole store nor holds every key
-   * of it in the dedupe Set. Removing the per-call cap must not trade one unbounded read for
-   * another.
+   * `prefix` narrows the walk at the source (the S3 ListObjectsV2 prefix and the local traversal
+   * root), so a caller reconciling one subtree neither pages the whole store nor walks the rest.
+   *
+   * The local dir is walked first and its keys remembered, so a key in both is listed once: on an
+   * S3 deployment it holds what was written during an outage (and, after a move from local storage, the old
+   * local media until it is cleaned up), while the bucket can hold an
+   * archive of millions of files that the S3 pages then stream past without being kept.
+   *
+   * A local directory the walk cannot read fails it, so no caller is handed a short listing without
+   * knowing. `skipUnreadable` is for a caller that only acts on the files it was shown (an orphan
+   * sweep): the directory is named in a warning and left alone.
    */
-  async *iterateFiles(prefix = ''): AsyncGenerator<string> {
+  async *iterateFiles(prefix = '', options: { skipUnreadable?: boolean } = {}): AsyncGenerator<string> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      const seen = new Set<string>();
-      for await (const file of this.iterateS3Files(prefix)) {
-        seen.add(file);
+      const local = new Set<string>();
+      for await (const file of this.iterateLocalFiles(prefix, options.skipUnreadable)) {
+        local.add(file);
         yield file;
       }
-      for await (const file of this.iterateLocalFiles(prefix)) {
-        if (!seen.has(file)) yield file;
+      for await (const file of this.iterateS3Files(prefix)) {
+        if (!local.has(file)) yield file;
       }
       return;
     }
-    yield* this.iterateLocalFiles(prefix);
+    yield* this.iterateLocalFiles(prefix, options.skipUnreadable);
   }
 
   async getFile(filePath: string): Promise<Buffer> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     // Mirror putFile: getLocalFile has its own isPathWithin guard, but getS3File builds
     // `${s3KeyRoot}${filePath}` with none, so contain both read backends at this boundary.
     if (!isSafeStorageKey(filePath)) {
@@ -333,27 +466,68 @@ export class StorageService implements OnModuleDestroy {
   /**
    * Open a file as a stream instead of reading it into memory, with the same key guard and S3
    * read-through as getFile. A missing or unreadable file rejects here rather than on the stream.
+   * On S3 a download past S3_MAX_OPEN_DOWNLOADS is refused at once with a 503.
    */
   async openFile(filePath: string): Promise<ExportFileSource> {
+    if (this.s3InitPromise) await this.s3InitPromise;
+    return this.openStoredFile(filePath, this.s3StreamClient);
+  }
+
+  private async openStoredFile(filePath: string, client: S3Client | null): Promise<ExportFileSource> {
     if (!isSafeStorageKey(filePath)) {
       throw new Error(`Refusing to read an unsafe storage key: ${filePath}`);
     }
     if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      return this.openS3File(filePath);
+      return this.openS3File(filePath, client);
     }
     return openLocalFile(this.localPath, filePath);
   }
 
   async putFile(filePath: string, data: Buffer): Promise<void> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     // Centralized containment so BOTH backends inherit it: putLocalFile has its own isPathWithin
     // guard, but putS3File builds `${s3KeyRoot}${filePath}` with none, so reject a traversing key here.
     if (!isSafeStorageKey(filePath)) {
       throw new Error(`Refusing to store an unsafe storage key: ${filePath}`);
     }
-    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      return this.putS3File(filePath, data);
+    if (this.storageType === 's3' && this.s3Client) {
+      return this.runWithFallbackKeyLock(filePath, async () => {
+        if (this.s3Available) {
+          await this.putS3File(filePath, data);
+          if (this.mayHaveLocalFallback) {
+            await this.deleteLocalFile(filePath);
+          }
+          return;
+        }
+        return this.writeLocalFallback(() => this.putLocalFile(filePath, data));
+      });
     }
     return this.putLocalFile(filePath, data);
+  }
+
+  async putStream(filePath: string, stream: Readable, sizeBytes: number): Promise<void> {
+    try {
+      if (this.s3InitPromise) await this.s3InitPromise;
+      if (!isSafeStorageKey(filePath)) {
+        throw new Error(`Refusing to store an unsafe storage key: ${filePath}`);
+      }
+      if (this.storageType === 's3' && this.s3Client) {
+        return await this.runWithFallbackKeyLock(filePath, async () => {
+          if (this.s3Available) {
+            await this.putS3Stream(filePath, stream, sizeBytes);
+            if (this.mayHaveLocalFallback) {
+              await this.deleteLocalFile(filePath);
+            }
+            return;
+          }
+          return this.writeLocalFallback(() => this.putLocalStream(filePath, stream));
+        });
+      }
+      return await this.putLocalStream(filePath, stream);
+    } catch (error) {
+      stream.destroy();
+      throw error;
+    }
   }
 
   /**
@@ -366,29 +540,40 @@ export class StorageService implements OnModuleDestroy {
    * S3 DeleteObject is idempotent by design) so a caller doesn't have to special-case "already gone".
    */
   async deleteFile(filePath: string): Promise<void> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     if (!isSafeStorageKey(filePath)) {
       throw new Error(`Refusing to delete an unsafe storage key: ${filePath}`);
     }
-    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      await this.deleteS3File(filePath);
+    if (this.storageType === 's3' && this.s3Client) {
+      return this.runWithFallbackKeyLock(filePath, async () => {
+        if (!this.s3Available) {
+          throw new Error(`S3 storage is currently unavailable; refusing local-only delete for ${filePath}`);
+        }
+        await this.deleteS3File(filePath);
+        return this.deleteLocalFile(filePath);
+      });
     }
     return this.deleteLocalFile(filePath);
   }
 
   async getFileCount(): Promise<{ count: number; sizeBytes: number }> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     if (this.storageType === 's3' && this.s3Client && this.s3Available) {
+      // Union with the local fallback dir (media written locally while S3 was down is not in the
+      // bucket listing): a local-only file counts with its real on-disk size; for a key present in
+      // both, the S3 copy is authoritative. As in iterateFiles, the local keys are the ones remembered,
+      // so the bucket's pages, which can list millions of keys, stream past without being kept.
+      const local = new Set<string>();
+      for await (const file of this.iterateLocalFiles()) {
+        if (this.isExportableKey(file)) local.add(file);
+      }
       // ListObjectsV2 already returns each object's Size, so report the real total instead of a
       // 100KB-per-file estimate — no extra API calls beyond the listing we'd do anyway.
-      const s3 = await this.getS3CountAndSize();
-      // Union with the local fallback dir (same split-brain gap as listFiles): a local-only file
-      // counts with its real on-disk size; for a key present in both, the S3 copy is authoritative.
-      const s3Keys = new Set(s3.keys);
-      let { count, sizeBytes } = s3;
-      for await (const file of this.iterateLocalFiles()) {
-        if (s3Keys.has(file)) continue;
+      let { count, sizeBytes } = await this.getS3CountAndSize(local);
+      for (const file of local) {
         count += 1;
         try {
-          // Same reason as the local branch below: this walk is uncapped too, so the stat must yield.
+          // Same reason as the local branch below: the walk covers the whole store, so the stat must yield.
           sizeBytes += (await fs.promises.stat(path.join(this.localPath, file))).size;
         } catch (error) {
           this.logger.debug(`Failed to stat file: ${file}`, { error: String(error) });
@@ -397,17 +582,16 @@ export class StorageService implements OnModuleDestroy {
       return { count, sizeBytes };
     }
 
-    // The uncapped walk, for the same reason createExportStream uses it: this is the pre-check an
-    // operator runs BEFORE the export/import migration, so a count truncated at STORAGE_LIST_MAX_FILES
-    // would hide exactly the gap they are checking for.
-    const files = await this.listAllFiles();
+    // The whole store is walked, for the same reason createExportStream does: this is the pre-check an
+    // operator runs BEFORE the export/import migration, so it has to see every file the export will carry.
+    const files = await this.listExportableFiles();
     let sizeBytes = 0;
     for (const file of files) {
       try {
         const fullPath = path.join(this.localPath, file);
-        // Awaited, not statSync: uncapping the walk above also uncapped this loop, and a synchronous
-        // stat per file holds the event loop for the whole store — health checks, webhooks and every
-        // in-flight request wait behind a count. Measured at one event-loop tick for 2000 files.
+        // Awaited, not statSync: a synchronous stat per file holds the event loop for the whole store,
+        // so health checks, webhooks and every in-flight request wait behind a count. Measured at one
+        // event-loop tick for 2000 files.
         const stats = await fs.promises.stat(fullPath);
         sizeBytes += stats.size;
       } catch (error) {
@@ -418,12 +602,10 @@ export class StorageService implements OnModuleDestroy {
     return { count: files.length, sizeBytes };
   }
 
-  private async getS3CountAndSize(): Promise<{ count: number; sizeBytes: number; keys: string[] }> {
+  /** Counts and sizes the bucket's exportable objects, dropping from `local` every key the bucket also holds. */
+  private async getS3CountAndSize(local: Set<string>): Promise<{ count: number; sizeBytes: number }> {
     let count = 0;
     let sizeBytes = 0;
-    // Keys (prefix-stripped) are kept so getFileCount can union the local fallback dir without a
-    // second listing.
-    const keys: string[] = [];
     let continuationToken: string | undefined;
 
     do {
@@ -433,20 +615,21 @@ export class StorageService implements OnModuleDestroy {
           Prefix: this.s3KeyRoot,
           ContinuationToken: continuationToken,
         }),
+        { abortSignal: AbortSignal.timeout(S3_LIST_TIMEOUT_MS) },
       );
 
       for (const obj of response.Contents ?? []) {
         const key = this.stripS3KeyRoot(obj.Key);
-        if (key === null) continue;
+        if (key === null || !this.isExportableKey(key)) continue;
         count += 1;
         sizeBytes += obj.Size ?? 0;
-        keys.push(key);
+        local.delete(key);
       }
 
       continuationToken = response.NextContinuationToken;
     } while (continuationToken);
 
-    return { count, sizeBytes, keys };
+    return { count, sizeBytes };
   }
 
   // ============================================================================
@@ -454,38 +637,48 @@ export class StorageService implements OnModuleDestroy {
   // ============================================================================
 
   createExportStream(): Promise<PassThrough> {
-    // Enumerated with iterateFiles(), NOT listFiles(). listFiles() stops at STORAGE_LIST_MAX_FILES
-    // and returns without logging or throwing — a per-call DoS guard, as its own doc says, and not a
-    // completeness contract. Spending it here made the documented local→S3 migration (export,
-    // repoint STORAGE_TYPE, import) leave media behind on the old backend silently, and the
-    // operator's own files/count pre-check was truncated by the same path, so the consistency check
-    // could not reveal the gap. An export exists to be complete; that is what the uncapped walk is for.
+    // The whole store is enumerated (iterateFiles): an export exists to be complete, and a short one
+    // would leave media behind on the old backend silently after the documented local→S3 migration
+    // (export, repoint STORAGE_TYPE, import).
     // A listed key openFile would refuse (an S3 object named `..`, or one sitting exactly at the key
     // root) is left out here: the export fails on any open error other than a missing object, and a
     // key that can never be opened must not fail every export.
+    // Entries are read on s3Client, one at a time: the downloads' pool can be full, and the export must not
+    // fail behind it.
     return createExportStream(
-      async () => (await this.listAllFiles()).filter(file => this.isExportableKey(file)),
-      filePath => this.openFile(filePath),
+      () => this.listExportableFiles(),
+      filePath => this.openStoredFile(filePath, this.s3Client),
       this.logger,
     );
   }
 
+  /**
+   * Whether the export carries a listed key. The file count applies the same rule, so the pre-check never
+   * promises a file the archive will not hold.
+   */
   private isExportableKey(file: string): boolean {
+    // A key ending in "/" is a folder placeholder an S3 console leaves behind: it holds no file, and written to
+    // the archive as one it would fail the import that restores it onto a local store.
+    if (file.endsWith('/')) return false;
     if (isSafeStorageKey(file)) return true;
-    this.logger.warn(`Skipping an unsafe storage key in the export: ${JSON.stringify(file)}`);
+    this.logger.warn(`Leaving an unsafe storage key out of the export and the file count: ${JSON.stringify(file)}`);
     return false;
   }
 
-  /** Every key in the store, uncapped — the completeness counterpart to the capped listFiles(). */
-  private async listAllFiles(): Promise<string[]> {
+  /** Every key in the store that the export carries. */
+  private async listExportableFiles(): Promise<string[]> {
     const files: string[] = [];
-    for await (const file of this.iterateFiles()) files.push(file);
+    for await (const file of this.iterateFiles()) {
+      if (this.isExportableKey(file)) files.push(file);
+    }
     return files;
   }
 
   // Best-effort, NOT atomic: see the implementation in storage-transfer.ts for the full contract.
   importFromStream(inputStream: Readable): Promise<{ imported: number; failed: number }> {
-    return importFromStream(inputStream, (filePath, data) => this.putFile(filePath, data), this.logger);
+    return importFromStream(inputStream, (filePath, data) => this.putFile(filePath, data), this.logger, {
+      putStream: (filePath, stream, sizeBytes) => this.putStream(filePath, stream, sizeBytes),
+    });
   }
 
   // ============================================================================
@@ -493,21 +686,12 @@ export class StorageService implements OnModuleDestroy {
   // ============================================================================
 
   /**
-   * Enumerate local files under the storage root, capped at STORAGE_LIST_MAX_FILES — a per-call
-   * DoS guard (a healthy media store stays well under it), NOT a completeness contract. Callers
-   * that must see the whole tree use iterateFiles().
+   * Local enumeration as a stream. Async + iterative (a work queue, not recursion) so a deep/wide
+   * media tree can't block the event loop or stack-overflow; still bounded by the max directory
+   * depth so a pathological tree can't descend unbounded.
    */
-  private listLocalFiles(): Promise<string[]> {
-    return listLocalFiles(this.localPath);
-  }
-
-  /**
-   * Full local enumeration as a stream — no count cap. Async + iterative (a work queue, not
-   * recursion) so a deep/wide media tree can't block the event loop or stack-overflow; still
-   * bounded by the max directory depth so a pathological tree can't descend unbounded.
-   */
-  private iterateLocalFiles(prefix = ''): AsyncGenerator<string> {
-    return iterateLocalFiles(this.localPath, prefix);
+  private iterateLocalFiles(prefix = '', skipUnreadable = false): AsyncGenerator<string> {
+    return iterateLocalFiles(this.localPath, prefix, { skipUnreadable, logger: this.logger });
   }
 
   private getLocalFile(filePath: string): Promise<Buffer> {
@@ -518,6 +702,159 @@ export class StorageService implements OnModuleDestroy {
     return putLocalFile(this.localPath, filePath, data);
   }
 
+  private putLocalStream(filePath: string, stream: Readable): Promise<void> {
+    return putLocalStream(this.localPath, filePath, stream);
+  }
+
+  private async runWithFallbackKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    if (!this.mayHaveLocalFallback && this.s3Available && !this.fallbackKeyLocks.has(key)) {
+      return fn();
+    }
+    const prev = this.fallbackKeyLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const tail = prev.then(() => gate);
+    this.fallbackKeyLocks.set(key, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.fallbackKeyLocks.get(key) === tail) {
+        this.fallbackKeyLocks.delete(key);
+      }
+    }
+  }
+
+  private async writeLocalFallback(write: () => Promise<void>): Promise<void> {
+    this.mayHaveLocalFallback = true;
+    this.localFallbackWriteEpoch++;
+    this.inFlightLocalFallbackWrites++;
+    try {
+      await write();
+    } finally {
+      this.inFlightLocalFallbackWrites--;
+      if (this.s3Available && !this.stopped) {
+        this.localFallbackSyncPending = true;
+        this.scheduleLocalFallbackSync();
+      }
+    }
+  }
+
+  private clearFallbackSyncRetry(): void {
+    if (this.fallbackSyncRetryTimer) {
+      clearTimeout(this.fallbackSyncRetryTimer);
+      this.fallbackSyncRetryTimer = null;
+    }
+  }
+
+  private scheduleFallbackSyncRetry(): void {
+    if (this.stopped || !this.s3Available || this.fallbackSyncRetryTimer) return;
+    this.fallbackSyncRetryTimer = setTimeout(() => {
+      this.fallbackSyncRetryTimer = null;
+      this.scheduleLocalFallbackSync();
+    }, this.s3ReprobeIntervalMs);
+    this.fallbackSyncRetryTimer.unref();
+  }
+
+  private scheduleLocalFallbackSync(): void {
+    if (this.stopped || !this.s3Available) return;
+    if (this.fallbackSyncInFlight) {
+      this.localFallbackSyncPending = true;
+      return;
+    }
+    this.localFallbackSyncPending = false;
+    this.clearFallbackSyncRetry();
+    this.fallbackSyncInFlight = this.syncLocalFallbackToS3().finally(() => {
+      this.fallbackSyncInFlight = null;
+      if (this.localFallbackSyncPending && !this.stopped && this.s3Available) {
+        this.localFallbackSyncPending = false;
+        this.scheduleLocalFallbackSync();
+      }
+    });
+  }
+
+  private async syncLocalFallbackToS3(): Promise<void> {
+    if (!this.s3Client || !this.s3Available || this.stopped) return;
+    const startEpoch = this.localFallbackWriteEpoch;
+    let synced = 0;
+    let failed = 0;
+    let stoppedEarly = false;
+    let enumerationFailed = false;
+    try {
+      for await (const file of this.iterateLocalFiles('', true)) {
+        if (this.stopped || !this.s3Available) {
+          stoppedEarly = true;
+          break;
+        }
+        if (!isSafeStorageKey(file)) continue;
+        try {
+          await this.runWithFallbackKeyLock(file, async () => {
+            if (this.stopped || !this.s3Available) {
+              stoppedEarly = true;
+              return;
+            }
+            let source: ExportFileSource;
+            try {
+              source = await openLocalFile(this.localPath, file);
+            } catch (error: unknown) {
+              if (isMissingObjectError(error)) return;
+              throw error;
+            }
+            try {
+              if (source.size !== undefined) {
+                await this.putS3Stream(file, source.stream, source.size);
+              } else {
+                source.stream.destroy();
+                const buf = await this.getLocalFile(file);
+                await this.putS3File(file, buf);
+              }
+            } finally {
+              source.stream.destroy();
+            }
+            await this.deleteLocalFile(file);
+            synced++;
+          });
+        } catch (error: unknown) {
+          failed++;
+          this.logger.warn(`Failed to sync local fallback file '${file}' to S3`, { error: String(error) });
+        }
+      }
+    } catch (error: unknown) {
+      enumerationFailed = true;
+      this.logger.warn('Failed to enumerate local fallback dir after S3 recovery', { error: String(error) });
+    }
+    if (synced > 0) {
+      this.logger.log(`Synced ${synced} local fallback file(s) to S3 after recovery`);
+    }
+    if (this.stopped || !this.s3Available) return;
+    if (failed === 0 && !stoppedEarly && !enumerationFailed) {
+      let anyRemaining = false;
+      try {
+        for await (const file of this.iterateLocalFiles('', true)) {
+          if (isSafeStorageKey(file)) {
+            anyRemaining = true;
+            break;
+          }
+        }
+      } catch {
+        anyRemaining = true;
+      }
+      if (
+        !anyRemaining &&
+        this.inFlightLocalFallbackWrites === 0 &&
+        !this.localFallbackSyncPending &&
+        this.localFallbackWriteEpoch === startEpoch
+      ) {
+        this.mayHaveLocalFallback = false;
+        return;
+      }
+    }
+    this.scheduleFallbackSyncRetry();
+  }
+
   private deleteLocalFile(filePath: string): Promise<void> {
     return deleteLocalFile(this.localPath, filePath);
   }
@@ -525,12 +862,6 @@ export class StorageService implements OnModuleDestroy {
   // ============================================================================
   // S3 Storage Operations
   // ============================================================================
-
-  private async listS3Files(): Promise<string[]> {
-    const files: string[] = [];
-    for await (const file of this.iterateS3Files()) files.push(file);
-    return files;
-  }
 
   /** Stream every S3 object key (prefix-stripped), following the ListObjectsV2 pagination token. */
   private async *iterateS3Files(prefix = ''): AsyncGenerator<string> {
@@ -545,6 +876,7 @@ export class StorageService implements OnModuleDestroy {
           Prefix: `${this.s3KeyRoot}${prefix}`,
           ContinuationToken: continuationToken,
         }),
+        { abortSignal: AbortSignal.timeout(S3_LIST_TIMEOUT_MS) },
       );
 
       for (const obj of response.Contents ?? []) {
@@ -562,7 +894,7 @@ export class StorageService implements OnModuleDestroy {
   }
 
   private async getS3File(filePath: string): Promise<Buffer> {
-    const { stream } = await this.openS3File(filePath);
+    const { stream } = await this.openS3File(filePath, this.s3Client);
     const chunks: Buffer[] = [];
     for await (const chunk of stream) {
       chunks.push(Buffer.from(chunk as ArrayBuffer));
@@ -570,18 +902,29 @@ export class StorageService implements OnModuleDestroy {
     return Buffer.concat(chunks);
   }
 
-  private async openS3File(filePath: string): Promise<ExportFileSource> {
-    if (!this.s3Client) throw new Error('S3 client not initialized');
+  private async openS3File(filePath: string, client: S3Client | null): Promise<ExportFileSource> {
+    if (!client) throw new Error('S3 client not initialized');
+    // Only the stream client, whose pool serves the downloads, is bounded. Checked and taken before any await.
+    let held = client === this.s3StreamClient;
+    if (held && this.s3OpenDownloads >= S3_MAX_OPEN_DOWNLOADS) {
+      throw new DownloadsBusyException();
+    }
+    if (held) this.s3OpenDownloads++;
+    const release = (): void => {
+      if (held) this.s3OpenDownloads--;
+      held = false;
+    };
 
     let response;
     try {
-      response = await this.s3Client.send(
+      response = await client.send(
         new GetObjectCommand({
           Bucket: this.s3Bucket,
           Key: `${this.s3KeyRoot}${filePath}`,
         }),
       );
     } catch (error: unknown) {
+      release();
       // Read-through: media written while S3 was down lives only in the local fallback dir, so after
       // recovery a plain S3 read would split-brain (NoSuchKey even though the app served the file
       // fine during the outage). Fall through to the local copy; if there is none, surface the
@@ -598,9 +941,21 @@ export class StorageService implements OnModuleDestroy {
       return local;
     }
 
-    if (!response.Body) throw new Error('Empty response body');
-
-    return { stream: response.Body as Readable, size: response.ContentLength };
+    if (!response.Body) {
+      release();
+      throw new Error('Empty response body');
+    }
+    const body = response.Body as Readable;
+    // Headers that took over 3 s leave the SDK's socket timer armed for the body, cutting a reader held back for 27 s;
+    // withIdleBound bounds the body instead. A checksummed body (the SDK sends a checksum with every upload) wraps the
+    // response as its internal `source`, which storage.service.s3-late-headers.spec.ts pins.
+    const raw = body as Readable & { socket?: Socket | null; source?: { socket?: Socket | null } };
+    (raw.socket ?? raw.source?.socket)?.setTimeout(0);
+    // Released on the SDK body, which holds the socket: it goes back once the body is read to the end, fails, or
+    // is destroyed (a client that went away, or the idle bound). Released on the guard instead, a reader that
+    // stopped with the last chunks in the guard's buffer would hold the place after the socket went back.
+    finished(body, release);
+    return { stream: withIdleBound(body, S3_SOCKET_TIMEOUT_MS, S3_READER_IDLE_MS), size: response.ContentLength };
   }
 
   private async putS3File(filePath: string, data: Buffer): Promise<void> {
@@ -611,6 +966,22 @@ export class StorageService implements OnModuleDestroy {
         Bucket: this.s3Bucket,
         Key: `${this.s3KeyRoot}${filePath}`,
         Body: data,
+      }),
+    );
+  }
+
+  private async putS3Stream(filePath: string, stream: Readable, sizeBytes: number): Promise<void> {
+    if (!this.s3Client) {
+      stream.destroy();
+      throw new Error('S3 client not initialized');
+    }
+
+    await this.s3Client.send(
+      new PutObjectCommand({
+        Bucket: this.s3Bucket,
+        Key: `${this.s3KeyRoot}${filePath}`,
+        Body: stream,
+        ContentLength: sizeBytes,
       }),
     );
   }

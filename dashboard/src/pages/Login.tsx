@@ -1,20 +1,31 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Eye, EyeOff } from 'lucide-react';
+import { Eye, EyeOff, Languages } from 'lucide-react';
 import { GithubIcon } from '../components/GithubIcon';
-import { API_BASE_URL } from '../services/api';
+import { CustomSelect } from '../components/CustomSelect';
+import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
+import { authApi } from '../services/api';
 import './Login.css';
 
+export interface LoginSessionResult {
+  role?: string;
+  engineType?: string;
+  scoped?: boolean;
+  apiKeyId?: string;
+}
+
 interface LoginProps {
-  onLogin: (apiKey: string, role?: string, engineType?: string, scoped?: boolean) => void;
+  onLogin: (session: LoginSessionResult) => void;
 }
 
 export function Login({ onLogin }: LoginProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const currentLang = resolveSupportedLanguage(i18n.resolvedLanguage || i18n.language);
+  const changeLanguage = (language: SupportedLanguage) => { void i18n.changeLanguage(language); };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,24 +39,31 @@ export function Login({ onLogin }: LoginProps) {
     setError('');
 
     try {
-      const response = await fetch(`${API_BASE_URL}/auth/validate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': key,
-        },
-      });
+      const response = await authApi.createSession(key);
 
       if (response.ok) {
-        // The validate body already carries the key's role — hand it up so the app can set it
-        // directly instead of re-validating the same key a second time.
-        const data: { role?: string; engineType?: string; scoped?: unknown } = await response.json().catch(() => ({}));
-        onLogin(
-          key,
-          data.role,
-          typeof data.engineType === 'string' ? data.engineType : undefined,
-          data.scoped === true,
-        );
+        // The session exchange sets the HttpOnly browser cookie and returns non-secret session
+        // metadata so the app can hydrate role/scope/engine without a second round-trip.
+        const data: {
+          valid?: unknown;
+          role?: string;
+          engineType?: string;
+          scoped?: unknown;
+          apiKeyId?: unknown;
+        } = await response.json().catch(() => ({}));
+        // A 200 is the gateway's answer only if it says the session is valid: a reverse proxy
+        // serving the app's HTML for a misrouted /api would otherwise sign any typed text in as a viewer.
+        if (data.valid !== true) {
+          setError(t('login.connectionError'));
+          return;
+        }
+        setApiKey('');
+        onLogin({
+          role: data.role,
+          engineType: typeof data.engineType === 'string' ? data.engineType : undefined,
+          scoped: data.scoped === true,
+          apiKeyId: typeof data.apiKeyId === 'string' && data.apiKeyId.length > 0 ? data.apiKeyId : undefined,
+        });
       } else {
         // A 5xx, or a body that is not the gateway's JSON (a proxy error page while it restarts), says
         // nothing about the key; a refusal keeps the gateway's reason (expired, revoked, rate limited).
@@ -76,6 +94,16 @@ export function Login({ onLogin }: LoginProps) {
           </span>
         </div>
 
+        <div className="login-language">
+          <Languages size={18} />
+          <CustomSelect
+            value={currentLang}
+            onChange={value => changeLanguage(value as SupportedLanguage)}
+            options={languageOptions.map(opt => ({ value: opt.value, label: opt.label }))}
+            ariaLabel={t('common.language')}
+          />
+        </div>
+
         <form onSubmit={handleSubmit} className="login-form">
           <div className="input-group">
             <label htmlFor="apiKey">{t('login.apiKey')}</label>
@@ -87,10 +115,8 @@ export function Login({ onLogin }: LoginProps) {
                 onChange={e => setApiKey(e.target.value)}
                 placeholder={t('login.apiKeyPlaceholder')}
                 className={error ? 'error' : ''}
-                autoComplete="off"
-                spellCheck={false}
-                aria-invalid={Boolean(error)}
-                aria-describedby={error ? 'login-error' : undefined}
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'apiKey-error' : undefined}
               />
               <button
                 type="button"
@@ -102,7 +128,7 @@ export function Login({ onLogin }: LoginProps) {
               </button>
             </div>
             {error && (
-              <span id="login-error" className="error-message" role="alert">
+              <span id="apiKey-error" className="error-message" role="alert">
                 {error}
               </span>
             )}

@@ -3,11 +3,15 @@ jest.mock('../common/services/logger.service', () => ({
   createLogger: () => ({ warn: mockWarn, log: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() }),
 }));
 
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
   __resetWebVersionCache,
+  getEffectiveWebVersionInfo,
+  getVerifiedPinnedHtml,
+  MAX_WEB_VERSION_HTML_BYTES,
   PINNED_HTML_TIMEOUT_MS,
   pickSettledWebVersion,
   resolveCurrentWebVersion,
@@ -87,6 +91,22 @@ describe('pickSettledWebVersion', () => {
       entry('2.3000.GOOD-alpha', settled() + 1000, 50 * 86_400_000, false),
     ];
     expect(pickSettledWebVersion(versions, now, null)).toBe('2.3000.GOOD-alpha');
+  });
+
+  it('passes over builds in the skip set and picks the next older settled build', () => {
+    const versions = [
+      entry('2.3000.BAD-alpha', settled(), 50 * 86_400_000), // newest qualifying, but its page was not the app
+      entry('2.3000.GOOD-alpha', settled() + 3_600_000, 50 * 86_400_000),
+    ];
+    expect(pickSettledWebVersion(versions, now, null)).toBe('2.3000.BAD-alpha');
+    expect(pickSettledWebVersion(versions, now, null, new Set(['2.3000.BAD-alpha']))).toBe('2.3000.GOOD-alpha');
+  });
+
+  it('does not fall back to a currentVersion in the skip set', () => {
+    const skip = new Set(['2.3000.BAD-alpha']);
+    expect(pickSettledWebVersion([], now, '2.3000.BAD-alpha', skip)).toBeNull();
+    expect(pickSettledWebVersion(undefined, now, '2.3000.BAD-alpha', skip)).toBeNull();
+    expect(pickSettledWebVersion([], now, '2.3000.OK-alpha', skip)).toBe('2.3000.OK-alpha');
   });
 });
 
@@ -173,25 +193,62 @@ describe('resolveCurrentWebVersion', () => {
   });
 });
 
-// Remote-HTML pins execute inside the authenticated web.whatsapp.com origin with no integrity
-// check, so taking one MUST be visible to the operator — once per process, with the source and
-// the opt-outs. 'off' (first-party) is the only path that must stay silent.
-describe('resolveWebVersionPin remote-trust warning', () => {
+// Default posture is native (no remote HTML fetch). Remote-HTML pins require either a matching
+// WWEBJS_WEB_VERSION_SHA256 digest or explicit WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED=true opt-in.
+// Only the unverified opt-in path emits the once-per-process remote-trust warning.
+describe('resolveWebVersionPin remote-trust warning and default-off policy', () => {
   const ORIGINAL_ENV = process.env.WWEBJS_WEB_VERSION;
+  const ORIGINAL_SHA = process.env.WWEBJS_WEB_VERSION_SHA256;
+  const ORIGINAL_ALLOW = process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
   const json = (body: unknown) => ({ ok: true, status: 200, json: () => Promise.resolve(body) });
 
   beforeEach(() => {
     __resetWebVersionCache();
     mockWarn.mockClear();
+    delete process.env.WWEBJS_WEB_VERSION;
+    delete process.env.WWEBJS_WEB_VERSION_SHA256;
+    delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
   });
   afterEach(() => {
     __resetWebVersionCache();
     if (ORIGINAL_ENV === undefined) delete process.env.WWEBJS_WEB_VERSION;
     else process.env.WWEBJS_WEB_VERSION = ORIGINAL_ENV;
+    if (ORIGINAL_SHA === undefined) delete process.env.WWEBJS_WEB_VERSION_SHA256;
+    else process.env.WWEBJS_WEB_VERSION_SHA256 = ORIGINAL_SHA;
+    if (ORIGINAL_ALLOW === undefined) delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+    else process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = ORIGINAL_ALLOW;
   });
 
-  it('warns once (with version, source URL, and opt-out) when an exact version is pinned', async () => {
+  it('defaults unset or blank WWEBJS_WEB_VERSION to native with zero remote fetches and no warnings', async () => {
+    const fetcher = jest.fn();
+    await expect(resolveWebVersionPin(fetcher as never)).resolves.toBeUndefined();
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: null, source: 'native' });
+
+    process.env.WWEBJS_WEB_VERSION = '   ';
+    await expect(resolveWebVersionPin(fetcher as never)).resolves.toBeUndefined();
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: null, source: 'native' });
+
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(mockWarn).not.toHaveBeenCalled();
+  });
+
+  it('refuses auto/latest and unverified exact pins at runtime when neither SHA-256 nor allow-unverified is set', async () => {
+    const fetcher = jest.fn();
+
+    process.env.WWEBJS_WEB_VERSION = 'auto';
+    await expect(resolveWebVersionPin(fetcher as never)).resolves.toBeUndefined();
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: null, source: 'native' });
+
     process.env.WWEBJS_WEB_VERSION = '2.3000.1234-alpha';
+    await expect(resolveWebVersionPin(fetcher as never)).resolves.toBeUndefined();
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: null, source: 'native' });
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('warns once (with version, source URL, and opt-out) when an exact version uses unverified opt-in', async () => {
+    process.env.WWEBJS_WEB_VERSION = '2.3000.1234-alpha';
+    process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = 'true';
     await resolveWebVersionPin();
     await resolveWebVersionPin(); // second resolve must NOT re-warn
     expect(mockWarn).toHaveBeenCalledTimes(1);
@@ -208,8 +265,9 @@ describe('resolveWebVersionPin remote-trust warning', () => {
     expect(mockWarn).not.toHaveBeenCalled();
   });
 
-  it('warns for the auto-resolved registry pin (the default posture)', async () => {
-    delete process.env.WWEBJS_WEB_VERSION;
+  it('warns for the opted-in auto-resolved registry pin', async () => {
+    process.env.WWEBJS_WEB_VERSION = 'auto';
+    process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = 'true';
     const fetcher = jest.fn(() => Promise.resolve(json({ currentVersion: '2.3000.SOLO-alpha' })));
     await resolveWebVersionPin(fetcher as never);
     expect(mockWarn).toHaveBeenCalledTimes(1);
@@ -279,14 +337,29 @@ describe('resolveCurrentWebVersion failure warning', () => {
 // when that fails, silently. The HTML is now fetched here, bounded, and served as a strict local file.
 describe('resolveWebVersionPin with a cache directory', () => {
   const ORIGINAL_ENV = process.env.WWEBJS_WEB_VERSION;
+  const ORIGINAL_ALLOW = process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+  const ORIGINAL_SHA = process.env.WWEBJS_WEB_VERSION_SHA256;
   const VERSION = '2.3000.1234';
   const HTML = `<!DOCTYPE html><html><head></head><body>${'x'.repeat(2048)}</body></html>`;
+  const HTML_SHA256 = createHash('sha256').update(Buffer.from(HTML, 'utf8')).digest('hex');
   let dir: string;
 
-  const page = (body: string, status = 200) => ({ ok: status < 400, status, text: () => Promise.resolve(body) });
+  const page = (body: string, status = 200) => {
+    const buf = Buffer.from(body, 'utf8');
+    return {
+      ok: status < 400,
+      status,
+      text: () => Promise.resolve(body),
+      arrayBuffer: () => Promise.resolve(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)),
+    };
+  };
   const htmlWarning = (): Record<string, unknown> | undefined =>
     (mockWarn.mock.calls as [string, Record<string, unknown>][]).find(
       ([, meta]) => meta?.action === 'web_version_html_unavailable',
+    )?.[1];
+  const hashMismatchWarning = (): Record<string, unknown> | undefined =>
+    (mockWarn.mock.calls as [string, Record<string, unknown>][]).find(
+      ([, meta]) => meta?.action === 'web_version_html_hash_mismatch',
     )?.[1];
 
   beforeEach(() => {
@@ -294,6 +367,8 @@ describe('resolveWebVersionPin with a cache directory', () => {
     mockWarn.mockClear();
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-web-cache-'));
     process.env.WWEBJS_WEB_VERSION = VERSION;
+    process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = 'true';
+    delete process.env.WWEBJS_WEB_VERSION_SHA256;
   });
   afterEach(() => {
     jest.useRealTimers();
@@ -301,6 +376,10 @@ describe('resolveWebVersionPin with a cache directory', () => {
     fs.rmSync(dir, { recursive: true, force: true });
     if (ORIGINAL_ENV === undefined) delete process.env.WWEBJS_WEB_VERSION;
     else process.env.WWEBJS_WEB_VERSION = ORIGINAL_ENV;
+    if (ORIGINAL_ALLOW === undefined) delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+    else process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = ORIGINAL_ALLOW;
+    if (ORIGINAL_SHA === undefined) delete process.env.WWEBJS_WEB_VERSION_SHA256;
+    else process.env.WWEBJS_WEB_VERSION_SHA256 = ORIGINAL_SHA;
   });
 
   it('writes the HTML and answers a strict local cache for it', async () => {
@@ -429,5 +508,434 @@ describe('resolveWebVersionPin with a cache directory', () => {
       webVersionCache: { type: 'remote' },
     });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  describe('SHA-256 integrity verification', () => {
+    beforeEach(() => {
+      delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+      process.env.WWEBJS_WEB_VERSION_SHA256 = HTML_SHA256;
+    });
+
+    it('accepts pinned HTML matching WWEBJS_WEB_VERSION_SHA256 without emitting the unverified warning and tightens permissions', async () => {
+      const fetcher = jest.fn(() => Promise.resolve(page(HTML)));
+      const nestedDir = path.join(dir, 'nested-cache');
+
+      const pin = await resolveWebVersionPin(fetcher as never, nestedDir);
+      expect(pin).toEqual({
+        webVersion: VERSION,
+        webVersionCache: { type: 'local', path: nestedDir, strict: true },
+      });
+      const cachedFile = path.join(nestedDir, `${VERSION}.html`);
+      expect(fs.readFileSync(cachedFile, 'utf8')).toBe(HTML);
+      expect(fs.statSync(nestedDir).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(cachedFile).mode & 0o777).toBe(0o600);
+      expect(getVerifiedPinnedHtml(pin)?.toString('utf8')).toBe(HTML);
+      expect(mockWarn).not.toHaveBeenCalled();
+    });
+
+    it('re-verifies SHA-256 on disk cache hits without re-fetching when the cached file matches', async () => {
+      const fetcher = jest.fn(() => Promise.resolve(page(HTML)));
+
+      await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toMatchObject({ webVersion: VERSION });
+      __resetWebVersionCache();
+      const pin = await resolveWebVersionPin(fetcher as never, dir);
+      expect(pin).toMatchObject({ webVersion: VERSION });
+      expect(getVerifiedPinnedHtml(pin)?.toString('utf8')).toBe(HTML);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(mockWarn).not.toHaveBeenCalled();
+    });
+
+    it('emits a structured mismatch warning, deletes a tampered on-disk cache file, and re-fetches verified bytes', async () => {
+      const cachedFile = path.join(dir, `${VERSION}.html`);
+      fs.writeFileSync(cachedFile, `<!DOCTYPE html><html><body>${'z'.repeat(2048)}</body></html>`);
+      const fetcher = jest.fn(() => Promise.resolve(page(HTML)));
+
+      const pin = await resolveWebVersionPin(fetcher as never, dir);
+      expect(pin).toMatchObject({ webVersion: VERSION });
+      expect(getVerifiedPinnedHtml(pin)?.toString('utf8')).toBe(HTML);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(fs.readFileSync(cachedFile, 'utf8')).toBe(HTML);
+      expect(hashMismatchWarning()).toEqual(
+        expect.objectContaining({
+          action: 'web_version_html_hash_mismatch',
+          source: 'cache',
+          webVersion: VERSION,
+          expectedSha256: HTML_SHA256,
+        }),
+      );
+    });
+
+    it('refuses a symlinked cached HTML file, warns, and replaces it atomically with verified bytes', async () => {
+      const target = path.join(dir, 'outside-target.html');
+      fs.writeFileSync(target, HTML);
+      const cachedFile = path.join(dir, `${VERSION}.html`);
+      fs.symlinkSync(target, cachedFile);
+      const fetcher = jest.fn(() => Promise.resolve(page(HTML)));
+
+      const pin = await resolveWebVersionPin(fetcher as never, dir);
+      expect(pin).toMatchObject({ webVersion: VERSION });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(fs.lstatSync(cachedFile).isSymbolicLink()).toBe(false);
+      expect(hashMismatchWarning()).toEqual(
+        expect.objectContaining({
+          action: 'web_version_html_hash_mismatch',
+          source: 'cache',
+          webVersion: VERSION,
+        }),
+      );
+    });
+
+    it('refuses a symlinked cache directory without writing through it', async () => {
+      const realOutside = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-web-outside-'));
+      const symDir = path.join(dir, 'sym-cache');
+      fs.symlinkSync(realOutside, symDir);
+      const fetcher = jest.fn(() => Promise.resolve(page(HTML)));
+      try {
+        await expect(resolveWebVersionPin(fetcher as never, symDir)).resolves.toBeUndefined();
+        expect(fs.readdirSync(realOutside)).toEqual([]);
+      } finally {
+        fs.rmSync(realOutside, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses fetched bytes failing SHA-256, logs web_version_html_hash_mismatch, and writes nothing', async () => {
+      const tamperedHtml = `<!DOCTYPE html><html><head></head><body>${'y'.repeat(2048)}</body></html>`;
+      const fetcher = jest.fn(() => Promise.resolve(page(tamperedHtml)));
+
+      await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toBeUndefined();
+      expect(fs.readdirSync(dir)).toEqual([]);
+      const mismatch = hashMismatchWarning();
+      expect(mismatch).toBeDefined();
+      expect(mismatch?.source).toBe('remote');
+      expect(mismatch?.webVersion).toBe(VERSION);
+      expect(mismatch?.expectedSha256).toBe(HTML_SHA256);
+    });
+
+    it('deletes a tampered cache file and returns undefined when re-fetched bytes also fail SHA-256', async () => {
+      const cachedFile = path.join(dir, `${VERSION}.html`);
+      fs.writeFileSync(cachedFile, `<!DOCTYPE html><html><body>${'z'.repeat(2048)}</body></html>`);
+      const tamperedHtml = `<!DOCTYPE html><html><head></head><body>${'y'.repeat(2048)}</body></html>`;
+      const fetcher = jest.fn(() => Promise.resolve(page(tamperedHtml)));
+
+      await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toBeUndefined();
+      expect(fs.existsSync(cachedFile)).toBe(false);
+      expect(hashMismatchWarning()).toBeDefined();
+    });
+
+    it('aborts and rejects oversized remote HTML streams exceeding MAX_WEB_VERSION_HTML_BYTES', async () => {
+      const chunk = new Uint8Array(1024 * 1024); // 1 MiB
+      let reads = 0;
+      const cancel = jest.fn(() => Promise.resolve());
+      const streamBody = {
+        getReader: () => ({
+          read: () => {
+            reads += 1;
+            if (reads <= 20) return Promise.resolve({ done: false, value: chunk });
+            return Promise.resolve({ done: true, value: undefined });
+          },
+          cancel,
+          releaseLock: jest.fn(),
+        }),
+      };
+      const fetcher = jest.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          body: streamBody,
+        }),
+      );
+
+      await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toBeUndefined();
+      expect(cancel).toHaveBeenCalled();
+      expect(reads).toBeLessThanOrEqual(Math.ceil(MAX_WEB_VERSION_HTML_BYTES / chunk.byteLength) + 1);
+      expect(htmlWarning()?.reason).toContain('exceeds maximum size');
+      expect(fs.readdirSync(dir)).toEqual([]);
+    });
+
+    it('rejects responses advertising Content-Length larger than MAX_WEB_VERSION_HTML_BYTES before reading body', async () => {
+      const arrayBuffer = jest.fn();
+      const fetcher = jest.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === 'content-length' ? String(MAX_WEB_VERSION_HTML_BYTES + 1) : null,
+          },
+          arrayBuffer,
+        }),
+      );
+
+      await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toBeUndefined();
+      expect(arrayBuffer).not.toHaveBeenCalled();
+      expect(htmlWarning()?.reason).toContain('exceeds maximum size');
+    });
+  });
+});
+
+describe('resolveWebVersionPin when a registry build is the logged-out page', () => {
+  const ORIGINAL_ENV = process.env.WWEBJS_WEB_VERSION;
+  const ORIGINAL_ALLOW = process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+  const APP = `<!DOCTYPE html><html id="whatsapp-web" lang="en"><head></head><body>${'x'.repeat(2048)}</body></html>`;
+  const LOGGED_OUT = `<!DOCTYPE html><html lang="en" id="whatsapp-web-logged-out"><head></head><body>${'x'.repeat(2048)}</body></html>`;
+  const NEWEST = '2.3000.1053060988-alpha';
+  const NEWER = '2.3000.1052966331-alpha';
+  const OLDER = '2.3000.1052897873-alpha';
+  const htmlUrl = (build: string) =>
+    `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${build}.html`;
+  let dir: string;
+
+  // The builds are listed newest first, a day apart, so the picker names them in that order.
+  const registry = (builds: string[]) => ({
+    ok: true,
+    status: 200,
+    json: () =>
+      Promise.resolve({
+        currentVersion: builds[0],
+        versions: builds.map((version, i) => ({
+          version,
+          beta: false,
+          released: new Date(Date.now() - (1 + i) * 86_400_000).toISOString(),
+          expire: '2099-01-01T00:00:00Z',
+        })),
+      }),
+  });
+  const host = (builds: string[], pages: Record<string, string>) =>
+    jest.fn((url: string) => {
+      if (url === WA_VERSION_REGISTRY_URL) return Promise.resolve(registry(builds));
+      const build = Object.keys(pages).find(b => url === htmlUrl(b));
+      const body = build === undefined ? '' : pages[build];
+      const buf = Buffer.from(body, 'utf8');
+      return Promise.resolve({
+        ok: build !== undefined,
+        status: build === undefined ? 404 : 200,
+        text: () => Promise.resolve(body),
+        arrayBuffer: () => Promise.resolve(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)),
+      });
+    });
+  const warnings = (action: string): Record<string, unknown>[] =>
+    (mockWarn.mock.calls as [string, Record<string, unknown>][])
+      .filter(([, meta]) => meta?.action === action)
+      .map(([, meta]) => meta);
+
+  beforeEach(() => {
+    __resetWebVersionCache();
+    mockWarn.mockClear();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-web-loggedout-'));
+    process.env.WWEBJS_WEB_VERSION = 'auto';
+    process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = 'true';
+  });
+  afterEach(() => {
+    __resetWebVersionCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (ORIGINAL_ENV === undefined) delete process.env.WWEBJS_WEB_VERSION;
+    else process.env.WWEBJS_WEB_VERSION = ORIGINAL_ENV;
+    if (ORIGINAL_ALLOW === undefined) delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+    else process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = ORIGINAL_ALLOW;
+  });
+
+  it('pins the next older settled build when the newest one is the logged-out page', async () => {
+    const fetcher = host([NEWEST, NEWER, OLDER], { [NEWEST]: LOGGED_OUT, [NEWER]: APP, [OLDER]: APP });
+
+    await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toEqual({
+      webVersion: NEWER,
+      webVersionCache: { type: 'local', path: dir, strict: true },
+    });
+    expect(fs.readdirSync(dir)).toEqual([`${NEWER}.html`]);
+    expect(warnings('web_version_html_rejected')).toEqual([expect.objectContaining({ webVersion: NEWEST })]);
+    expect(warnings('web_version_html_unavailable')).toEqual([]);
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: NEWER, source: 'auto' });
+  });
+
+  it('does not fetch the logged-out build again on the next start', async () => {
+    const fetcher = host([NEWEST, NEWER], { [NEWEST]: LOGGED_OUT, [NEWER]: APP });
+
+    await resolveWebVersionPin(fetcher as never, dir);
+    await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toMatchObject({ webVersion: NEWER });
+
+    expect(fetcher.mock.calls.filter(([url]) => url === htmlUrl(NEWEST))).toHaveLength(1);
+    expect(warnings('web_version_html_rejected')).toHaveLength(1);
+  });
+
+  it('pins the next build from the same registry read when the registry cannot be read again', async () => {
+    // The read that named the logged-out build is the only one that succeeds: the fallback must not need another.
+    const pages = host([NEWEST, NEWER, OLDER], { [NEWEST]: LOGGED_OUT, [NEWER]: APP, [OLDER]: APP });
+    let reads = 0;
+    const fetcher = jest.fn((url: string) => {
+      if (url !== WA_VERSION_REGISTRY_URL) return pages(url);
+      reads += 1;
+      return reads === 1 ? pages(url) : Promise.reject(new Error('registry unreachable'));
+    });
+
+    await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toMatchObject({ webVersion: NEWER });
+    expect(reads).toBe(1);
+    expect(fs.readdirSync(dir)).toEqual([`${NEWER}.html`]);
+  });
+
+  it('keeps skipping the rejected build after the daily refresh re-reads the registry', async () => {
+    const DAY = 86_400_000;
+    let now = Date.now();
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const fetcher = host([NEWEST, NEWER], { [NEWEST]: LOGGED_OUT, [NEWER]: APP });
+      await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toMatchObject({ webVersion: NEWER });
+
+      now += DAY;
+      await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toMatchObject({ webVersion: NEWER });
+      expect(fetcher.mock.calls.filter(([url]) => url === htmlUrl(NEWEST))).toHaveLength(1);
+      expect(warnings('web_version_html_rejected')).toHaveLength(1);
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
+  it('reads the registry again when the only build of the last read was the logged-out page', async () => {
+    // No candidate is left to fall back to, so the next resolve has to read the registry; the rejected build stays out.
+    const FRESH = '2.3000.1053100000-alpha';
+    let reads = 0;
+    const pages = host([FRESH, NEWEST], { [FRESH]: APP, [NEWEST]: LOGGED_OUT });
+    const fetcher = jest.fn((url: string) => {
+      if (url !== WA_VERSION_REGISTRY_URL) return pages(url);
+      reads += 1;
+      return Promise.resolve(registry(reads === 1 ? [NEWEST] : [FRESH, NEWEST]));
+    });
+
+    await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toMatchObject({ webVersion: FRESH });
+    expect(reads).toBe(2);
+    expect(fs.readdirSync(dir)).toEqual([`${FRESH}.html`]);
+  });
+
+  it('shares one rejection between sessions that start together', async () => {
+    const fetcher = host([NEWEST, NEWER], { [NEWEST]: LOGGED_OUT, [NEWER]: APP });
+
+    const pins = await Promise.all([
+      resolveWebVersionPin(fetcher as never, dir),
+      resolveWebVersionPin(fetcher as never, dir),
+      resolveWebVersionPin(fetcher as never, dir),
+    ]);
+
+    expect(pins.map(pin => pin?.webVersion)).toEqual([NEWER, NEWER, NEWER]);
+    expect(fetcher.mock.calls.filter(([url]) => url === htmlUrl(NEWEST))).toHaveLength(1);
+    expect(warnings('web_version_html_rejected')).toHaveLength(1);
+  });
+
+  it('gives up after three logged-out builds and drops the pin', async () => {
+    const builds = [NEWEST, NEWER, OLDER, '2.3000.1052866173-alpha'];
+    const fetcher = host(builds, Object.fromEntries(builds.map(b => [b, LOGGED_OUT])));
+
+    await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toBeUndefined();
+
+    const pages = fetcher.mock.calls.map(([url]) => url).filter(url => url !== WA_VERSION_REGISTRY_URL);
+    expect(pages).toEqual([htmlUrl(NEWEST), htmlUrl(NEWER), htmlUrl(OLDER)]);
+    expect(warnings('web_version_html_rejected')).toHaveLength(2);
+    expect(warnings('web_version_html_unavailable')).toEqual([
+      expect.objectContaining({ webVersion: OLDER, reason: expect.stringContaining('logged-out') as unknown }),
+    ]);
+    expect(fs.readdirSync(dir)).toEqual([]);
+    // Out of builds, no rejected page is left reported as the resolved build; the next start reads the registry.
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: null, source: 'auto' });
+  });
+
+  it('does not swap an exact build the operator set', async () => {
+    process.env.WWEBJS_WEB_VERSION = NEWEST;
+    const fetcher = host([NEWEST, NEWER], { [NEWEST]: LOGGED_OUT, [NEWER]: APP });
+
+    await expect(resolveWebVersionPin(fetcher as never, dir)).resolves.toBeUndefined();
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(warnings('web_version_html_unavailable')).toEqual([expect.objectContaining({ webVersion: NEWEST })]);
+    expect(warnings('web_version_html_rejected')).toEqual([]);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it.each([
+    ['single quotes and another attribute first', `<html lang="en" id='whatsapp-web-logged-out' dir="ltr">`],
+    ['upper case', `<HTML ID="whatsapp-web-logged-out">`],
+    ['spaces around the equals sign', `<html id = "whatsapp-web-logged-out">`],
+    ['an unquoted value', `<html id=whatsapp-web-logged-out>`],
+  ])('refuses the page with %s', async (_label, root) => {
+    process.env.WWEBJS_WEB_VERSION = NEWEST;
+    const page = `<!DOCTYPE html>${root}<head></head><body>${'x'.repeat(2048)}</body></html>`;
+
+    await expect(resolveWebVersionPin(host([NEWEST], { [NEWEST]: page }) as never, dir)).resolves.toBeUndefined();
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('keeps an app page that only mentions the logged-out id', async () => {
+    process.env.WWEBJS_WEB_VERSION = NEWEST;
+    const page = `<!DOCTYPE html><html id="whatsapp-web"><head><style>#whatsapp-web-logged-out{display:none}</style></head><body data-id="whatsapp-web-logged-out">${'x'.repeat(2048)}</body></html>`;
+
+    await expect(resolveWebVersionPin(host([NEWEST], { [NEWEST]: page }) as never, dir)).resolves.toMatchObject({
+      webVersion: NEWEST,
+    });
+    expect(fs.readdirSync(dir)).toEqual([`${NEWEST}.html`]);
+  });
+});
+
+/**
+ * The status reports the build the gateway resolves for sessions to pin, not the outcome of any one start: a
+ * session whose pinned HTML cannot be loaded starts unpinned and logs it, and the reading stays what was resolved.
+ * The infrastructure status and its documentation word it that way, and the dashboard shows the value as it is.
+ */
+describe('the build reported for sessions to pin', () => {
+  const ORIGINAL_ENV = process.env.WWEBJS_WEB_VERSION;
+  const ORIGINAL_ALLOW = process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+  const BUILD = '2.3000.1047000000-alpha';
+  const HTML = `<!DOCTYPE html><html><head></head><body>${'x'.repeat(2048)}</body></html>`;
+  let dir: string;
+
+  const html = (ok: boolean) => {
+    const body = ok ? HTML : '';
+    const buf = Buffer.from(body, 'utf8');
+    return {
+      ok,
+      status: ok ? 200 : 404,
+      text: () => Promise.resolve(body),
+      arrayBuffer: () => Promise.resolve(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)),
+    };
+  };
+  const registry = { ok: true, status: 200, json: () => Promise.resolve({ currentVersion: BUILD }) };
+  const host = (htmlOk: boolean) =>
+    jest.fn((url: string) => Promise.resolve(url === WA_VERSION_REGISTRY_URL ? registry : html(htmlOk)));
+
+  beforeEach(() => {
+    __resetWebVersionCache();
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-web-reported-'));
+    process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = 'true';
+  });
+  afterEach(() => {
+    __resetWebVersionCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (ORIGINAL_ENV === undefined) delete process.env.WWEBJS_WEB_VERSION;
+    else process.env.WWEBJS_WEB_VERSION = ORIGINAL_ENV;
+    if (ORIGINAL_ALLOW === undefined) delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+    else process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = ORIGINAL_ALLOW;
+  });
+
+  it('stays the resolved registry build while the pinned HTML cannot be loaded, and after it can', async () => {
+    process.env.WWEBJS_WEB_VERSION = 'auto';
+
+    await expect(resolveWebVersionPin(host(false) as never, dir)).resolves.toBeUndefined();
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: BUILD, source: 'auto' });
+
+    await expect(resolveWebVersionPin(host(true) as never, dir)).resolves.toMatchObject({ webVersion: BUILD });
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: BUILD, source: 'auto' });
+  });
+
+  it('stays the operator-set build while its HTML cannot be loaded', async () => {
+    process.env.WWEBJS_WEB_VERSION = '2.3000.1047000001-alpha';
+
+    await expect(resolveWebVersionPin(host(false) as never, dir)).resolves.toBeUndefined();
+
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: '2.3000.1047000001-alpha', source: 'pinned' });
+  });
+
+  it('reports no build when the first-party build is chosen or WWEBJS_WEB_VERSION is unset', () => {
+    process.env.WWEBJS_WEB_VERSION = 'off';
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: null, source: 'native' });
+
+    delete process.env.WWEBJS_WEB_VERSION;
+    expect(getEffectiveWebVersionInfo()).toEqual({ version: null, source: 'native' });
   });
 });

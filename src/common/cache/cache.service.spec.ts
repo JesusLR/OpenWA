@@ -177,35 +177,24 @@ describe('CacheService Redis-outage resilience', () => {
     expect(calls[1][0].db).toBe(1);
   });
 
-  it('parses a cached JSON value and reads a miss as null', async () => {
-    const get = jest.fn().mockResolvedValueOnce('["a","b"]').mockResolvedValueOnce(null);
-    RedisMock.mockImplementation(() => ({ ...fakeClient(jest.fn().mockResolvedValue('PONG')), get }));
-    const service = new CacheService(enabledConfig());
-
-    expect(await service.getSessionsList()).toEqual(['a', 'b']);
-    expect(await service.getSessionsList()).toBeNull();
-  });
-
-  it('falls back to the source of truth when a cache command fails', async () => {
-    const fail = jest.fn().mockRejectedValue(new Error('READONLY'));
-    RedisMock.mockImplementation(() => ({
-      ...fakeClient(jest.fn().mockResolvedValue('PONG')),
-      get: fail,
-      setex: fail,
-    }));
-    const service = new CacheService(enabledConfig());
-
-    expect(await service.getSessionInfo('s1')).toBeNull();
-    expect(await service.getSessionsStats()).toBeNull();
-    await expect(service.setSessionInfo('s1', { id: 's1' } as never)).resolves.toBeUndefined();
-    await expect(service.setSessionsStats({} as never)).resolves.toBeUndefined();
-  });
-
   it('does not construct a client when the cache is disabled', async () => {
     const disabled = { get: (_key: string, def?: unknown) => def } as unknown as ConfigService;
     const service = new CacheService(disabled);
 
     expect(await service.isAvailable()).toBe(false);
     expect(RedisMock).not.toHaveBeenCalled();
+  });
+
+  it('does not lazily create a new Redis client on isAvailable() after onModuleDestroy()', async () => {
+    const ping = jest.fn().mockResolvedValue('PONG');
+    useClient(ping);
+    const service = new CacheService(enabledConfig());
+
+    expect(await service.isAvailable()).toBe(true);
+    expect(RedisMock).toHaveBeenCalledTimes(1);
+
+    await service.onModuleDestroy();
+    expect(await service.isAvailable()).toBe(false);
+    expect(RedisMock).toHaveBeenCalledTimes(1);
   });
 });

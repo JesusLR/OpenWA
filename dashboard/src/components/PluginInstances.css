@@ -5,6 +5,7 @@
 }
 .plugin-instances .pi-header {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: flex-start;
   gap: 1rem;
@@ -31,6 +32,7 @@
 }
 .plugin-instances .pi-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
   padding: 0.75rem;
@@ -44,13 +46,16 @@
 }
 .plugin-instances .pi-id {
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 .plugin-instances .pi-scope {
   font-size: 0.8rem;
   color: var(--text-muted);
 }
 .plugin-instances .pi-url {
-  flex: 1;
+  /* Wide enough to show the start of the address, or a row of its own: it used to take what the badge and
+     the four action buttons left, which on a phone was nothing. */
+  flex: 1 1 14rem;
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -69,7 +74,7 @@
 }
 .plugin-instances .pi-badge.on {
   background: var(--primary-soft);
-  color: var(--success-text);
+  color: var(--primary-text);
 }
 .plugin-instances .pi-badge.off {
   background: var(--bg-light);
@@ -78,7 +83,43 @@
 .plugin-instances .pi-actions {
   display: flex;
   gap: 0.25rem;
-  margin-left: auto;
+  margin-inline-start: auto;
+}
+.plugin-instances .icon-btn,
+.plugin-instances .icon-btn-sm {
+  /* Centred as a flex box so the icon alone sizes the button: an inline icon in a line box made it taller
+     than wide, and much taller under the Arabic font. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.plugin-instances .icon-btn-sm {
+  padding: 0.25rem;
+  border: none;
+  color: var(--text-muted);
+}
+.plugin-instances .icon-btn:hover {
+  background: var(--bg-light);
+  color: var(--text-primary);
+}
+.plugin-instances .icon-btn-sm:hover {
+  color: var(--text-primary);
+}
+.plugin-instances .icon-btn.danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.3);
+  color: var(--error-text);
+}
+.plugin-instances .confirm-modal {
+  max-width: 400px;
 }
 .plugin-instances .pi-hint {
   font-size: 0.8rem;
@@ -113,4 +154,25 @@
   width: 100%;
   min-height: 96px;
   font-family: monospace;
+  /* Downwards only, as every other textarea: dragged sideways it outgrew the dialog body, which cut its border off. */
+  resize: vertical;
+}
+
+/* The configuration is JSON: code, not text a person wrote. It reads left to right and flush left in every page,
+   whatever the first letter of a line is, as code and pre do. The second selector wins the rule that right-aligns
+   every field of an Arabic page. */
+.plugin-instances textarea.pi-json,
+[dir='rtl'] .plugin-instances textarea.pi-json {
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: normal;
+}
+
+/* The dialog's input rule does not reach a textarea, so it states the focus the inputs beside it show. */
+.plugin-instances textarea:focus {
+  outline: none;
+  border-color: var(--focus-ring);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px rgba(37, 211, 102, 0.1);
 }

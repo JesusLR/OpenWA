@@ -9,6 +9,13 @@ import { LidMapping } from '../../engine/identity/lid-mapping.entity';
 const inList = (value: string, cond?: FindOperator<string>): boolean =>
   cond === undefined || (cond.value as unknown as string[]).includes(value);
 
+const createLidStore = (table: Array<{ lid: string; phone: string; isReported: boolean }>): LidMappingStoreService =>
+  new LidMappingStoreService({
+    find: ({ where }: { where: { lid?: FindOperator<string>; phone?: FindOperator<string> } }) =>
+      Promise.resolve(table.filter(r => inList(r.lid, where.lid) && inList(r.phone, where.phone))),
+    findOne: ({ where }: { where: { lid: string } }) => Promise.resolve(table.find(r => r.lid === where.lid) ?? null),
+  } as unknown as Repository<LidMapping>);
+
 describe('ConversationMappingService', () => {
   let ds: DataSource;
   let service: ConversationMappingService;
@@ -97,7 +104,7 @@ describe('ConversationMappingService', () => {
     // lid 111 -> phone 628999. A 1:1 chat's neutral id flips from `111@lid` to `628999@c.us` once the
     // mapping is learned, so a takeover recorded under either form has to govern the other. The store is
     // real but its cache is empty, as for a mapping past the preload cap or evicted: only the table has it.
-    const table = [{ lid: '111', phone: '628999' }];
+    const table = [{ lid: '111', phone: '628999', isReported: true }];
     const lidStore = new LidMappingStoreService({
       find: ({ where }: { where: { lid?: FindOperator<string>; phone?: FindOperator<string> } }) =>
         Promise.resolve(table.filter(r => inList(r.lid, where.lid) && inList(r.phone, where.phone))),
@@ -133,6 +140,20 @@ describe('ConversationMappingService', () => {
     it('does not match another person', async () => {
       await human('111@lid');
       expect(await service.findHandoverForChat('sess-1', '628000@c.us')).toBeNull();
+    });
+
+    it('does not share takeover decisions through an unreported phone alias', async () => {
+      table[0].isReported = false;
+      try {
+        await human('111@lid');
+        expect(await service.findHandoverForChat('sess-1', '628999@c.us')).toBeNull();
+        await bot('628999@c.us', 'convC');
+        expect((await row('628999@c.us'))!.handoverState).toBe('bot');
+        await service.setHandover((await row('628999@c.us'))!.id, 'bot');
+        expect((await row('111@lid'))!.handoverState).toBe('human');
+      } finally {
+        table[0].isReported = true;
+      }
     });
 
     const row = (chatId: string) =>
@@ -174,7 +195,7 @@ describe('ConversationMappingService', () => {
     it('a hand-back reaches a row whose form was paired after the takeover', async () => {
       await human('111@lid');
       await bot('628999@c.us', 'convC'); // inherits the takeover
-      table.push({ lid: '333', phone: '628999' }); // another lid for the number is learned meanwhile
+      table.push({ lid: '333', phone: '628999', isReported: true }); // another lid for the number is learned meanwhile
       try {
         await service.setHandover((await row('628999@c.us'))!.id, 'bot');
         expect((await row('111@lid'))!.handoverState).toBe('bot');
@@ -185,7 +206,7 @@ describe('ConversationMappingService', () => {
     });
 
     it('a decision on one lid of a number reaches its sibling lid and the phone-form row', async () => {
-      table.push({ lid: '222', phone: '628999' });
+      table.push({ lid: '222', phone: '628999', isReported: true });
       try {
         await bot('111@lid', 'convB');
         await bot('222@lid', 'convD');
@@ -318,5 +339,83 @@ describe('ConversationMappingService', () => {
     // The forward-key collision is resolved in favor of sess-2's own (fresher) row; the stale one is gone.
     expect(await service.getByProvider('chatwoot', 'acct1', 'conv-1')).toBeNull();
     expect((await service.getByProvider('chatwoot', 'acct1', 'conv-2'))?.sessionId).toBe('sess-2');
+  });
+
+  describe('effectiveHandover across the lid and phone forms of one chat', () => {
+    const table = [
+      { lid: '111', phone: '628999', isReported: true },
+      { lid: '222', phone: '628999', isReported: true },
+    ];
+    let lidStore: LidMappingStoreService;
+    let repo: Repository<ConversationMapping>;
+    const baseKey: MappingKey = {
+      sessionId: 'sess-1',
+      chatId: '111@lid',
+      pluginId: 'chatwoot',
+      instanceId: 'acct1',
+    };
+    beforeEach(() => {
+      lidStore = createLidStore(table);
+      repo = ds.getRepository(ConversationMapping);
+      service = new ConversationMappingService(repo, lidStore);
+    });
+
+    it('returns human when requested row is closed and another form of the same instance is human', async () => {
+      await service.upsert(baseKey, 'conv-lid', { handoverState: 'closed' });
+      await service.upsert({ ...baseKey, chatId: '628999@c.us' }, 'conv-phone', { handoverState: 'human' });
+      const requested = await service.get(baseKey);
+      expect(requested?.handoverState).toBe('closed');
+      expect(await service.effectiveHandover(requested!)).toBe('human');
+    });
+
+    it('returns closed when requested row is bot and another form of the same instance is closed', async () => {
+      await service.upsert(baseKey, 'conv-lid');
+      await service.upsert({ ...baseKey, chatId: '628999@c.us' }, 'conv-phone', { handoverState: 'closed' });
+      const requested = await service.get(baseKey);
+      expect(requested?.handoverState).toBe('bot');
+      expect(await service.effectiveHandover(requested!)).toBe('closed');
+    });
+
+    it('ignores human rows belonging to another plugin, instance, or session', async () => {
+      await service.upsert(baseKey, 'conv-lid');
+      await service.upsert({ ...baseKey, chatId: '628999@c.us', pluginId: 'other-plugin' }, 'conv-other-p', {
+        handoverState: 'human',
+      });
+      await service.upsert({ ...baseKey, chatId: '628999@c.us', instanceId: 'acct2' }, 'conv-other-i', {
+        handoverState: 'human',
+      });
+      await service.upsert({ ...baseKey, chatId: '628999@c.us', sessionId: 'sess-2' }, 'conv-other-s', {
+        handoverState: 'human',
+      });
+      const requested = await service.get(baseKey);
+      expect(await service.effectiveHandover(requested!)).toBe('bot');
+    });
+
+    it('returns the row own handoverState when there are no sibling rows', async () => {
+      await service.upsert({ ...baseKey, chatId: 'solo@c.us' }, 'conv-solo-bot');
+      await service.upsert(baseKey, 'conv-lid-closed', { handoverState: 'closed' });
+      expect(await service.effectiveHandover((await service.get({ ...baseKey, chatId: 'solo@c.us' }))!)).toBe('bot');
+      expect(await service.effectiveHandover((await service.get(baseKey))!)).toBe('closed');
+    });
+
+    it('applies the same rule to a row loaded via getByProvider', async () => {
+      await service.upsert(baseKey, 'conv-lid', { handoverState: 'closed' });
+      await service.upsert({ ...baseKey, chatId: '222@lid' }, 'conv-lid-2', { handoverState: 'human' });
+      const row = await service.getByProvider('chatwoot', 'acct1', 'conv-lid');
+      expect(row?.chatId).toBe('111@lid');
+      expect(await service.effectiveHandover(row!)).toBe('human');
+    });
+
+    it('skips alias and repository queries when the requested row is already human', async () => {
+      await service.upsert(baseKey, 'conv-lid', { handoverState: 'human' });
+      await service.upsert({ ...baseKey, chatId: '628999@c.us' }, 'conv-phone', { handoverState: 'bot' });
+      const row = (await service.get(baseKey))!;
+      const repoFind = jest.spyOn(repo, 'find');
+      const lidLookup = jest.spyOn(lidStore, 'findPhoneForLid');
+
+      expect(await service.effectiveHandover(row)).toBe('human');
+      expect(repoFind).not.toHaveBeenCalled();
+      expect(lidLookup).not.toHaveBeenCalled();
+    });
   });
 });

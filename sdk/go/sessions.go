@@ -24,8 +24,8 @@ func (s *SessionsService) GetConfig(ctx context.Context, sessionID string) (*Ses
 }
 
 // UpdateConfig merges the given keys into a session's stored configuration, running or stopped,
-// with no restart or re-link. AutoRejectCalls applies immediately; MaxReconnectAttempts and
-// ReconnectBaseDelay apply on the next start.
+// with no restart or re-link. AutoRejectCalls and LinkPreview apply immediately; MaxReconnectAttempts
+// and ReconnectBaseDelay apply on the next start.
 func (s *SessionsService) UpdateConfig(ctx context.Context, sessionID string, body UpdateSessionConfigRequest) (*SessionConfig, error) {
 	var out SessionConfig
 	err := s.client.do(ctx, "PATCH", "/api/sessions/"+pathEscape(sessionID)+"/config", nil, body, &out)
@@ -116,6 +116,9 @@ func (s *SessionsService) Stop(ctx context.Context, sessionID string) (*SessionR
 // did not complete (no send, no acknowledgement, timeout/transport error, or local cleanup
 // failure); phone is cleared and no success audit is written. Start the session again and retry
 // the logout; do not assume the retry reconnects automatically or lands in a guaranteed QR state.
+// On Baileys, a session with no linked device returns an HTTP 409 error instead: it was stopped
+// locally, phone is cleared and no success audit is written. Start it to link a device, or delete
+// it; retrying the logout cannot help.
 func (s *SessionsService) Logout(ctx context.Context, sessionID string) (*SessionResponse, error) {
 	var out SessionResponse
 	err := s.client.do(ctx, "POST", "/api/sessions/"+pathEscape(sessionID)+"/logout", nil, nil, &out)

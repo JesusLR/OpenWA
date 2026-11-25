@@ -7,6 +7,1374 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-11-24
+
+### Fixed
+
+- Plugins: clear worker `dispatchId` synchronously before posting hook and webhook results so queued microtasks do not send expired dispatch contexts.
+- Plugins: preserve `allowConfigHosts` for floated hook `ctx.net.fetch` calls via host-bound `netScopeId`, and accept an explicit active `sessionId` for off-dispatch background calls.
+
+## [0.32.0] - 2026-11-24
+
+### Upgrade notes (behavior changes)
+
+- `WWEBJS_WEB_VERSION` defaults to native WhatsApp Web (`off`) instead of fetching remote HTML from GitHub.
+- Exact remote `WWEBJS_WEB_VERSION` pins require a 64-character hex `WWEBJS_WEB_VERSION_SHA256` or `WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED=true`, while `auto` and `latest` remote modes require `WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED=true`.
+- `docker-proxy` in `docker-compose.yml` is now opt-in under `--profile docker-proxy`, and local Docker Unix socket fallback requires `DOCKER_ALLOW_LOCAL_SOCKET=true`.
+- `GET /api/sessions/{sessionId}/proxy` now requires an unscoped `ADMIN` key, matching `PATCH`.
+- `GET /api/sessions/stats/overview` omits `memoryUsage` for non-admin and session-scoped keys; Go SDK `SessionStatsOverview.MemoryUsage` is now `*MemoryUsage` (`nil` when omitted).
+- `GET /api/infra/export-data` redacts plugin instance `secret`, `verifyToken`, and `secret: true` config fields by default; pass `?includePluginSecrets=true` when migrating credentials.
+- MCP `GroupGetInviteCode` moved from the `read` tier to the `write` tier and is omitted when `MCP_READONLY=true`.
+- `MCP_MAX_RESULT_BYTES` defaults to `100000` bytes (100 KB); set `MCP_MAX_RESULT_BYTES=0` to restore unlimited results and base64 resource offloading.
+- Dashboard authentication uses an `HttpOnly; SameSite=Strict` `openwa_session` cookie stored in `main.sqlite` (`browser_sessions`) instead of `sessionStorage`.
+- Non-safe dashboard cookie requests require `X-Requested-With: OpenWA-Dashboard` and same-origin verification, and cross-node forwarding returns `409` for cookie-only requests.
+- Raise `stop_grace_period` (Docker) and `terminationGracePeriodSeconds` (Kubernetes) to 90 s to accommodate the 82 s forced teardown limit.
+- Helm `replicaCount` values above 1 fail template rendering because a single session data volume does not support concurrent replicas.
+- Forwarded inter-node `POST`, `PUT`, and `PATCH` requests with non-JSON or non-form content types whose bodies are rejected unread now return `400` instead of forwarding synthesized `{}` as `application/json`.
+
+### Added
+
+- Browser session cookie endpoints (`POST`, `GET`, `DELETE /api/auth/session`) backed by `browser_sessions` in `main.sqlite`, configurable via `DASHBOARD_SESSION_TTL_MS` and `DASHBOARD_SESSION_COOKIE_SECURE`.
+- `HOOK_PRE_EGRESS_FAIL_CLOSED` opt-in fail-closed mode for `message:sending` and `webhook:before` hooks, releasing send idempotency keys and recording undelivered webhook failures on hook error.
+- Optional `Idempotency-Key` support on `POST /api/sessions/{sessionId}/messages/click-button` across the REST API, `openapi.json`, and all five SDKs.
+- Opt-in `?includePluginSecrets=true` query parameter on `GET /api/infra/export-data` and a matching dashboard checkbox across all 15 locales.
+- `SQLITE_JOURNAL_MODE` (`WAL` default, `DELETE` opt-out for network filesystems), automatic `0600` database permissions before enabling WAL, and shutdown `wal_checkpoint(TRUNCATE)`.
+- High-volume composite and retention indexes across `messages`, `webhook_delivery_failures`, `message_batches`, and `integration_delivery_failures` (`1791900000000-AddHighVolumeQueryIndexes.ts`).
+- Per-session enabled automation rule cache with invalidation on mutations, session retirement, and data imports.
+- `SESSION_PROXY_SECRET` opt-in HMAC-SHA256 authentication for inter-node forwarded hops so owning nodes skip double-throttling.
+- Helm `secretChecksumAnnotation` toggle (default `true`, automatically omitted when `existingSecret` is set) so operators can opt out of Secret digest pod annotations.
+- Install-time Baileys patch `scripts/patch-baileys-media-signal.js` forwarding `options.signal` into `getHttpStream` so timed-out or capped inbound downloads abort immediately.
+
+### Changed
+
+- MCP tool outputs carrying user-authored WhatsApp text are framed in per-response randomized nonce boundary tags that survive truncation.
+- Bundled `postgres`, `redis`, `minio`, and `docker-proxy` sidecars drop Linux capabilities and enforce memory and PID limits.
+- Bundled `redis` supports optional `REDIS_PASSWORD` authentication via `--requirepass`.
+- Restrict `PUPPETEER_ARGS` to an explicit Chromium flag allowlist in boot validation and `PUT /api/infra/config`.
+- Enforce `./data` subdirectory containment on dashboard-configured local storage and session paths.
+- JavaScript, Python, Go, PHP, and Java SDKs make `SessionStatsOverview.memoryUsage` optional and add an optional idempotency key to `clickButton`.
+- Baileys caches positive `onWhatsApp` resolutions on outbound 1:1 sends (5,000-entry LRU, 15-minute TTL) to avoid repeated `usync` round-trips.
+- `EventsGateway` caches unmapped 1:1 chat lookups for 5 seconds with immediate local invalidation when a mapping is learned.
+- `EventsGateway` tracks chat-restricted WebSocket replicas in Redis to skip unnecessary `lid_mappings` lookups when no restricted client is connected.
+- Retire superseded `whatsapp-web.js` install-time patchers (`patch-wwebjs-201832.js` with `wwebjs-201832.patch`, and `patch-wwebjs-group-description.js`) and remove the `wwebjs-backport-check.ts` startup check.
+- Remove the unused GNU `patch` package from the production Docker image.
+- Exclude `src/engine/engine-capability-matrix.ts` from production `tsconfig.build.json` output while keeping it for documentation parity checks.
+- Run dashboard `npm run test:cov` in CI and release workflows.
+- Add a PHP syntax check step for PHP SDK sources in SDK CI.
+- Document HTTP/HTTPS session-proxy DNS rebinding exposure and required egress ACLs alongside `SESSION_PROXY_URL_FETCH`.
+- Reject non-scalar `?code` query arrays and objects on `GET /api/sessions/{sessionId}/groups/join-info` with `400`.
+- Bound plugin webhook delivery capability timeouts to the dispatch deadline with retry deduplication, scope `ctx.net.fetch` allowlists outside active dispatches, and check symlink containment recursively across plugin package installs.
+- Enforce `replicaCount <= 1`, valid `terminationGracePeriodSeconds` and `tmpVolumeSizeLimit` inputs, and disallow `PORT` overrides in Helm `values.schema.json`, bound `/tmp` `emptyDir.sizeLimit` in the chart template, and harden `scripts/restore.sh` path containment and pre-restore checks.
+- Exclude `*.sqlite-wal` and `*.sqlite-shm` (alongside existing `.db-wal`/`.db-shm`) patterns from Docker build contexts in `.dockerignore`.
+- The amd64 image's Chrome for Testing 158.0.8127.36 to 158.0.8127.88, picking up the browser security fixes released since; the arm64 image keeps the chromium package Debian ships.
+
+### Fixed
+
+- Baileys: release inbound limiter slots before waiting on preparation room so slow message preparation cannot stall unrelated chats.
+- Baileys: fence generation timers and detach socket listeners with proxy agent teardown on disconnect and terminal close.
+- Baileys: make `BaileysSessionStore` LRU eviction and batched state twin lookups linear.
+- `whatsapp-web.js`: guard disconnect, auth-failure, and stuck-auth lifecycle races across adapter generations.
+- Engine: resolve self LID admin status in LID groups without caching null lookups permanently.
+- Plugins: strip secrets across base, env, session, and instance configs whenever `allowConfigHosts` targets redirect.
+- Plugins: serialize per-plugin instance mutations so concurrent updates cannot interleave.
+- Plugins: scope `ctx.net.fetch` allowed hosts to the active session and dispatch context.
+- Plugins: restrict config-UI CSP `script-src` to `'unsafe-inline'` and skip noncing external SVG scripts.
+- Plugins: memoize config-UI HTML hardening to avoid reparsing on every request.
+- Plugins: propagate `AbortSignal` into sandbox capability calls so timed-out or terminated workers cancel in-flight `net.fetch` requests promptly.
+- Plugins: probe idle sandbox workers periodically to detect and reclaim event-loop spins without incoming dispatches.
+- Plugins: suppress hook re-execution on own-send `message:sent` echoes while keeping persistence, WebSockets, and webhooks intact.
+- Security: reject credentialed or malformed SSRF redirect locations and redact IPv6 endpoints in SSRF errors.
+- Security: block deprecated ORCHID and non-public Teredo IPv6 addresses in SSRF host validation.
+- Security: enforce per-object key limits and NUL-byte sanitization on `ImportDataDto` imports.
+- Security: verify realpath symlink containment and use `O_NOFOLLOW` on local storage and storage-import writes.
+- Automation: require explicit positive chat-kind opt-in for channel, broadcast, and status chats on automation rules.
+- Messages: isolate `message:sending` hook payloads while pinning caller routing and status recipient fields.
+- Messages: archive outbound echo media even when already merged as `DELIVERED` or `READ`.
+- Messages: harden `BulkMessageService` media handling, abortable delays, shutdown drains, and atomic result persistence.
+- Messages: align idempotency expiry checks to `<=` and drain pending idempotency writes on shutdown.
+- Sessions: preserve `x-request-id`, bodyless `DELETE`, and form-urlencoded bodies in `SessionProxyInterceptor`.
+- Sessions: evaluate PostgreSQL session leases on the database UTC clock (`clock_timestamp() AT TIME ZONE 'UTC'`) and SQL-fence status and metadata writes on `{ id, nodeId }`.
+- Sessions: explicitly delete `automation_rules` rows during session deletion and full data restore instead of relying on SQLite foreign-key cascades.
+- Queue: set `socketTimeout` (1500 ms) and disable `autoResendUnfulfilledCommands` on the Redis producer so silent peers fail fast without replaying stale commands.
+- Queue: defer busy ingress ordering keys via `DelayedError` instead of holding BullMQ worker slots so one hot conversation cannot block unrelated keys.
+- Webhooks: commit persisted message rows and pending `webhook_outbox_events` rows atomically in one transaction so a crash cannot drop webhooks for saved messages.
+- Webhooks: mark outbox rows queued before BullMQ enqueue with rollback on enqueue failure.
+- Webhooks: prune legacy `NULL`-state outbox rows and close outbox entries for deleted webhooks on worker failure.
+- Webhooks: guard PostgreSQL redrive JSON predicates safely across PostgreSQL 12 through 18.
+- Storage: await S3 bucket initialization before purges and fail closed on `deleteFile` when configured S3 is unavailable.
+- Reliability: isolate throwing shutdown listeners and add cooperative bounded shutdown drains across maintenance loops.
+- Reliability: cap in-memory `resolvedSendIds` and `failingWebhooks` maps and clear idle `sessionWrites` and deleted webhook IDs.
+- Events: accept Origin-less same-origin Socket.IO polling handshakes via `Sec-Fetch-Site: same-origin` and same-origin `Referer` validation.
+- Search: read PostgreSQL `datctype` when probing existing trigram indexes on replicas so C/POSIX databases enforce ASCII constraints.
+- Search: route chat-restricted `SEARCH_PROVIDER=auto` requests to `builtin-fts` when a search plugin is enabled.
+- Database: name unnamed entity `@Index` decorators to match existing migrations and eliminate main-connection schema drift.
+- Dashboard: match own chat reactions by exact session phone or `me` across cached message slices.
+- Dashboard: stabilize `ChatThread` scroll listeners and isolate composer draft state to eliminate keystroke re-render churn.
+- Dashboard: cap unbounded list pagination and percent-encode dynamic API path segments.
+- Dashboard: serve inline document downloads through inert `application/octet-stream` Blobs with deferred URL revocation.
+- Dashboard: parse balanced search highlight marks safely with dataset scroll matching.
+- Dashboard: exclude shimmed non-code assets and bound concurrency during coverage runs.
+- PHP SDK: forward `Idempotency-Key` headers, reject empty API keys, and serialize boolean query parameters as `true`/`false` in `Client::request()`.
+- PHP SDK: return an empty array instead of `null` from `WebhooksResource::deliveryFailures()` on empty responses.
+- Python SDK: pin `asyncio_default_fixture_loop_scope = "function"` in test configuration.
+- Tests: raise bulk orphan-sweep Jest timeouts to 30s.
+- Tests: close PostgreSQL import test `DataSource` pools in `try/finally` blocks.
+- Config & Security: track chunked request body byte budgets incrementally as chunks arrive, bound in-memory throttler fallback maps, add 10s SOCKS connect timeouts with abort cancellation, cap plugin upload multipart counts, and apply MCP rate limits without dropping tool errors.
+- Storage & Data: stream storage archive transfers with bounded temporary directories, resolve S3 local-fallback recovery sync races, keep SQLite media archive CAS predicates UTF-16 safe, and export PostgreSQL snapshots inside `REPEATABLE READ` transactions.
+- Search, Messages & Webhooks: prevent NULL SQLite FTS indexing corruption, normalize FTS trigger comparisons, isolate PostgreSQL connection cleanup, use UTC midnight quota bounds, cap automation rule cooldown maps, generate unique integration redrive keys, and drain periodic webhook prunes on shutdown.
+- Engines & Lifecycle: prevent regional JID `ephemeralExpiration` leaks on non-content sends, close inbound limiters on logout, fence adapter and LID store teardowns, separate session renewal DB passes from `onLeaseLost` teardown, serialize mid-boot signals, and redact sensitive keys in logs.
+- Dashboard & SDKs: isolate cross-tab and cross-actor query caches, lock active modals and search navigation during loading or saves, add Go retry backoff jitter, reject scalar 2xx payloads across PHP `HttpExecutor` calls, and clarify unsigned webhook headers vs signed bodies in docs.
+
+## [0.31.0] - 2026-11-21
+
+### Added
+
+- `GET /api/sessions/{sessionId}/chats` lists `phone` for a Baileys privacy-id chat the session can map, and the JavaScript, Python, Go and Java SDK types carry it (#2134). Thanks @juanbracamonte.
+- Dashboard: an open chat's header has a search button for that chat's stored messages, by text and optionally by day; a day alone jumps to its first loaded message. A hit older than the loaded messages is not scrolled to: the bar asks you to scroll up first (#2129). Thanks @juanbracamonte.
+- MCP: every tool is advertised with a `title`, the name a client shows: the tool name split into words, or the `title` its descriptor sets (#2098). Thanks @sudipta-prodevs.
+- MCP: `MCP_MAX_RESULT_BYTES`, an opt-in cap for clients that put a whole tool result in the model's context. When set, every result, an error answer included, is one text item, cut at that many bytes with a note of its full size, and none is offloaded as a base64 resource; unset or `0`, the default, changes nothing (#2100). Thanks @sudipta-prodevs.
+- Dashboard: a message typed in a chat but not sent is listed on that chat's row, after a `Draft:` label, in place of the last message until the chat is opened again (#2125). Thanks @juanbracamonte.
+- Dashboard: `/name` typed in the chat composer offers the session's templates by name, and Enter or a click puts the chosen one in the message field, to be sent like any other message; a template that still holds a placeholder is not sent until its text is edited (#2123). Thanks @juanbracamonte.
+- whatsapp-web.js: the `409` answered while WhatsApp Web reloads its page carries `code` `ENGINE_PAGE_RELOADING` and `retryAfterSeconds`, the interval to ask again at, so a client can tell it from other conflicts and retry (#2139).
+
+### Changed
+
+- Baileys: `GET /api/sessions/{sessionId}/chats` lists `name` as `""` for a privacy-id chat that has no name, where it was the id's own digits (see Upgrade notes) (#2134). Thanks @juanbracamonte.
+- Baileys: a chat's `name` in `GET /api/sessions/{sessionId}/chats` is trimmed, and a blank one of a chat not held under a privacy id lists the contact's name or the id's digits, where it was listed as it came (see Upgrade notes).
+- whatsapp-web.js: block and unblock use the library's own LID handling, so an unblock no longer also removes an entry the same person holds under a second id, such as a phone-keyed block from before the LID migration (see Upgrade notes), and a number WhatsApp holds no privacy id for answers `400`. The install-time block patch is retired.
+- The MCP `MessageList` tool lists a media message without its payload unless the call sets `inlineMedia: true`, where it carried the base64 inline up to the 8 MiB budget, so one photo made the result larger than an MCP client takes.
+- Dashboard: a document in a chat shows as a card with its file name, its size where known and a PDF mark, and a click still downloads it; one left out of the message list showed only `Media` (#2105). Thanks @mbdali.
+- Dashboard: the message field of a chat is multi-line and grows with its draft: Enter sends, Shift+Enter breaks the line (#2123). Thanks @juanbracamonte.
+- The amd64 image's Chrome for Testing 157.0.8103.78 to 158.0.8127.36, picking up the browser security fixes released since; the arm64 image keeps the chromium package Debian ships.
+- The SSRF guard also refuses the documentation and benchmarking address ranges and the 6a44 relay anycast address `192.88.99.2` in webhook, media, plugin download and plugin request urls (see Upgrade notes).
+- The local media store (`STORAGE_LOCAL_PATH`, `./data/media` by default) is owner-only: its root is set `0700` at every boot when the gateway owns it, and a warning is logged when it does not; new directories and files are written `0700` and `0600`, as the databases and the engine auth directories already are (see Upgrade notes).
+- The storage export archive is written `0600` in a `0700` `data/exports`, where it was `0644` in `0755`, so it is as private as the media it copies; the next boot closes the directory of an archive an earlier version left.
+- whatsapp-web.js: the `409` answered while WhatsApp Web reloads its page says to retry every few seconds for up to a few minutes, where it said to retry in a few seconds (#2139).
+
+### Fixed
+
+- Dashboard: an unnamed chat WhatsApp holds under a privacy id is titled by its phone number, in the list and in the header, where both showed the privacy id's own digits (#2134). Thanks @juanbracamonte.
+- Dashboard: the chat search and the webhook chat filter find a chat by its number typed with spaces, a plus sign or parentheses, and an unnamed privacy-id chat by the phone that titles it; the filter's chip and suggestions call that chat by it (#2134). Thanks @juanbracamonte.
+- Dashboard: opening a chat with a mouse click on its row, or from the New chat panel, puts focus in the message field, where typing first needed a click on it; a tap, or a row selected with the keyboard, does not move focus (#2124). Thanks @juanbracamonte.
+- Dashboard: starting an audio or video message pauses the one already playing, where both kept playing at once (#2106). Thanks @mbdali.
+- Baileys: `POST /api/sessions/{sessionId}/chats/read` sets the chat's `unreadCount` back to `0` when the receipt names the chat's newest received message, and undoes an unread mark set by hand (`chats/unread` or on the phone) on every record of the chat, also when a message received after the mark put its count in its place; the count and the mark used to stay, so the dashboard's unread badge came back on every reload (#2109). Thanks @juanbracamonte.
+- Dashboard: a shared contact shows as a card with its name and phone, in the thread, the chat list and a quoted reply, where the raw `BEGIN:VCARD` text was printed (#2110). Thanks @juanbracamonte.
+- whatsapp-web.js: a message that shares several contacts had an empty `body`; it now holds their vCards, newline-joined as on Baileys. The chat list preview and a quote of such a message carry them too.
+- whatsapp-web.js: block asks WhatsApp for a number's privacy id when the page holds none, so a number the session never talked to can be blocked.
+- Baileys: a contact's encrypted edit, encrypted reaction, pin, keep-in-chat toggle, album header, event RSVP, encrypted comment or lone fast-ratchet sender-key distribution no longer lists the chat as unread on its own, lists no chat the session holds no record of, and no longer brings back a chat WhatsApp deleted; the engine counts each as a received message. Two or more of them for one chat that reach the socket in one batch, as after a reconnect, are recognised the same way when no message of its own came in that batch.
+- Baileys: such a message merged into a history chunk that counts only that message no longer dates a chat that has a time of its own or brings back a deleted one, and a chat the session holds no other time for is listed at the time the phone gave it; the count it adds stays in the chunk, and a chunk that counts more is left as before.
+- Baileys: a message whose decrypted parts include a fast-ratchet sender-key distribution is typed and announced by its content, and its media is downloaded, its buttons clicked and its text quoted as for any other message; a history sync skips such a distribution when it stands alone, where either reached consumers as an `unknown` message.
+- Baileys: a history sync's chat title that is only a privacy id no longer replaces the saved, verified or push name a contact holds, so `GET /api/sessions/{sessionId}/contacts` and the chat list keep the name.
+- Baileys: encrypted edits and reactions of one message are applied in the order they arrived, where the older one could end as the final text or emoji after an offline replay on PostgreSQL.
+- Baileys: a pin, mute, archive, read mark or timer change synced under the other spelling (lid or phone) of a chat shows on its row instead of a second row at the epoch.
+- Baileys: a lid-keyed chat with a pinned, muted or archived state no longer lists a second row under its phone.
+- Baileys: a contact whose only name is its privacy id's digits no longer reports them as its push name or saved name in contact reads, the contact list or a status's poster name.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/messages/send-sticker` answers `400` for a video ffmpeg refuses and `503` when the host ffmpeg is missing or cannot run, where both were a `500` that counted toward the session send breaker and kept the `Idempotency-Key`.
+- whatsapp-web.js: `GET /api/sessions/{sessionId}/groups/join-info` answers `501` on a WhatsApp Web build with no invite preview job, where every code, valid ones included, was the `404` of an unknown invite. A page reload that lands on the call answers the retryable `409` with `code` `ENGINE_PAGE_RELOADING`.
+- whatsapp-web.js: deleting a channel or unsubscribing from one on a page that has not installed the library helpers answers the retryable `409`, where it was a bare `500`.
+- Baileys: a reaction, edit, delete or poll vote no longer keeps about 1 KB of memory until the account is unlinked.
+- Answer `503`, not `500`, when the database drops the row read a stop, delete, logout or force-kill makes, the write that records a stop or delete, or the check a stop record makes after a missed write; nothing was stopped, deleted, logged out or killed.
+- Log that another node holds a session only when a live peer does, not on every start or delete of a missing session.
+- whatsapp-web.js: a send, reply, forward or status post that a page reload cuts while it runs answers a `409` that says it may or may not have gone out, where it was a bare `500` that counted toward the session send breaker; a keyed send keeps its `Idempotency-Key`.
+- Baileys: a media send or product send that fails before the message reaches WhatsApp (the media host refusing the upload, a failed catalog lookup) frees its pacing admission and no longer counts toward the send breaker, and a media send also frees its `Idempotency-Key`.
+- Baileys: a connect, reconnect or session start no longer leaves a key cache and its ten-minute timer running for the life of the process.
+- Baileys: a group's second and later settings changes, the lid to phone pairs of a history sync and every answer to an event that the library buffers in one window are delivered, through a new install-time patch, `scripts/patch-baileys-event-buffer.js`.
+- Baileys: a link preview built from a fetched page cuts its title to 256 and its description to 1024 characters, as a supplied preview is held to, where a page could put hundreds of thousands into the message.
+- Plugins: an install or an update answers `400` naming the field for a manifest whose `ingress` is not a list, whose hmac-sha256 `contentTemplate` is not a string or whose `header` or `timestampHeader` (hmac-sha256 and shared-secret routes), `dedupHeader` or `conversationId.header` is not a string, where an update stopped the running plugin first and every delivery failed after it loaded; the boot scan refuses the same manifests.
+- Plugins: `ctx.storage` no longer reads or deletes the plugin's own `manifest.json` or `package.json` through the keys `./manifest`, `./package` or a spelling the filesystem folds to them, which made the plugin stop loading at the next boot.
+- Plugins: a reinstall into the surviving plugin directory that fails after an entry replaced a stored file puts that file back, where the rollback deleted it.
+- Plugins: the boot scan no longer renames or deletes a dot-directory such as `.cache.bak` or `.tmp.new` in the plugins directory unless it holds that plugin's package, where it treated it as an interrupted update's leftover.
+- Plugins: the boot scan logs a warning when a plugin directory is a symbolic link, which it does not follow, where it skipped it without a line in the log.
+- MCP: a tool's `sessionId` takes letters, digits and hyphens, at most 128 characters, as the REST routes do, where any non-empty string reached the lookup.
+- Webhooks: the OpenAPI schema and the Python and JavaScript SDK types of the update request declare that a `null` `secret` clears it, as the route has always accepted.
+- Dashboard: a whatsapp-web.js chat whose stored-message read is refused for a reason that may pass (no answer, a timeout, a limit, the gateway down) shows a failed load, which loads again when the chat is opened again or the window is focused, where it showed the engine history alone as the whole thread until a reconnect.
+- Dashboard: after a failed refresh of a loaded thread, the strip is a button that refreshes the newest page, where the retry it offered fetched an older page, which ended the failure and left the messages of the gap missing.
+- Dashboard: a chat is read once its thread has shown, where opening it sent the read at once: while the thread loads or after it fails the chat stays unread, its badge comes back when the thread fails or the chat is left before it showed, and the read goes out when the thread loads.
+- Dashboard: the Message Tester keeps a gap between a result label and a value that wraps.
+- Dashboard: the Number Checker names the WhatsApp Web page reload when a stopped run carries `ENGINE_PAGE_RELOADING`, where it said the session is not connected.
+- Dashboard: the webhook form counts a chat id entry over 128 characters as incomplete and says so, where Save sent it and the gateway answered a bare `400`, and a webhook stored with one could not be saved.
+- Dashboard: a long group name or an unbroken token in a failed send no longer widens the Message Tester past a phone screen, and a long plugin name ends with an ellipsis on a plugin card.
+- Dashboard: the error row of a session card keeps the start of the message in Arabic and Hebrew, where the end was kept and the start cut.
+- Dashboard: the plugin instance, webhook secret, template name, API key, Number Checker and BullMQ URL copy buttons show a failure toast when neither clipboard path works, as the chat id button does, where they did nothing.
+- Dashboard: the pairing QR image has an alt text in the page language, where it read "QR" in English.
+- whatsapp-web.js: a start no longer waits on a `ps` or a stale lock removal that never returns, such as one stuck on a hung volume; each gets five seconds.
+- whatsapp-web.js: the onboarding fallback moves a session to `action_required` on the click that follows five clicks which left the modal in place, where a flow of five screens that each landed tripped it on the fifth.
+- whatsapp-web.js: the chats of a label carry `lastMessage`, as the chat list does.
+- whatsapp-web.js: a group invite join that a reload cut answers the `503` that says it may or may not have been applied, whatever text the failure carries, where a failure with another text answered the `400` of an invalid invite code.
+- whatsapp-web.js: a reply or forward whose chat read a page reload cut answers the retryable `409`, once the page has kept reloading past its grace, where it answered a `500` that counted toward the send breaker and kept the `Idempotency-Key`.
+- The startup line for missing install-time patches gives a command for each patch and offers a reinstall only for an install that ran with `--ignore-scripts`.
+- Drop the restriction, error, presence and claim state of sessions an infra data import removes, so the restricted-sessions gauge stops counting them and no false lost-claim warning follows.
+- `backup.sh` and `restore.sh` read a `PLUGINS_DIR` exported empty as the app does, as unset to its default directory, where they took the directory `./.env` named.
+- Baileys: a poll vote on the account's own broadcast-list poll is reported only when it arrives in a 1:1 chat, as documented; a vote from a group, the list or the status chat was reported too.
+- Baileys: with `STORE_EPHEMERAL_MESSAGES=false`, a message received in a disappearing chat leaves no copy in `baileys_stored_messages` and no text as the chat's `lastMessage`, and its media is not downloaded, where its content stayed in the database, in backups and in the chat list (see Upgrade notes).
+- Overlapping updates of one privacy id's phone mapping are written in the order they were made; the older one could land last and stay in `lid_mappings`, on a PostgreSQL pool or when both were made in the same turn.
+- The in-memory privacy id mapping reloaded after a data import skips an id whose write is still under way, where it could keep answering the phone that write cleared or replaced.
+- An id whose re-map is being written answers no phone until the write lands, also after its cache entry was evicted or the mapping reloaded, and after a failed re-map until the id is reported again, a negative clears its row (not for an id whose failure was forgotten, see below) or the mapping reloads or the gateway restarts, where it answered the phone the write replaces.
+- More failed writes than `LID_MAPPING_CACHE_MAX`, which also bounds the failed-write marks, make the oldest forgotten: that id, and a small share of the others (0.5 percent after 5000 forgotten), answer no phone while they have no cache entry, until each is reported again or the mapping reloads or the gateway restarts, and a negative does not end it; a warning names the bound. A forgotten id that is reported again answers its row again; past the same bound of such ids the oldest, once it has no cache entry, answers no phone again until it is reported again, the mapping reloads or the gateway restarts.
+- A display lookup whose write failed refuses only a row that names another phone than its own, until the same events end it, so a repeated lookup of the stored phone no longer hides the id; another gateway's later report of the id does not end the refusal.
+- While the database cannot be read, the readers that answer from the in-memory mapping judge its entry as they judge a stored row, so an id with a failed write no longer answers the phone the write replaces.
+- whatsapp-web.js: the writes that are safe to repeat (contact, profile, channel, group setting, label and message reaction, edit, delete, star, pin and vote, status delete), and the reads of channels, labels, message reactions, receipts and history, a group's invite code and join requests and a chat's labels, answer `503` when WhatsApp Web does not answer within the protocol timeout, where they answered `500`; sends, status posts and the other writes keep their answer, except for a timeout in the group lookup and in the check for the invitation sender made before a group write, which answers `503` as nothing has been applied.
+- whatsapp-web.js: `message.ack` is no longer announced for an entry the account sent of a kind the gateway does not list, with no text or media; it has no `message.sent`.
+- whatsapp-web.js: `DELETE /api/sessions/{sessionId}/groups/{groupId}/picture` sends the delete to WhatsApp itself and answers by WhatsApp's status: `200` also for a group with no picture left, so a repeat converges, and a retryable `503` for a rate limit, a timeout or a server error. All three answered `403` naming missing admin rights, and a picture WhatsApp Web had not loaded was not deleted. A WhatsApp Web build with no job to remove a group picture answers `501`. A page reload that lands on the call answers the retryable `409` with `code` `ENGINE_PAGE_RELOADING`.
+- A media `url` that carries a user name or password is refused with `400` on every route that fetches one, where it answered `500`, counted toward the send breaker and held the `Idempotency-Key`; `send-bulk` refuses a batch holding one at creation, where it accepted the batch and failed the item.
+- A plugin install `url`, `PLUGIN_CATALOG_URL` or webhook `url` that carries a user name or password fails with `URL must not contain credentials (userinfo)`, where the answer or the stored delivery failure repeated the URL, credentials included.
+- A media, plugin install, plugin catalog or webhook `url` with a user name or password that cannot be parsed (a bad port or host) is refused with the same text, where the log line of the refusal and a stored delivery failure named the URL, credentials included.
+- `PUT /api/auth/api-keys/{id}` with `role: null` on the only admin key no longer answers `409` when the update changes no role.
+- Dashboard: the Revoke and Delete confirmation of an API key shows a name that holds `{{name}}` as it was typed, where the name came back inside itself, and the Key column shows the `(master key)` marker of a bootstrap key without the `****` mask.
+- The status posts and the profile and group picture routes answer `400`, not `500`, for a media `url` that resolves to an internal address, does not resolve or redirects.
+- Webhook events for messages whose id the engine could not read (an empty id on whatsapp-web.js) each get their own `X-OpenWA-Idempotency-Key` and outbox record, where they shared one, so a receiver that deduplicates on the key kept only the first.
+- `scripts/restore.sh` refuses an archive that holds the SQLite data store while `DATABASE_TYPE` is `postgres`, before it writes anything; it wrote the file to a path named after the database, where the app never reads it, and answered `Restore complete` (see Upgrade notes).
+- A failed `PUT /api/infra/config` write answers with the overlay path relative to the working directory and the error code, where it carried the filesystem error that named the host data directory; the full error is in the server log.
+- `PUT /api/infra/config` answers `400` for a `database.poolSize` above 9007199254740991, where an environment-pinned pool size let a value such as 1e21 be saved as `1e+21`, which the next boot refuses.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/groups/{groupId}/invite-code/revoke` asks the job that resets an invite code where the current WhatsApp Web build keeps it, and answers `501` on a build with none, where it answered `500` and the link was not rotated. A page reload that lands on the call answers the retryable `409` with `code` `ENGINE_PAGE_RELOADING`.
+- whatsapp-web.js: `GET /api/sessions/{sessionId}/groups/{groupId}/invite-code` answers `501` on a WhatsApp Web build that has no job to read the code, and `403` when WhatsApp gives no code, where it answered a bare `500`.
+- whatsapp-web.js: `PUT /api/sessions/{sessionId}/profile/status` answers `501` on a WhatsApp Web build that no longer has the call the library uses to set the About text, where it answered `500`. A page reload that lands on the call answers the retryable `409` with `code` `ENGINE_PAGE_RELOADING`.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/messages/pin` and `/messages/unpin` call the page's pin sender the way the WhatsApp Web build takes it, where they answered a bare `500` on every build from 2.3000.1052565782 on; a build with no sender the adapter can call answers `501`. A page reload that lands on the call answers the retryable `409` with `code` `ENGINE_PAGE_RELOADING`.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/groups/join` answers `501` on a WhatsApp Web build with no group join job, where it answered `400` for every code; a group that has an admin approve new members says a request to join was sent, where it said the invite was invalid. A page reload that lands on the call answers the retryable `409` with `code` `ENGINE_PAGE_RELOADING`.
+- whatsapp-web.js: the group subject, description, picture, announce, locked and member add mode writes and `PUT /api/sessions/{sessionId}/profile/picture` answer `501` on a WhatsApp Web build with no job to send them, and the retryable `409` on a page whatsapp-web.js has not installed its helpers into, where they answered a bare `500`.
+- whatsapp-web.js: adding participants no longer fails as a whole with `500` on a WhatsApp Web build where the library's invite sender moved; a participant who can only be invited is a `403` of its own, no invitation is sent there, and the others keep their outcome.
+- whatsapp-web.js: a read, a write that is safe to repeat, the invite code revoke and the check made before adding participants answer the retryable `409` when they reach a document WhatsApp Web has not booted yet, where they answered `500`, or `404` for a group, contact or label lookup.
+- whatsapp-web.js: the group subject, description, picture, announce, locked and member add mode writes, the account's profile picture, the invite revoke and the invite code read answer `503` for a rate limit, a timeout or a server error from WhatsApp and `403` for a refusal, where every status answered `403` naming missing admin rights; a refused announce or locked write answered `200`, and an account that may not set them a bare `500`.
+- whatsapp-web.js: `DELETE /api/sessions/{sessionId}/profile/picture` answers the retryable `503` when WhatsApp rate-limits, times out or fails the removal (408, 423, 429 or 5xx), where it answered `403`, and `501` on a WhatsApp Web build with no job to send it. A page reload that lands on the call answers the retryable `409` with `code` `ENGINE_PAGE_RELOADING`.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/chats/mute` answers `400` for a channel id, which is muted through its own route, where the mute and the unmute answered a bare `500`.
+- whatsapp-web.js: `DELETE /api/sessions/{sessionId}/profile/picture` sends the removal whatever WhatsApp Web's copy of the picture holds, so a repeat answers what WhatsApp answers and no longer a local `200`; WhatsApp's answer for an account with no picture has not been observed.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/channels/{channelId}/delete`, `POST /api/sessions/{sessionId}/channels/{channelId}/mute` and `DELETE /api/sessions/{sessionId}/channels/{channelId}` answer a `503` that says the operation may or may not have been applied when WhatsApp reports a timeout, a rate limit or a server error (408, 423, 429 or 5xx), where they answered `403` or, for an error of the query itself, a bare `500`; a suspended channel (423) and an answer of the query that holds nothing (a 500 the page's own job makes up) stay `403`.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/groups/join` and `GET /api/sessions/{sessionId}/groups/join-info` answer the retryable `503` when WhatsApp rate-limits, times out or fails the request (408, 423, 429 or 5xx), where a good invite code was answered `400` or `404`; a preview that gets neither a group nor an error back from WhatsApp still answers `404`.
+- whatsapp-web.js: `POST /api/sessions/{sessionId}/messages/pin` and `/messages/unpin` answer `403` for a chat with a contact the account blocked, and by its status (`503` for 408, 423, 429 or 5xx) when WhatsApp fails the read of the group in front of the send, where both were a bare `500`.
+- A request body value that is an object with its own `toString` (JSON `{"toString":"x"}`, a form key such as `name[toString]=x`) answers `400` on every route that takes a body, where it answered `500` and logged a stack.
+- Deleting a session no longer logs that another node took it, and no longer leaves a stop mark behind for the deleted id, when the heartbeat ticks between the removal of the row and the end of the credential purge.
+- The second of two overlapping `DELETE /api/sessions/{sessionId}` requests answers `404` when the first one removed the session, where it answered `409` that the session was no longer owned by this node.
+- Starts, deletes and stops of one session that reach a node together, however many, answer `409` "running on another node" only when another node holds the session; a delete is no longer left undone and a duplicate start answers `400` as documented.
+- A delete or a start of a session that overlaps a stop, logout, force-kill or failed start of it, or two other requests for it, no longer answers `409` "no longer owned by this node" or is refused as stopped while no other node holds the session.
+- A node that takes a session over from a node whose lease lapsed fails the dead node's unfinished bulk batches even when two requests for the session overlapped, where they stayed `pending` or `processing` until the node restarted.
+- A media conversion and a bulk item whose `url` the SSRF guard refuses leave the reason in the server log, as a send does; the log had no line for either.
+- Creating, changing and deleting a webhook write `webhook_created`, `webhook_updated` and `webhook_deleted` audit rows with the key, the session, the URL host, the events and the `active` flag, and the previous host when the URL changed, never the secret, headers or URL path and query; they wrote none.
+- Retention prunes (webhook outbox, delivery failures, integration dedup log and dead letters, audit log, send idempotency keys, messages) remove a backlog 500 rows at a time, with a pause between statements on SQLite, where one statement held the whole process for as long as it ran (about 2 s for 400,000 outbox rows) and, on PostgreSQL, one past `statement_timeout` was cancelled on every run.
+- An acknowledged ingress delivery whose queue job Redis loses (a restore from an earlier snapshot, a failover to a replica that was behind, a restart without persistence) is replayed from its event row, which keeps its payload until the delivery settles; the job was its only copy and the delivery was dropped (see Upgrade notes).
+- Sandboxed plugins: a loop that never yields no longer stalls the gateway or grows its memory when it logs on each pass or calls a capability without awaiting it; the worker sends at most 198 `ctx.logger` lines per 10 s, has at most 64 capability calls unanswered and holds up to 10000 further calls until a reply frees a slot, refusing the next with a thrown `Error`, and a send still held after the hook handler that made it has returned is refused; it also tells the host about a webhook route once.
+- Plugin config: saving a list of rows with a secret column that removes one row and adds another no longer gives the new row the stored secret of a kept row (see Upgrade notes).
+- Plugin config: a save of a list of rows with a secret column keeps each stored secret on at most one row, and, in a save in which a row moved, never on a row with other fields than its stored row, where rows that differ only by their secret, a row whose secret was cleared or typed over, or a row renamed to another row's fields could take another row's secret.
+- Plugin storage: a `ctx.storage` key that holds a lone UTF-16 surrogate (half of an emoji left by `slice`) is refused, where every such key at one place named the same file (see Upgrade notes).
+- Plugins: an update to a package whose ingress declaration the host refuses (an unsigned route with `ALLOW_UNSIGNED_INGRESS` off, an unsupported `sdkVersion` major, a missing `webhook:ingress` permission) is answered `400` before the running plugin is stopped, where it ran `onDisable`, unloaded the plugin and rolled back; an install is refused before anything is written.
+- `scripts/backup.sh` and `scripts/restore.sh` read an environment value of only blanks as unset, as the app does; a `DATABASE_TYPE` of spaces no longer makes the backup of a PostgreSQL install archive its old SQLite file.
+- Under the bundled compose files, `scripts/restore.sh` refuses a plugin-state path from the archive's `.env.generated` outside the data directory, as documented since 0.26.0, where `PLUGIN_STATE_DIR` forwarded empty skipped the refusal.
+- Declare the `automation` and `media` tags in `openapi.json`, so the API explorer describes both groups.
+- Publish the integer request fields of the session config, automation rule, webhook, webhook redrive, group settings, label and infrastructure config (`database.poolSize`, also as `GET /api/infra/config` returns it) routes as `integer` in `openapi.json`; they said `number` although the routes refuse a fraction.
+- Dashboard: a message search hit on a shared contact shows its name and phone, where it listed the raw `BEGIN:VCARD` lines.
+- Dashboard: text fields, selects and textareas draw a border at 3:1 contrast in the light and dark themes, where it was the 1.2:1 card hairline.
+- Dashboard: a focused field draws a 1px ring in the focus colour beside its border, and a hovered select draws that colour, where hover was fainter than the border at rest in the light theme.
+- Dashboard: the config field of a plugin instance resizes downwards only, where dragging it sideways pushed it out of its dialog.
+- Stop the dashboard's language list announcing itself as a menu to screen readers: it is a plain list of buttons that marks the language in use as current.
+- Let the dashboard's tab rows (Number Checker, QR pairing, plugin install and configuration, chat sidebar, group info) take the arrow keys, Home and End, with the selected tab as the row's one Tab stop.
+- Say that the search or status filter emptied the dashboard's Sessions list instead of telling the operator, a viewer included, to create a session.
+- Underline the documentation link on the dashboard's sign-in card at rest, as its colour alone does not set it apart from the sentence.
+- Show the dashboard's empty Sessions Overview message on one centred line instead of wrapping it inside the first table column.
+- Mark `event.response` and the `call.accepted`, `call.rejected` and `call.missed` webhook events as Baileys only in the dashboard's event list, as they never fire on whatsapp-web.js.
+- Warn in the dashboard's Revoke and Delete confirmations of an API key that the dashboard is signed in with that key and the action signs the operator out.
+- Dashboard: picking an emoji, pressing Escape on one, removing a staged file, closing the reply banner and starting a reply from a message menu put focus back in the message field (not after a tap, which would raise a phone's keyboard), where it fell to the page and what was typed next went nowhere.
+- Dashboard: the emoji button of the message field tells screen readers whether its panel is open.
+- Dashboard: Show more in the sidebar message search keeps the hits already listed and adds the next page under them, where it replaced the list with a loading line and took the reader back to the first hit.
+- Dashboard: typing in the sidebar message search shows the loading line at once, where the hits of the text before stayed listed and clickable until the new search started.
+- Dashboard: in forced-colors mode (a Windows contrast theme) the focused search box and composer, the selected tab, row and toggle, the custom switches and the filled buttons stay visible, where they were drawn like their peers or not at all.
+- Dashboard: the box that shows a new API key and the one in the webhook delete dialog draw their fill, where a style read an undefined property and left them bare.
+- Dashboard: the sign-in language select draws one focus frame under keyboard focus, where its box and the select each drew one.
+- Dashboard: the warning icon of the note shown when the dashboard is signed in with the key being edited is 4.9:1 on its tint in the light theme, where it was 2:1.
+- Dashboard: the Hebrew locale writes the term Session in Latin script throughout, where some values spelled it in Hebrew script.
+- Dashboard: the current page of the Logs pager and the open template of the Templates list are marked for screen readers, where only a style told them apart.
+- Dashboard: in Arabic and Hebrew, text a person or a plugin author wrote (names, template bodies and previews, found messages, plugin descriptions) and every text field read in their own direction, except the JSON configuration of a plugin instance, which reads left to right as code does, where a Latin sentence showed its full stop on the wrong end and an Arabic preview read its clauses in the wrong order.
+- Dashboard: the Infrastructure switches keep their full width beside a long description, so the knob of an on switch stays inside its track at 1100 to 1920px.
+- Dashboard: in Arabic and Hebrew, the chat id in the save-contact dialog and in the webhook chat filter reads `15550001111@c.us`, not `c.us@15550001111`, and the `@g.us`, `@c.us` and `@lid` suffixes in the API key chat hints and the save-contact hint read as they are typed, not `g.us@`.
+- Dashboard: the audit log table fits a window from about 1100px, where its Severity column was cut off below about 1340px, and a long session, key or address ends in an ellipsis instead of overprinting the next column.
+- Dashboard: the API keys table keeps its row actions in view at any width, where they were cut off on windows up to about 1480px wide (about 1540px for a key with limits in German); its cells take less padding so it fits from about 1440px, and below that the columns beside the actions scroll into view.
+- Dashboard: a sidebar label or the brand name that the browser's text size makes too long ends in an ellipsis at its own end (a label also carries its text in a title), where the row cut it mid-letter from about 120% text size in Spanish, French and Portuguese and from about 150% in English, and the brand name lost its start in Arabic and Hebrew.
+- PHP SDK: an empty request body is sent as `{}` instead of `[]`, which the gateway refused with `400` on config, proxy, webhook and template updates.
+- Java SDK: an API error with a JSON body can be Java-serialized, where it threw `NotSerializableException` for the Gson body.
+- PHP SDK: the `mentions`, poll `options`, status `recipients`, webhook `events` and `filters`, webhook redrive `ids` and mark-read `messageIds` lists are sent as JSON arrays when their keys have gaps (`array_filter`, `array_unique`), which the gateway refused with `400`.
+- Python SDK: the call link `startTime` is typed `int`, as the gateway refuses a fraction with `400`; the PHP docblock and the Go, Java and JavaScript field comments say a whole number.
+- Python SDK: the source distribution ships `tests/conftest.py`, so the tests run from the unpacked archive.
+- whatsapp-web.js: a send or forward that met a page reload after its first attempt had run answers a `409` that says the message may or may not have been sent, where it said to retry; a forward refused there keeps its send pacing admission, as it keeps its `Idempotency-Key`.
+- whatsapp-web.js: a session promoted to `ready` after its `ready` event was missed no longer answers the page reload `409` for up to a minute when WhatsApp Web had navigated while it authenticated; the promotion closes the window the probe has just found the helpers through, unless another navigation landed meanwhile (#2139).
+- Webhooks: a recovery pass that does not fill its batch starts again at the oldest stale delivery, so one whose queue job was lost is replayed while newer stale deliveries keep arriving, where it waited for that backlog to clear.
+- Webhooks: a stranded delivery whose stored payload cannot be read (an imported or hand-edited row on SQLite) stays out of the recovery pass for an hour, where the pass read its page again and logged the row on every pass.
+- MCP: a tool error carries `retryAfterSeconds` beside its `code` when the REST answer has one (`ENGINE_PAGE_RELOADING`, `SEND_PACING_LIMITED`), where only the code came through.
+- Baileys: a send, status post, status delete, reaction, edit, message delete or pin whose connection was replaced or stopped while it was being written answers a `409` that says it may or may not have been sent, published, removed or applied, where it said the session was not connected.
+
+### Documentation
+
+- Say in the OpenAPI `ErrorResponse.code` description that `POST /api/infra/restart` answers `409` with `RESTART_DATABASE_NOT_STARTED` or `RESTART_ALREADY_RUNNING`.
+- Say in the OpenAPI document, the engine interface and the five clients that `ChatSummary.phone` is Baileys only: whatsapp-web.js lists none and lists an unnamed privacy-id chat under its id.
+- Say in the `engineLoaded` description of the session response that `stop` still answers `200` and records the stop while no engine is loaded, where `logout` and `force-kill` answer `400`.
+- Say in the API reference and the OpenAPI text of the routes that reach an engine that a send whose first attempt had already run answers a `409` with no `code`, which says the message may or may not have been sent, where they called every such `409` a refusal before WhatsApp that is safe to retry.
+- Say in the `limit` description of the MCP tools that answer a bare list (`SessionFindAll`, `SessionGetChats`, `ContactFindAll`, `GroupFindAll`, `WebhooksList`) that a call returns at most 1000 rows, also when `limit` is omitted, so a full page may not be the whole list.
+- Correct the 0.27.0 rollback hazard in the migration guide: run `migration:revert:prod` until `migration:show:prod` lists `AddChatStateDeletedAt1791700000000` as pending; it said once, which since 0.28.0 only drops the status media index.
+- Say in the docs that `INGRESS_DISPATCH_TIMEOUT_MS`, `SANDBOX_HOOK_TIMEOUT_MS` and `SANDBOX_SEARCH_TIMEOUT_MS` are fixed budgets and not settings, and give the ingress `202` text in `openapi.json` the 5 s figure in place of the name.
+- Name 0.16.0, the first release without `ENABLE_SWAGGER=true` in `.env.example`, in the `SECURITY.md` note on a copied `.env`.
+- State in the API reference how long a session `restriction` stays: a stop, start or logout keeps it until the engine reports a lift, the link reaches `ready`, its `expiresAt` passes or the session is deleted.
+- Say in the API reference that a cross-form reaction, like an edit or delete, needs a reported pairing and is otherwise neither stored nor announced.
+- List the message receipts route among the chat-scoped routes in the API reference.
+- Say in the API reference and the troubleshooting FAQ that a media `url` that answers with a redirect is refused with `Destination address is not allowed`, and that `SSRF_ALLOWED_HOSTS` does not lift it.
+- Say in the API reference and the engine caveats that the stored `body` of an API-sent contact card, poll, location or captionless document differs by engine.
+- Say in the API reference and the engine caveats that under `STORE_EPHEMERAL_MESSAGES=false` the whatsapp-web.js history read and chat list still return a disappearing message, which WhatsApp Web holds until it expires.
+- State in the integration guide that the reconciler's sweep goes on past unreadable pending ingress rows however many there are, and that with more than about a thousand of them the retention hand-off does not dead-letter the healthy rows behind them until the unreadable ones are repaired or deleted.
+- Say in the API reference and the OpenAPI text that any member of a group whose info is not restricted to admins may edit its subject, description and picture, not only an admin.
+- Say in the API reference that deleting a session leaves its stored media files in the media store until the orphan sweeps remove them, one to two hours later with the defaults, and longer after a restart or when `statuses/` or `chat-media/` holds more than 100000 unreferenced files, one more sweep for each further 100000.
+- Say in the migration guide that the `restore.sh` refusal of a SQLite archive under `DATABASE_TYPE=postgres` is cleared by changing `DATABASE_TYPE` and `DATABASE_NAME` where they are set, as an environment value (a compose `environment:` entry, a Helm ConfigMap) outranks `./.env`.
+- Add `chatName` to the `topChats` entries of the two statistics examples in the API reference.
+- Correct the API reference and the API collection on a plugin's config UI, which the dashboard shows alone in place of the generated form, with an error when its bridge does not start within 5 s, and show the secret mask as `***`, as the gateway returns it.
+- Say in the API reference and `.env.example` that a send by `url` holds the whole body in memory, at least twice its size at the peak and on whatsapp-web.js more while the page call is in flight, and that only the per-key rate limit bounds how many run at once.
+- List the local media store and the storage export archive in the at-rest table of the security design: plaintext files, owner-only (`0600` in `0700` directories).
+- Say in the MCP `SessionGetChats` and `MessageSearch` descriptions, the plugin guide, the `ChatSummary.name` comment, the typed SDKs and the PHP client that a Baileys privacy-id chat with no name of its own lists `name` "" and, when the session can map the id, a `phone` to show instead.
+- Say in the security design that a host other users can log in to should run the gateway with `TMPDIR` set to a directory only its user can enter, since the engine libraries stage the media of an upload in the temporary directory.
+- Say in the API reference that, while the database cannot be read, the chat match of a chat-restricted key falls back to the gateway's in-memory mappings, which do not see a mapping another gateway node has changed since.
+- Say in the API reference and the troubleshooting guide how long the whatsapp-web.js page reload `409` can last, that no event marks its end, and how to retry on it (#2139).
+- Correct the migration guide: the 0.15.0 reload row no longer says to wait for a `ready` event that nothing announces, and the import troubleshooting rows describe the shipped import, which replaces everything, restores in a fixed order and rolls back whole.
+- Correct the troubleshooting guide's messaging entry (a send answers `201`, the engine failure log line, no message queue, a history check both engines serve).
+- Point the migration guide at the CHANGELOG upgrade notes, which name the behavior changes of a release, where it named a Breaking marker that recent releases do not use.
+- Correct the API reference: the plugin search provider shows as `plugin:<pluginId>` and `SEARCH_PROVIDER` never takes a plugin id, `byType` of the message statistics has `text` and counts only messages with a body or metadata, an empty `url` beside `base64` of a status post is accepted, the import example carries its notice, the seeded key lists `(master key)`, the chats of a label answer `404` for a missing label only, and `message.received` names its optional fields.
+- Correct the troubleshooting guide's database locked step, which ran a command that checked nothing, to name the process that holds the file.
+- Say in the troubleshooting guide that an `onboarding_dialog_unrecognized` warning beside the page reload `409` means the "What's new" screen of WhatsApp Web is open in a language the gateway does not recognise.
+- Say in the troubleshooting guide that an icon with no text prints under its icon name (`ic-close`) in the lists of an `onboarding_dialog_unrecognized` warning, and that it is not the label to add.
+
+### Dependencies
+
+- Update `whatsapp-web.js` to 1.34.8, which carries the message-id fix OpenWA backported, the media-id fix and a LID-aware block and unblock, and ends its wait for the page's connection to WhatsApp after `WWEBJS_AUTH_TIMEOUT_MS` (see Upgrade notes); the ready-sync patch now keeps only the `eventsAttached` marker.
+- Update `@aws-sdk/client-s3` to 3.1169.0, `bullmq` to 6.7.6, `@bull-board/api`, `@bull-board/express` and `@bull-board/nestjs` to 9.13.1, `typeorm` to 1.1.3, `puppeteer` to 25.17.0, `dotenv` to 18.0.10 and `@nestjs/common`, `@nestjs/core`, `@nestjs/platform-express`, `@nestjs/platform-socket.io`, `@nestjs/websockets` and `@nestjs/testing` to 11.2.10 in the gateway.
+- Update `better-sqlite3` to 13.2.0 in the gateway, which bundles SQLite 3.54.1.
+- Update `i18next` to 27.1.1, `react-i18next` to 18.0.1 and `lucide-react` to 1.73.0 in the dashboard bundle. react-i18next 18 ignores `shouldUnescape`, so the API key confirmation no longer passes it.
+- Update `vite` to 8.3.8, `@vitejs/plugin-react` to 6.3.0 and `jsdom` to 31.0.1 in the dashboard, `prettier` to 3.10.1, `typescript-eslint` to 8.72.2 and `eslint` to 10.15.0 in the gateway and the dashboard, and `concurrently` to 10.0.7 and `supertest` to 7.3.2 in the gateway; these are build, lint and test tooling only.
+- Update `guzzlehttp/guzzle` to 8.5.0 in the PHP SDK lockfile; this touches development and test setups only.
+- The image's Node.js 22.23.4 to 22.23.5, a security release for the `http`, `http2`, `https`, `tls`, `permission` and `zlib` modules.
+- The built-in S3 storage image `pgsty/silo` RELEASE.2026-09-16 to RELEASE.2026-11-12, a security release; an existing `openwa-minio` container keeps its image until it is recreated (see `docs/14-migration-guide.md`).
+- The dashboard and SDK audits run the same per-advisory gate as the gateway's.
+
+### Upgrade notes (behavior changes)
+
+- An MCP `MessageList` call that does not set `inlineMedia` returns each media message with an `{ omitted, sizeBytes }` marker in place of its payload, where it returned the base64 inline; pass `inlineMedia: true` to get the bytes. `GET /api/sessions/{sessionId}/messages` still inlines by default.
+- A source install that runs the Chrome Puppeteer downloads (no `PUPPETEER_EXECUTABLE_PATH`) moves from Chrome 156 to 157 with Puppeteer 25.17.0, and the amd64 image moves from Chrome for Testing 157 to 158, so a rollback to 0.30.3 or earlier crosses a browser major and deletes the stored whatsapp-web.js logins unless `sessions/` is restored from a backup taken before the first start on this release (see `docs/11-operational-runbooks.md`); the arm64 image runs the chromium Debian ships when it is built, whose major can differ between releases; Baileys sessions are unaffected.
+- whatsapp-web.js 1.34.8 ends its wait for the page's connection to WhatsApp to open after `WWEBJS_AUTH_TIMEOUT_MS` (30000 ms unless set), where 1.34.7 waited with no limit of its own; a start on a host where that connection takes longer now fails, and a session that ends `failed` is not started again at boot by `AUTO_START_SESSIONS`. Raise `WWEBJS_AUTH_TIMEOUT_MS` there and start the session (see `docs/12-troubleshooting-faq.md`).
+- A whatsapp-web.js unblock (`DELETE /api/sessions/{sessionId}/contacts/{contactId}/block`) now unblocks only the entry under the number's privacy id; 0.26.0 to 0.30.3 also unblocked an entry the same person held under a second id, such as a phone-keyed block from before the LID migration. A contact that stays blocked after an unblock needs that entry unblocked on the phone.
+- `scripts/restore.sh` exits `1` before it writes anything when the archive holds the SQLite data store and `DATABASE_TYPE` is `postgres`; 0.30.3 exited `0` after writing a file the app never reads (see `docs/14-migration-guide.md`).
+- With `STORE_EPHEMERAL_MESSAGES=false`, Baileys no longer keeps incoming disappearing messages, so a reply, forward, reaction, star, pin, unpin, delete by id, button click or quote of one, a group read receipt that names one, and an encrypted edit, reaction or vote aimed at it, no longer work, an RSVP to an event posted there is not reported, and the chat list carries no `lastMessage` text for one. Rows stored before the upgrade stay until the store's count cap evicts them.
+- The SSRF guard refuses the documentation and benchmarking blocks (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`, `3fff::/20`, `2001:2::/48`, also in their 6to4, NAT64 and IPv4-mapped spellings) and the 6a44 relay anycast address `192.88.99.2`, as it already refused `198.18.0.0/15`; a webhook, media or plugin url that points into one is refused, and a receiver on such an address needs `SSRF_ALLOWED_HOSTS`.
+- With the queue on, an ingress event row stays `pending`, with its payload, until the worker settles it, where it was marked `dispatched` with its payload cleared as soon as its job was queued; while Redis cannot be asked, the reconciler replays nothing inline, where it used to; with the queue off, a pending ingress row, like a stranded webhook outbox row, is replayed inline whatever Redis still holds, so a job left in the ingress or webhook queue runs again when the queue is turned back on: let both queues drain before turning it off (see `docs/25-integration-fabric.md`).
+- In a plugin config list with a secret column, a save of the same length in which a row matched by its other fields, whatever its own secret, changes position, such as removing a row ahead of a kept one and adding another, or reordering rows, saves a row renamed in place, with its mask untouched, without its secret; enter that secret again (see `docs/19-plugin-architecture.md`).
+- An installed plugin whose manifest declares `ingress` that is not a list, an hmac-sha256 `contentTemplate` that is not a string, or a `header`, `timestampHeader` (hmac-sha256 and shared-secret routes), `dedupHeader` or `conversationId.header` that is not a string no longer loads at boot (status `error`, and the log names the route and the field), where 0.30.3 loaded it and failed that route on every delivery; correct the field and update the plugin.
+- A `ctx.storage` key that holds a lone UTF-16 surrogate is refused: `set` and `delete` reject it as an unsafe key and `get` answers `null`; a record an earlier version wrote under one stays reachable through the key spelled with `U+FFFD`.
+- A process that reads the local media directory or the storage export archives as a user other than the one the gateway runs as, such as a static file server or a backup job under another uid, loses access: the media root becomes `0700` at the next boot, whatever `STORAGE_TYPE` is, `data/exports` becomes `0700`, and new files are `0600`. Files written earlier keep their mode but sit under the `0700` root. A media directory the gateway does not own keeps its mode and a warning is logged at boot. Run such a reader as the gateway's user (the image runs as `openwa`). With `STORAGE_TYPE=s3` the directory matters only while it still holds files: those stored before the move to s3 and the fallback written while the bucket was unreachable.
+- Baileys lists `name` as "" for a chat held under a privacy id that has no saved, verified or push name, with its `phone` when the session maps the id, where 0.30.3 listed the id's own digits: title such a chat by `phone`, else by `id`. This reaches `GET /api/sessions/{sessionId}/chats`, the MCP `SessionGetChats` tool and a plugin's `getChats`. Every Baileys chat `name` is also trimmed, and a blank name of any other chat lists the contact's name or the id's digits, where 0.30.3 listed it as it came.
+- In a plugin config list with a secret column, a row that differs from another only by its secret, and was edited or removed in a save of the same length in which a row moved, is saved without its secret; enter that secret again (see `docs/19-plugin-architecture.md`).
+- The `409` a whatsapp-web.js session answers while WhatsApp Web reloads its page has a new message ("Retry every few seconds: this can last a few minutes.") and carries `code` `ENGINE_PAGE_RELOADING` and `retryAfterSeconds`. A client that matched the old text, "Retry in a few seconds.", must match the `code`.
+
+## [0.30.3] - 2026-11-16
+
+### Added
+
+- Session config key `linkPreview`: the default for a `send-text` or `send-template` that sets neither `linkPreview` nor `customLinkPreview`; a value in the request wins (#2080). Thanks @arraisfilho.
+- List the `linkPreview` session config key in the JavaScript, Python, Go and Java SDK types.
+- whatsapp-web.js: log the raw type of a message kept as an empty `unknown` (`wwebjs_keep_unmapped`, at `LOG_LEVEL=debug`), so a kind the gateway does not map can be named.
+- Log how many linked sessions stay disconnected because `AUTO_START_SESSIONS` is off, and how to start them: at boot, and when a session a vanished node left behind is marked disconnected (`action=auto_start_disabled`) (#2082). Thanks @arraisfilho.
+
+### Fixed
+
+- A `message:sending` plugin that rewrites a `send-text` to carry both `linkPreview: false` and `customLinkPreview` now gets the `400` the same request gets directly; Baileys sent it with the preview.
+- whatsapp-web.js: the header of an album no longer arrives as an empty `unknown` message, live, in the chat history or as a chat's last message; its photos and videos arrive as their own messages, as on Baileys (#2076).
+- whatsapp-web.js: the chat history (REST, MCP and plugin reads) returns a message deleted for everyone under the id of its stored row when its delete notice names the chat, or in a group the author, in the other id form (phone number or lid) and the gateway knows the two to be one person (#2076).
+- Dashboard: a message deleted for everyone is shown once when its history entry and its stored row name the chat or the author in different id forms, phone number and lid (#2076).
+- `PATCH /sessions/{sessionId}/config` no longer writes the characters of a string or the items of an array back as keys when the stored config is JSON but not an object, as a restored backup can hold.
+
+## [0.30.2] - 2026-11-15
+
+### Added
+
+- Report poll votes as `poll.vote` on Baileys, as whatsapp-web.js already does. A vote is read while the poll's creation message is still in the session's message store (`BAILEYS_MESSAGE_STORE_LIMIT`); earlier votes are not backfilled (#2063). Thanks @Shreyas1702003 for the report.
+
+### Fixed
+
+- whatsapp-web.js: an entry WhatsApp Web keeps in a chat that nobody sent (a group or security notice, or a kind the library does not list that carries neither text nor media) is no longer stored or announced as an `unknown` message, returned by the chat history, seeded as an empty status or reported as a chat's last message (#2076). Thanks @OneArmArmy for the report.
+- whatsapp-web.js: the chat history returns a message deleted for everyone under the id the message had, where it returned the id of the delete notice, so it no longer shows beside its stored copy (#2076).
+- whatsapp-web.js: `GET /sessions/{sessionId}/channels/{channelId}/messages` no longer returns a deleted channel update as an entry with an empty `body` (#2077). Thanks @OneArmArmy for the report.
+- Dashboard: a message deleted for everyone is shown once in the chat window of a whatsapp-web.js session, where the stored row and WhatsApp Web's own placeholder for it were both drawn (#2076).
+- Dashboard: an entry with nothing to show no longer draws an empty bubble: an `unknown` message with no text, media or quote in the chat window, or a channel update with neither text nor media in the Channels tab (#2076, #2077).
+- Dashboard: a message known only from WhatsApp Web's history no longer shows read ticks, since the history carries no delivery status.
+- `ctx.mappings.get` and `ctx.mappings.getByProvider` report the handover a plugin instance holds for a chat across its `@lid` and phone rows (`human`, else `closed`, else `bot`), so a plugin reading one row no longer misses a takeover recorded under the other.
+- Store the contact statuses WhatsApp delivers to some Baileys accounts as a top-level `<status>` stanza, which 0.30.1 acknowledged and dropped: `scripts/patch-baileys-status-ack.js` now decodes a stanza shaped as the status message it replaces, so it reaches the status list and the `status.received` webhook. A status that fails to decrypt is dropped, not retried (#2064). Thanks @damar-glh for the report.
+- A Baileys message or status that decrypts only in part and is left with no content is no longer stored or announced as an empty `unknown` message, so a redelivery that carries the content is not skipped as a duplicate.
+- A status the account posted is no longer listed among contact statuses on Baileys when WhatsApp names its poster by the account's lid.
+- Cap `poll.vote` at 32 `selectedOptions` of 1024 characters each and `pollName` at 1024 characters on both engines, as an inbound poll already is.
+- Read a contact's encrypted edit or reaction on Baileys when its key names one party by lid and the other by phone number without the alternate id, using the pairing the session already holds.
+
+## [0.30.1] - 2026-11-14
+
+### Added
+
+- Log when an unlink clears the stored messages and chat states of a Baileys session, where only a failed clear was logged, and document that a reply, forward or reaction to a message from before the unlink answers `404` from then on (#2061). Thanks @rivenash for the report.
+
+### Changed
+
+- The amd64 image's Chrome for Testing 157.0.8103.50 to 157.0.8103.78, the current Stable; the arm64 image keeps the chromium package Debian ships.
+
+### Fixed
+
+- Acknowledge the top-level `<status>` stanza that WhatsApp now sends some Baileys accounts in place of a status message, so the server stops closing the stream about 50 minutes later with `Stream Errored (ack)`: a new install-time patch, `scripts/patch-baileys-status-ack.js`, acknowledges and drops it, and a status delivered this way still does not reach the status store (#2064). Thanks @damar-glh for the report.
+
+## [0.30.0] - 2026-11-10
+
+### Added
+
+- Say how far a Baileys connection had got when it closed: the `baileys_connection_dropped` log line carries `stage` and `aliveMs`, and `lastError` of a reconnect-looping session ends with a sentence naming the stage.
+- Warn once per connection when WhatsApp asks for a passkey to finish a Baileys link (`action=baileys_passkey_required`); the link stalled with no word of why (#560).
+- Report a passkey request on a Baileys link as a `passkey_required` restriction: it reaches `GET /api/sessions/{sessionId}`, the `session.restriction` webhook and the dashboard with no status change, and is lifted when a link reaches `ready`.
+- List the `passkey_required` restriction kind in the JavaScript, Python, Go and Java SDK types.
+- Accept `inlineMedia` on the MCP `MessageList` tool, so an agent can list messages without the base64 of their media, as `inlineMedia=false` does on `GET /api/sessions/{sessionId}/messages`; unset keeps the media inline.
+- Accept an `idempotencyKey` on the eleven MCP send tools, as `Idempotency-Key` works on the REST send routes: a retry with the same key and arguments returns the first result instead of sending again.
+- Accept the REST message-list filters `after`, `direction`, `type`, `since`, `until`, `orderBy` and `messageId` on the MCP `MessageList` tool, and `type` on `MessageSearch`.
+
+### Changed
+
+- Log the restart WhatsApp asks for right after it accepts a Baileys link (close `515`) as `baileys_link_restart`, where it was logged as a dropped connection.
+- The MCP `SessionGetPresence` tool answers `observedAt` as an ISO date-time, as `GET /api/sessions/{sessionId}/presence/{chatId}` does, where it answered unix milliseconds.
+- Refuse an MCP tool argument the tool does not name, an unknown key inside `customLinkPreview` included, with `Unrecognized key: "x"`, where it was dropped and the call ran without it; the published input schemas now say `additionalProperties: false`.
+- Carry the `code` of an HTTP error, such as `IDEMPOTENCY_KEY_IN_PROGRESS`, in an MCP tool error, which returned only its name and message.
+- Show a session restriction on the dashboard card of a session that is waiting for a scan or a pairing code, where the pairing placeholder showed none.
+- The amd64 image's Chrome for Testing 157.0.8103.38 to 157.0.8103.50, picking up the browser security fixes released since; the arm64 image keeps the chromium package Debian ships.
+- Refuse an MCP tool call whose arguments hold more than 10,000 array items and object keys before validating them, where a map of tens of thousands of entries with one wrong value was answered with an issue per entry, megabytes of text.
+- Refuse a `from` filter of more than 255 characters on the MCP `MessageList` and `MessageSearch` tools, as `chatId` already is.
+
+### Fixed
+
+- Stop an abandoned or cut-off Baileys inbound media download from crashing the gateway with `TypeError: terminated`, by tying the response body to its decrypting stream in a new install-time patch (#2034). Thanks @voidm4p.
+- Cut the text of an MCP tool error and its log line at 4096 characters, so a long id a caller sent (a group id, a webhook id, a phone number) no longer comes back whole.
+- Accept `linkPreview` on the MCP `MessageSendTemplate` tool, as send-template does over REST, and say in both text tools that Baileys attaches a preview only for `true`.
+- Answer 404 for an MCP `GroupFindAll` call on an unknown session, as `GET /api/sessions/{sessionId}/groups` does, where it answered 400 `Session is not started`.
+- Return an MCP tool result of up to 32 KiB as text, where anything over 4 KiB was offloaded to a base64 resource that Claude Code saves to a local file and shows the model only as a path.
+
+### Documentation
+
+- Add a troubleshooting entry for a Baileys link that is accepted and never becomes `ready`: what a first login does, and how to tell which step fails.
+- State in `CONTRIBUTING.md` and `docs/08-development-guidelines.md` that the dashboard unit tests need Node.js 22.22.2+ on 22, 24.15+ on 24 or 26+ (jsdom), above the Node.js 22.19 floor of the gateway.
+- Document in `docs/24-mcp-integration.md` how an MCP result over the inline limit and a long tool error are shaped and that tool calls are not forwarded between nodes.
+- Say in the README and `.env.example` that `MCP_READONLY` mounts only the read tools unless set to `false`.
+- Name the fields of a `GroupFindAll` entry in the MCP tool description.
+- Correct `docs/24-mcp-integration.md`: with MCP disabled only the MCP module and SDK are skipped, the tool registry is still built.
+- Correct the MCP result limit (32 KiB) and the argument rule in `docs/06-api-specification.md`, and list the changes to MCP answers in the upgrade hazards of `docs/14-migration-guide.md`.
+
+### Dependencies
+
+- Update `undici` to 8.12.4, which fixes six advisories in its cache and redirect interceptors and in `fetch` integrity checks; the gateway uses none of those features.
+- Update `@aws-sdk/client-s3` to 3.1163.0, `bullmq` to 6.7.1, `@bull-board/api`, `@bull-board/express` and `@bull-board/nestjs` to 9.11.0 and `@nestjs/swagger` to 11.4.8 in the gateway.
+- Update `@tanstack/react-query` to 5.107.1, `i18next` to 26.7.2, `i18next-browser-languagedetector` to 8.3.0, `lucide-react` to 1.70.0, `react-i18next` to 17.1.13 and `yet-another-react-lightbox` to 3.33.0 in the dashboard bundle.
+- Update `jsdom` to 31.0.0 in the dashboard tests; the restart progress test compares the bar width numerically, since jsdom now rounds style numbers to six digits.
+- Update `eslint` to 10.14.0 and `globals` to 17.14.0 in the gateway and the dashboard, `vite` to 8.3.6 and `@vitejs/plugin-react` to 6.2.1 in the dashboard and `vitest` to 5.1.0 in the JavaScript SDK; these are build, lint and test tooling only.
+
+### Upgrade notes (behavior changes)
+
+- An MCP tool call that carries an argument the tool does not declare, an unknown key inside `customLinkPreview` included, is refused with `Unrecognized key: "x"`, and the published input schemas say `additionalProperties: false`; before, the argument was dropped and the call ran without it, so a misspelled `quotedMessageId` sent the message unquoted.
+- MCP arguments that were dropped before now take effect: `idempotencyKey` on the eleven send tools (a key reused for a different send answers `IDEMPOTENCY_KEY_REUSED`, and a retry after a failure that may have sent answers `IDEMPOTENCY_OUTCOME_UNKNOWN`), `linkPreview` on `MessageSendTemplate`, the filters `after`, `direction`, `type`, `since`, `until`, `orderBy` and `messageId` on `MessageList`, and `type` on `MessageSearch`. Send a fresh key for each intended send and drop a filter the caller did not mean to apply.
+- An MCP call whose arguments hold more than 10,000 array items and object keys, or a `from` filter of more than 255 characters on `MessageList` or `MessageSearch`, is refused; before, neither had a limit.
+- The MCP `SessionGetPresence` tool answers `observedAt` as an ISO date-time, as `GET /api/sessions/{sessionId}/presence/{chatId}` does, where it answered unix milliseconds.
+- The MCP `GroupFindAll` tool answers `NotFoundException` for an unknown session, as `GET /api/sessions/{sessionId}/groups` does, where it answered `BadRequestException` (`Session is not started`); a session that exists and is not started still answers that.
+- An MCP tool result of up to 32 KiB arrives as one `text` block, where anything over 4 KiB was an embedded base64 `resource`; a larger result is still offloaded. A tool error carries the `code` of an HTTP error, and its text is cut at 4096 characters.
+- A new restriction kind, `passkey_required`, reaches `GET /api/sessions/{sessionId}`, the `session.restriction` webhook and socket event, the dashboard, the `openwa_sessions_restricted` gauge and an audit row when WhatsApp asks a Baileys link for a passkey, where nothing was reported. The status does not change and a link that reaches `ready` lifts it; a stop, start or logout does not, so delete the session or restart the gateway to drop it. A client with a closed list of kinds must accept the new value.
+- The close WhatsApp asks for right after it accepts a Baileys link (code `515`) is logged as `baileys_link_restart`, not `baileys_connection_dropped`; that line gains `stage` and `aliveMs`, the `reconnect_loop` warning gains `stage` and `statusCode`, and the `lastError` of a reconnect-looping session ends with a sentence on where the last connection closed. A filter or alert on `action=baileys_connection_dropped` no longer matches the restart, and a consumer should match the start of `lastError`.
+
+## [0.29.1] - 2026-11-07
+
+### Added
+
+- Mark a forwarded message with `isForwarded: true` and, when positive, `forwardingScore` on `message.received` and `message.sent` on both engines, and on the whatsapp-web.js chat history (#2029). Thanks @visualpathpaulpraksh.
+
+### Fixed
+
+- Pin the next settled WhatsApp Web build from the registry read that named a logged-out page, so a second registry read that fails no longer leaves the session unpinned (#1997). Thanks @Mr4sR.
+- Stop a Baileys session start from blocking the whole process for seconds to tens of seconds on default SQLite when the account has many stored chats it only ever sent to: the chat-name lookup scanned every stored incoming message instead of seeking by chat.
+
+## [0.29.0] - 2026-11-06
+
+### Changed
+
+- The amd64 image's Chrome for Testing 156.0.8078.80 to 157.0.8103.38, picking up the browser security fixes released since; the arm64 image keeps the chromium package Debian ships.
+
+### Fixed
+
+- A whatsapp-web.js session whose proxy asks for a username and password failed every start after the first with `net::ERR_INVALID_AUTH_CREDENTIALS`, because WhatsApp Web's service worker, registered in the saved profile, took the page's requests out of reach of the proxy login; the page now ignores the service worker for such a session (#819). Thanks @gudge25 and @lHumanizado for the report.
+- Refuse a WhatsApp Web build whose registry page is the logged-out landing page and pin the next older settled build instead (up to three are tried, warning `web_version_html_rejected`); every whatsapp-web.js session start used to fail with `Cannot read properties of null (reading 'Socket')` until the process restarted (#1997). Thanks @ScalingMBA for the report.
+
+### Upgrade notes (behavior changes)
+
+- The amd64 image moves from Chrome for Testing 156 to 157, so an amd64 rollback to 0.28.0 or earlier crosses a browser major and deletes the stored whatsapp-web.js logins unless `sessions/` is restored from a backup taken before the first start on the new image (see `docs/11-operational-runbooks.md`); Baileys sessions are unaffected.
+
+## [0.28.0] - 2026-11-06
+
+### Added
+
+- Add `GET /api/sessions/{sessionId}/messages/{chatId}/{messageId}/receipts`, which lists who received, read and played a message the account sent on whatsapp-web.js (Baileys answers `501`), and `messages.receipts` in all five SDKs (#1748). Thanks @Purushotham-Prajapati-24, and @berodcdev for the request.
+- Plugin ingress routes can set `dedupBodyMismatchAsNew` to treat a repeated delivery id with a different body as a new delivery; a mismatch is logged and counted in `openwa_ingress_dedup_body_mismatches_total` either way.
+
+### Changed
+
+- Log the page visibility, the H.264/AAC playback answer and the browser version when a whatsapp-web.js video send or video status post times out in WhatsApp Web's 20 second video load, and document how to read that timeout (#1902). Thanks @benjaminb10 for the report.
+- The Docker image no longer ships the TypeScript compiler and ts-node, about 24 MiB less per architecture; nothing loads them at run time.
+- Refuse `POST /api/sessions` with `400` for a `config` over 16384 bytes as JSON; the limit applies at creation, and a stored session above it still loads and takes `PATCH /api/sessions/{sessionId}/config`.
+- Answer `404`, not `400`, for an id of letters, digits and hyphens (up to 128 characters) that is not a UUID and that no session has, including a session name, and say the routes take the id.
+- `SESSION_PROXY_TIMEOUT_MS` covers only the first 4 MiB of a session owner's answer, so a larger one is no longer cut by it, and an owner failure once the relay of such an answer has begun cuts the connection instead of answering `502`.
+- Answer 400, before the session's engine is looked up, for an id that names no group on the group read, settings, subject, description, leave, invite code, participants and membership request routes and their MCP tools (such an id reached the engine and was reported as its refusal, 403 or 404), and give the engine the id as `<id>@g.us`.
+- List a Baileys session's stored chats right after a restart, groups included, with their newest stored message as preview and time and the contact's pushname (#1978). Thanks @farresyh.
+- Record a session's `lastActive` at most once every 30 seconds instead of on every message, so it can lag the latest message by up to that long.
+- A `PUT /api/plugins/{id}/config` write to a built-in plugin merges nested objects into the stored config instead of replacing them, and a `null` clears a key at any depth.
+- Add a partial index on `status_updates.mediaPath`, created by a migration when the gateway starts, for the status orphan sweep's lookups.
+
+### Fixed
+
+- Install Trivy for the release and scheduled image scans from its GitHub release against a pinned SHA-256, since the action's own installer needs a host that no longer resolves.
+- Stop storing, listing and announcing (`status.received`) a whatsapp-web.js story that arrives already deleted, live or in the backfill made on connect.
+- Ignore a Baileys edit, delete, reaction or RSVP that carries a lid and the sender's own number when it names a message of another chat or author.
+- Share one lid table lookup between the events of a chat when the gateway expands it for chat-restricted delivery (Redis fan-out on, or a chat-restricted socket connected to the node), and reuse a lookup that found a mapping for 5 seconds.
+- Print no part of an `API_MASTER_KEY` in the startup banner: the first boot names the key file, and later boots show no fingerprint of a key seeded from it by this release or still configured.
+- Hold Create and Save in the webhook form for a URL with whitespace, `<`, `>` or an underscore in the host name, which the gateway refuses, and show the standard URL hint.
+- Drop the 00 exit code from international numbers of any length in the Message Tester, Number Checker and bulk recipients.
+- Stop the new-chat privacy-id lookup when the API key is removed or replaced, the selected session changes or the panel is closed.
+- Keep a search result that waits for the session list from overriding a session, chat or newer result chosen meanwhile, or from raising a notice after the page is left.
+- End a search result's privacy-id phone lookups when the page is left or another session, chat or result is chosen.
+- Report a Message Tester send that the gateway accepted with an empty message id as sent instead of failed.
+- Show a stored plugin choice that the field no longer lists as the selected option, and a null choice as a blank one, so the form saves what it shows.
+- Use the theme text and card colors for chart legends and tooltips so they stay readable in the light and dark themes.
+- Keep the Infrastructure Save Configuration button clear of the notification stack.
+- whatsapp-web.js: a reloaded page whose event listeners fail to attach is no longer counted as recovered, so the watchdog restarts the session instead of leaving it READY without inbound messages.
+- whatsapp-web.js: an `auth timeout` or browser network error behind a SOCKS proxy URL with credentials now says in `lastError` that Chromium cannot send them.
+- Metrics scrapes that arrive together share one render, so the cached event-loop delay no longer reads zero after an overlap.
+- Treat the phone and lid forms of a chat as one contact in send pacing when the gateway holds a reported phone pairing for the lid, so replies and group adds for a contact known by its lid are no longer charged as new conversations.
+- Keep the payload of a media send the pending reaper failed while it was in flight when the own-send echo already holds its message id.
+- Answer `503`, not `500`, when a transient database failure interrupts a read a start, stop or delete makes before it acts (the cap check, the ownership check, a delete's row read, the read after a refused claim); nothing was started, stopped or deleted.
+- Answer `503`, not `500`, when a transient database failure interrupts the owner lookup a node with `NODE_URL` makes before routing a session request; nothing was done.
+- Report `delivered` and then `read` through `message.ack` for a Baileys group message once every member has received or read it, instead of leaving it at `sent`; a status post still stays at `sent`.
+- List a key seeded from `API_MASTER_KEY` as `(master key)` instead of its first 12 characters; keys seeded by earlier releases keep their stored prefix until replaced.
+- Key Baileys chat writes and read receipts to the newest stored message of the account the session is linked to, so a session relinked to another number no longer names the previous account's messages.
+- Warn when a session delete removes only a symlinked auth directory and leaves the WhatsApp login at its target, instead of logging it as purged.
+- Report the chat id of a whatsapp-web.js `message.reaction` as a string if WhatsApp Web sends it as an object.
+- Clear the stored body, media and metadata of a message deleted on whatsapp-web.js by its bare key id, which stayed in place before.
+- Fold a whatsapp-web.js mention given as a padded, upper-case, `@s.whatsapp.net`, `:device` or hosted id to the neutral id before it reaches WhatsApp Web, in text, media, sticker, reply and edit sends, as Baileys already does.
+- Cap the chat media and status orphan sweeps at 100,000 tracked files per pass, so a session delete or a retention run over a large archive no longer grows memory with the number of files left behind.
+- Remove a status, with its media file, from `GET /status`, `GET /status/:id` and the status media route when its poster deletes it, instead of serving it until it expires.
+- List a built-in Redis, MinIO or PostgreSQL under `removal.errors` instead of `removal.stopped` when a restart could not ask Docker for its container.
+- Keep a working directory `.env` out of the e2e and unit boots, which read the environment their harness sets; a `.env` that cannot be read still stops the boot, and the error names the file.
+- Stop the boot, naming the file, when `data/.env.generated` exists but cannot be read (a directory where a bind mount found no file, or a file the app user cannot open), instead of starting on the defaults without the database and storage settings saved there.
+- Stop the migration CLI, naming the file, when `.env` or `data/.env.generated` exists but cannot be read, instead of migrating without that file's settings.
+- Keep a Baileys receipt from another chat from advancing or announcing an own message whose row is still being written.
+- Preview each Baileys chat from its own history message when two chats' messages share an id.
+- Store a Baileys history-sync admin delete of the account's group message as the account's deleted message, and clear a member's own group message deleted in another history chunk.
+- Make the forwarded-message spec wait for the ack to be stored instead of a fixed pause, so it no longer fails intermittently on the PostgreSQL lane.
+- Stop announcing `message.ack` for the acks of whatsapp-web.js system notices, which are no longer delivered as messages.
+- Stop delivering whatsapp-web.js system notices (a changed security code, the encryption notice, business and broadcast notices) as `unknown` messages on `message.received` and `message.sent`, so they are no longer stored, passed to the message hooks or answered by automation rules (#1864). Thanks @dwimnofan.
+- Compile a chat-restricted key's allowlist once per request instead of once per chat id.
+- Return keyboard focus to the chat list row, or the search field, when the open chat, channel or status is closed.
+- Keep focus in the Number Checker phone field during and after a single check.
+- Keep dialogs that open over the phone navigation drawer usable and release the page scroll lock when they close.
+- Return keyboard focus to Save Configuration after the restart prompt is put off or a save is refused.
+- JavaScript SDK: `client.request()`, `requestBytes()` and `buildUrl()` send the entries of a `URLSearchParams` or `Map` query instead of sending the request without them.
+- Allow typing time in queued plugin webhook dispatch while keeping inline and hook limits at five seconds.
+- Synchronize plugin registry replacements before acknowledging required writes.
+- Reject plugin storage keys longer than 184 UTF-8 bytes before writing files.
+- Delay plugin missing-code warnings until all package directories have been scanned.
+- Use .env PUPPETEER_HEADLESS and PUPPETEER_ARGS instead of defaults for omitted keys in existing partial puppeteer config on the next start after upgrade, without another save.
+- Remove group and other access from existing plugin directories without granting owner permissions.
+- Take any restored session id (letters, digits and hyphens, up to 128 characters) on the `/api/sessions/{sessionId}` routes, which answered `400` for a non-UUID id and left a restored session impossible to stop, log out or delete; a restore refuses an archive whose session id is longer.
+- Relay a session owner's answer over 4 MiB as it arrives, so concurrent media downloads through another node no longer hold a full copy each in memory.
+- Stop `GET status/{id}` from returning the statuses of the phone before the first `@` for an id with a second `@` or for a group or channel id.
+- Refuse a group, channel, privacy or two-@ id, and a value with no digits, with 400 in the number check (REST and MCP), and query WhatsApp with the digits of the number only.
+- Read the thumbnail, duration and waveform of a Baileys video or audio send, or a video or voice status, only after the recipient, quote and status recipients checks pass, so a refused send no longer spawns the ffmpeg and parser child processes.
+- Make the dashboard restart-modal focus spec wait for the dialog to take focus and for the page to restore it instead of reading both at once, so it no longer fails intermittently.
+- Refuse a Baileys retry receipt from another chat for a message received under a lid with its sender's number.
+- Webhook writes refuse more than 27 events, and webhook and automation rule writes refuse id filter values over 128 characters.
+- Stored webhook rows and backups past these limits are kept as they are; an edit that resends them is refused until they fit.
+- Integration redrive reads one payload at a time, and an exhausted webhook replay budget keeps the event data on the failure row.
+- Stop announcing and storing `ready` for a link the session's account binding refuses; the session goes straight to `failed`.
+- Record a WhatsApp unlink that arrives after a stop, delete or shutdown retired the engine, or whose session read fails during shutdown, so another number can link the session.
+- Stop a start right after a logout, or a reconnect after a WhatsApp unlink, from keeping the old number and refusing the account that scans next.
+- Keep the account a reconnect attempt linked bound when that attempt then fails, so the retry refuses a different number.
+- A request body with an array of more than 10,000 items, an object of more than 1,000 keys or more than 250,000 items and keys in all is refused with 400 before validation instead of holding the process for seconds to minutes; the data restore and routes that read the body without a DTO are exempt.
+- An upload the in-flight body budget drops mid-stream is logged with its reason and counted as 408 or 503 in `http_requests_total`.
+- Pretty log output escapes control characters, so a value holding a newline cannot start a forged log record.
+- `GET /api/health/ready` shares its database probes between concurrent requests and reuses the verdict for one second, so a flood no longer queues probes ahead of application queries on PostgreSQL.
+- A request whose client left while the gateway was working on it is counted as 499 in `http_requests_total` instead of the status set before the handler ran.
+- Queue whatsapp-web.js label writes per chat whichever id names it, so adding two labels to one chat by its phone id and by its lid at the same time no longer removes one of them.
+- Ignore a SIGHUP that arrives while a stop is already running, so a terminal closing during the teardown no longer cuts it short.
+- Drain on SIGHUP like on SIGTERM and SIGINT, with the readiness 503, the request gate and the force-exit budget, also when the terminal that sent it has closed.
+- Raise a WebAssembly out-of-bounds access as a catchable error instead of spinning the process.
+- End the process on a crash in native code instead of leaving the gateway spinning at full CPU and answering nothing, so a restart policy brings it back.
+- Leave SIGQUIT and SIGABRT to their default action, so they can take a core dump of a gateway whose event loop is blocked.
+- Leave SIGUSR2 to Node, so `--report-on-signal` and `--heapsnapshot-signal=SIGUSR2` write their file and no longer stop the gateway; name a writable directory such as `/app/data` with `--report-directory` or `--diagnostic-dir`.
+- Hold the pacing admission of a bulk item or product send for the usual window when the engine answers not-ready, unreachable or not found after the send may already have gone out, instead of handing it back at once.
+- Keep the forwarded type and caption of a forward of a message the gateway has no stored copy of, instead of the `[Forwarded]` placeholder.
+- Ignore a Baileys group delete of another member's message, or of the account's, from a member the group roster shows is not an admin.
+- Keep the chat preview of a Baileys group message when a member known by a paired lid edits or deletes the message of a member known by a lid with no pairing.
+
+### Documentation
+
+- The community integrations page lists `openwa-n8n-workflows`, an import-ready n8n workflow that answers `message.received` webhooks with a local AI model. Thanks @Abhishekrajpurohit.
+- The API reference says that whatsapp-web.js system notices are not messages.
+- The Helm notes and the security guide say the admin key is read from the key file when `API_MASTER_KEY` is set.
+- Explain that schema defaults remain stored across plugin updates.
+- Explain how hooks and webhook handlers can start reply sends without awaiting them, with error handling.
+- Describe plain-text storage and masked reads for retained integration instance secrets.
+- Scope the ten second Baileys stored-chat read bound to PostgreSQL; on SQLite the read holds the event loop until it ends.
+- The API reference says how to count the viewers of a Baileys status post from `message.receipt`, and that a status post reports no `delivered` or `read` ack.
+- Explain redirect and blocked-destination delivery errors in the n8n troubleshooting guide.
+- API reference and troubleshooting guide: a SOCKS proxy cannot log in on whatsapp-web.js; use a proxy that admits the gateway by IP or an HTTP or HTTPS proxy with credentials.
+- `GET /api/infra/status`: `engine.webVersion` is the build the gateway resolves for sessions to pin, not the build every session ran.
+- `GET /api/infra/status`: `engine.headless` and `engine.browserArgs` are the environment values; a stored whatsapp-web.js plugin config overrides them for sessions.
+- The in-flight body budget reservation ends once the body has been read, and the status label of `http_requests_total` lists what a dropped or abandoned request counts as.
+- `.env.example` says pooled clients must expire idle connections before `KEEPALIVE_TIMEOUT_MS`.
+- The scaling guide says that a node booting while a peer's lease has just lapsed resets that peer's session, and that only one node is supported.
+- The operational runbooks list what each signal does to the gateway, the output directory Node's diagnostic flags need in the image, and the exit status a native crash leaves.
+- Describe VIEWER avatar and metadata lookups alongside OPERATOR number and LID checks.
+- Link SDK users to per-route role requirements and describe optional error fields.
+- Use stable dependency file and symbol references in engine capability evidence.
+- Explain resolved LID send addressing and limits of per-recipient receipt lists.
+- State the glibc 2.34 requirement and startup remedies for Linux glibc source installs on x64/arm64.
+- Describe PHP empty-response behavior for coalescing, nullable and required-body methods.
+- The FAQ says that a media send by `url` holds its download in memory until the send finishes, and that nothing limits how many run at once.
+- The database design lists every step that still runs at boot on a SQLite database with `DATABASE_SYNCHRONIZE=true`.
+- The development guidelines list `SearchModule` among the global modules, and a check keeps the list equal to the source.
+- The API reference says where the app version is visible without a key.
+- The security design and architecture diagrams no longer show an encryption layer the gateway does not have.
+
+### Dependencies
+
+- Update `@aws-sdk/client-s3` to 3.1160.0 and `bullmq` to 6.5.1 in the gateway.
+- Update `@tanstack/react-query` to 5.105.0, `i18next` to 26.5.11, `i18next-browser-languagedetector` to 8.2.3, `lucide-react` to 1.65.0, `react-i18next` to 17.1.9 and `react-router-dom` to 7.18.5 in the dashboard bundle.
+- Update `typescript-eslint` to 8.72.1, `guzzlehttp/guzzle` to 8.3.1 in the PHP SDK lockfile and `maven-surefire-plugin` to 3.6.1 in the Java SDK; these touch development and test setups only.
+- Update the transitive `@smithy/core` to 3.38.1, which npm no longer marks deprecated for a bug in custom logger data redaction; the gateway passes no custom logger to the AWS SDK.
+
+### Upgrade notes (behavior changes)
+
+- A Baileys group message now produces `message.ack` events (`delivered`, then `read`) and advances its stored status, which stayed at `sent` before; a webhook or socket client that expected no ack for a group message will receive them. The ack payload carries no `isGroup`, so a webhook filter on `isGroup` cannot tell them from direct ones; filter on `kind` or `chatId` instead.
+- The Docker image no longer contains `typescript` or `ts-node`. A plugin that required either from the gateway's `node_modules` without bundling it must now ship its own copy.
+- After a restart, Baileys `GET /api/sessions/{sessionId}/chats` also returns the chats with stored messages, and groups carry their newest message's time instead of `0`, so the list is longer and its pages change; a chat deleted on the phone before 0.27.0 or before an unlink is listed again while its messages are stored.
+- SIGQUIT, SIGABRT and a bare SIGUSR2 now end the process at once with no teardown; a process manager that restarts with SIGUSR2, such as nodemon's default, should send SIGTERM.
+- SIGHUP now drains and exits 0 (1 on a failed or overrun teardown) instead of dying by SIGHUP, so Docker's on-failure restart policy no longer restarts after `docker kill -s HUP`.
+- `POST /api/sessions` answers `400` for a `config` over 16384 bytes as JSON; a stored session above it still loads and takes `PATCH /api/sessions/{sessionId}/config`.
+- An id of letters, digits and hyphens (up to 128 characters) that is not a UUID answers `404` on the `/api/sessions/{sessionId}` routes when no session has it, where it answered `400`; a session restored under such an id can now be stopped, logged out and deleted. A data import refuses an archive that holds a session id longer than 128 characters, which it imported before.
+- A session start, stop or delete whose read before acting meets a transient database failure (a lost or refused connection, a lock, a connection limit), and a session request on a node with `NODE_URL` whose owner lookup does, answer `503` where they answered `500`; nothing was done, so the request can be repeated.
+- `SESSION_PROXY_TIMEOUT_MS` covers only the first 4 MiB of a session owner's answer; a larger one, such as a media download through a node that does not own the session, is relayed as it arrives, and an owner that fails after that cuts the connection where it answered `502`.
+- The group read, settings, subject, description, leave, invite code, participants and membership request routes and their MCP tools answer `400`, before the engine is asked, for an id that names no group, where the engine's refusal came back as `403` or `404`.
+- The number check (REST and MCP) answers `400` for a group, channel, privacy or two-@ id and for a value with no digits, and `GET /api/sessions/{sessionId}/status/{id}` no longer returns the statuses of the phone before the first `@` for an id with a second `@` or for a group or channel id.
+- A request body with an array of more than 10,000 items, an object of more than 1,000 keys, or more than 250,000 items and keys in all answers `400` before validation; the data import and routes that read the body without a DTO are exempt.
+- `http_requests_total` counts a request whose client left while the gateway worked on it under `499`, and a request body the in-flight body budget drops under `408` or `503`, where it counted the first under the status set before the handler ran (usually 200 or 201) and the second as a 200 (a 500 on a multipart route): a dashboard that sums 2xx loses those requests and a 5xx alert sees the `503` drops. `GET /api/health/ready` can answer with a verdict up to one second old.
+- Webhook writes answer `400` for more than 27 events, and webhook and automation rule writes for an id filter value over 128 characters; stored rows past these limits are kept, and an edit that resends them is refused until they fit.
+- The first boot with `API_MASTER_KEY` set no longer prints it: the banner names the key file, and later boots show no fingerprint of it. A key seeded from it is listed as `(master key)` instead of its first 12 characters; keys seeded by earlier releases keep their stored prefix until they are replaced.
+- whatsapp-web.js system notices (a changed security code, the encryption notice, business and broadcast notices) are no longer delivered as `unknown` messages on `message.received` and `message.sent`, so they are no longer stored, passed to the message hooks or answered by automation rules, and their acks are no longer announced; rows stored earlier stay.
+- A WhatsApp unlink that arrives after a stop, delete or shutdown retired the engine, or whose session read fails during shutdown, is now recorded: it writes its audit row and sends `session.disconnected`. A link the session's account binding refuses goes straight to `failed` without a `session.status` `ready`.
+- A bulk item or product send that the engine refuses as not ready, unreachable or not found after the message may already have gone out keeps its pacing admission for 10 seconds, which can refuse one follow-up send near a cap that would have been admitted before.
+- On Baileys, a group delete of another member's message, or of the account's, from a member the group roster shows is not an admin is ignored: the stored copy, the chat preview and `message.revoked` are left alone. The roster comes from the cached group metadata (`BAILEYS_GROUP_METADATA_CACHE_TTL_MS`, 5 minutes by default, dropped on promote and demote events), so a delete from an admin whose promotion it has not seen is ignored until it refreshes. An edit, delete, reaction or RSVP that carries a lid and the sender's own number is ignored when it names a message of another chat or author, and so is such a retry receipt.
+- `PUT /api/plugins/{id}/config` on a built-in plugin merges nested objects into the stored config instead of replacing them, and a `null` clears a key at any depth. A stored partial `puppeteer` override takes `PUPPETEER_HEADLESS` and `PUPPETEER_ARGS` from the environment for the keys it omits, from the first start after the upgrade. Plugin storage keys longer than 184 UTF-8 bytes are rejected, and existing plugin directories lose group and other access.
+- The boot stops, naming the file, when `data/.env.generated` exists but cannot be read (a directory where a bind mount found no file, or a file the app user cannot open), where it started on the defaults without the settings saved there; `npm run migration:run` and `migration:run:prod` stop when `.env` or `data/.env.generated` cannot be read.
+- A session's `lastActive` is written at most once every 30 seconds instead of on every message, so it can lag the latest message by up to that long.
+- A status its poster deletes is removed from `GET /status`, `GET /status/:id` and the status media route (which answers `404`) when the delete reaches the session, instead of being served until it expires.
+
+## [0.27.1] - 2026-11-02
+
+### Added
+
+- Add `GET /api/sessions/{sessionId}/contacts/{number}/lid`, which looks up the `@lid` WhatsApp holds for a phone number without sending a message and needs an OPERATOR key, and `contacts.lid` in all five SDKs (#1969). Thanks @farresyh for the report.
+- Python SDK: `client.request()` takes an `idempotency_key`.
+
+### Fixed
+
+- Answer `GET /api/sessions/{sessionId}/contacts/{contactId}/phone` for a phone id from the id itself on whatsapp-web.js, which no longer asks WhatsApp whether the number exists and so no longer works as a number check for keys below OPERATOR.
+- Answer `503`, not `500`, to `GET /api/sessions/{sessionId}/contacts/check/{number}` when WhatsApp rate-limits, refuses or drops the query on Baileys, or the whatsapp-web.js page does not answer in time.
+- Read a whatsapp-web.js group whose refresh fails one of WhatsApp Web's own invariants from the metadata the page already holds, so `GET /api/sessions/{sessionId}/groups/{groupId}` and `/labels/{labelId}/chats` no longer answer 404 for it, and the chat lookups behind its group setting, chat action, chat label and message routes use that metadata too (#1962).
+- Reload the active API key index after seeding the first admin key, so a failed first read no longer leaves body admission without it until the next refresh. Thanks @Purushotham-Prajapati-24.
+- Stop sending `message.edited` on the webhook and socket for an edit that reaches a message already deleted, for everyone or, through `POST /api/sessions/{sessionId}/messages/delete`, for this account only, which handed consumers new text for a message that was already gone. Thanks @rupeshreddynagolu.
+- Keep the `@lid` and `@s.whatsapp.net` previews of one Baileys chat in step when a history-sync revoke, or a live edit or revoke, names the chat under the other id.
+- Keep a Baileys chat preview cleared when an edit reaches a message already deleted for everyone, so `GET /api/sessions/{sessionId}/chats` and the dashboard sidebar no longer show the deleted text.
+- Refuse a Baileys send or status post with `409`, rather than sending on a replacement socket, when its connection changes during the media fetch, quote or recipient lookup, preview upload or product lookup; a send cut off by reconnect backoff now answers `409`, where it answered `503`.
+- Answer `503` (not sent) instead of `500` for a Baileys product send whose catalog lookup is cut off by a closed connection, and hand back its pacing admission.
+- Stop an old engine's disconnect report, sent while a reconnect tears it down, from using up a second reconnect attempt.
+- Record and announce a WhatsApp unlink whose session row could not be read when the session is stopped, logged out or deleted, or the gateway shuts down, instead of dropping it.
+- Stop a disconnect read retry that is still re-reading from overwriting a session that has become READY and tearing down its recovered engine.
+- Make a session delete wait for a logout that is still waiting on the session's initial status, instead of purging its data while the logout runs.
+- Reject chat and group ids with more than one `@` or an empty local part, in the API and in the API Keys form.
+- Pass the canonical `groupId` to the engine on the `/groups/{groupId}/picture` routes, which forwarded an upper-case, padded or device-suffixed id as sent.
+- Answer `404` to a malformed `channelId`, a bare `@newsletter` or an id with more than one `@`, on the channel delete, mute, unsubscribe, admin demote and owner transfer routes; demote and transfer passed any value to the engine, the others accepted such an id.
+- Answer `400` to a boolean `limit` in `POST /api/webhooks/delivery-failures/redrive` instead of redriving one delivery.
+- Retract the secrets of retired or rolled-back wildcard plugin instances from the plugin base config and `registry.json` when an infrastructure backup is imported, on the node that runs the import.
+- Keep a valid key's `GET /api/health` check from freeing the limiter slot of a newer failed attempt.
+- Log an unreadable API key store on `GET /api/health`, at most once a minute, instead of recording it as an `API_KEY_AUTH_FAILED` credential failure.
+- Stop throttled dashboard media downloads from retrying after the API key changes or is cleared.
+- Keep the dashboard chat composer's in-flight send state per conversation, so a slow send in one chat no longer disables Send in another.
+- Restore keyboard focus to the Export data, Import data or Download backup first control after a backup finishes, without scrolling the page.
+- Refuse `.` and `..` path segments, percent-encoded ones too, in raw Python and PHP SDK `request` paths, as the JavaScript, Go and Java SDKs do.
+- Keep the first segment of a raw Python SDK `request` path that starts with `//`, which httpx read as a host name and dropped.
+- Type `GroupInfo.owner` as a non-null JID in the JavaScript SDK, and `ChatHistoryMessage.mentionedIds` and `MessageContact.labels` as `list[str]` in the Python SDK.
+- Answer `503` instead of `500` when the Baileys connection drops under a group or channel request (a create excepted), a catalog, label, contact, profile, block, chat or call request.
+- Answer `404` instead of `500` when WhatsApp refuses a Baileys group read with a 4xx code other than the ones already mapped.
+- Answer `503` instead of `500`, with nothing sent and a keyed send's `Idempotency-Key` freed, when the identity check behind a Baileys reply, forward, button click, reaction, edit, delete, star, pin or unpin is rate-limited or loses its connection; the chat writes and read receipts that run the same check answer `503` too.
+- Free a keyed Baileys sticker send's `Idempotency-Key` when sharp cannot load, and keep that failure out of the send breaker.
+- Refuse with `403` a Baileys edit of a message that has no text or caption, as whatsapp-web.js does, instead of answering `200` and rewriting the stored body.
+- Send a Baileys contact card with its display name.
+- Clear a Baileys message and its chat preview when a contact's delete for everyone reaches history sync in a later chunk than the message.
+- Stop recording a Baileys history-sync group delete, for a message the session does not hold, as a deleted message sent by the account.
+- Answer `409` to a Baileys pairing-code request when the session stops or reconnects while the code is being requested, instead of returning a code nothing can link or a `500`.
+- Answer `GET /api/sessions/{sessionId}/presence/{chatId}` for a chat id written with `@s.whatsapp.net`, a `:device` suffix or in upper case, and on Baileys for a contact whose presence WhatsApp reports from its `@lid` once that pairing has been reported, all of which answered `null`.
+- Keep a whatsapp-web.js session `READY` when a WhatsApp Web reload cuts a page call short, which marked it disconnected and forced a full reconnect; a read cut short this way answers the retryable reload `409`, where it answered `503`.
+- Apply whatsapp-web.js chat label adds and removes addressed by a contact's `<phone>@c.us` id to its chat when WhatsApp Web keys that chat by `@lid`, which answered `200` and changed nothing.
+- Free the `Idempotency-Key` of a whatsapp-web.js send refused before anything was sent (an unknown chat or quoted message; a reply, location or contact card to a channel, status or broadcast list; a poll or sticker to a status or broadcast list; media to a channel; a custom link preview), which a retry answered with `409` outcome unknown.
+- Answer `503` (not sent) instead of `500` when the chat read before a whatsapp-web.js reply or forward outruns the page's protocol timeout.
+- Answer `400` (not sent) to a whatsapp-web.js sticker whose type is neither an image nor a video, instead of a `500` the send breaker counted.
+- Resolve a whatsapp-web.js send to `<phone>@s.whatsapp.net`, an upper-case `@C.US` or a `:device` id like its `<phone>@c.us` form, so a contact WhatsApp addresses by `@lid` is reached instead of refused with `500`.
+- Answer `503` instead of `500` when the whatsapp-web.js blocklist read outruns the page's protocol timeout.
+- Answer `403`, where it answered `200` or `500`, to whatsapp-web.js participant remove, promote and demote, to the membership requests read, and to approving or rejecting every pending request, for an account that is not an admin of the group, as the routes document.
+- Pin the browser locale on whatsapp-web.js Chromium args stored through the plugin config API, as on the built-in defaults.
+- Retry a whatsapp-web.js pairing code request that lands on a freshly reloaded QR page instead of answering `500`.
+- Kill the Chromium a whatsapp-web.js stop or delete left launching once the init deadline force-destroys the engine, instead of leaving it running on the session's profile.
+- Detect whatsapp-web.js onboarding dialogs drawn with `position: fixed`, which the onboarding probes never saw.
+- Keep `contact.id` in whatsapp-web.js contact details (`WEBHOOK_CONTACT_DETAILS=true`) on a WhatsApp Web build that renamed its id field.
+- Refuse with `400` a start sent while a whatsapp-web.js reconnect waits for the same profile removal, which launched a second engine and left the reconnect's running where stop, force-kill, delete and shutdown could not reach it.
+- Keep a whatsapp-web.js session's push name when it becomes ready while its account info cannot be read, instead of blanking it.
+- Store the forwarded message's type, text and media on the row `POST /api/sessions/{sessionId}/messages/forward` writes, instead of a `[Forwarded]` placeholder that the message list, the dashboard and search kept showing; a new forward is no longer typed `forward` in `?type=forward` and in the `byType` statistics.
+- Read unfinished bulk batches one at a time when failing them at startup, on a session takeover, delete or data import, so a restart after a crash mid-run no longer loads every batch's media payloads at once, nor a live peer's.
+- Answer `400` to `POST /api/sessions/{sessionId}/messages/send-template` when the template renders to an empty text (header, body and footer included), as `send-text` does, instead of storing and sending an empty message.
+- Hand back a bulk item's or product card's send-pacing admission when the engine marks its failure as raised before anything was sent, whatever the status, and stop counting any send failure marked that way toward the send breaker.
+- Delete expired finished bulk batches 500 at a time under `MESSAGE_RETENTION_DAYS`, so a large backlog no longer holds SQLite's single writer in one statement.
+- Keep a session `initializing`, with the timeout as `lastError`, while a reconnect whose relaunch hit the engine init deadline waits for its next attempt, instead of reporting `disconnected` with no `lastError`.
+- Keep another node's lapsed claim when `POST /api/sessions/{sessionId}/logout` or `/force-kill` cannot read the session, so the takeover sweep can still adopt it.
+- Answer `503` instead of `500` when `POST /api/sessions/{sessionId}/start` cannot claim the session because of a database error.
+- Accept a form-encoded `muteUntil` on `POST /api/sessions/{sessionId}/chats/mute`; clearing a mute still needs a JSON `null`.
+- Refuse `POST /api/infra/restart` with `409` (`RESTART_DATABASE_NOT_STARTED`) when the built-in PostgreSQL it was asked to start does not start, instead of restarting into a boot loop; nothing is stopped, a configuration saved since the server started is put back when it can be written, and the refusal is recorded in the audit log.
+- Answer `409` (`RESTART_ALREADY_RUNNING`) to a restart requested while another is running or once the server is restarting, where two could race for the same containers and roll a saved configuration back under the restart that won.
+- Refuse a `POST /api/infra/import-data` archive whose session `config`, webhook `headers`, plugin instance `config`, conversation mapping `metadata` or message batch JSON does not parse, which restored rows that failed every later read, `GET /api/sessions` included.
+- Enforce a plugin's session activation when its manifest declares `sessionScoped` as `0` or `""`, which the API already showed as session-scoped, so a plugin limited to some sessions, as an integration instance provisioned for one session is, no longer runs for the others.
+- Keep the Plugins page working when an installed manifest declares its description, author, provides tags or localized text as something other than text; those values are dropped.
+- Keep a long plugin `ctx.storage` key writable after many writes, instead of failing with `ENAMETOOLONG` once the gateway has written often enough.
+- Report a sandboxed plugin healthy on `GET /api/plugins/{id}/health` only when its health check returns `healthy: true`.
+- Take a sandboxed plugin's search-provider declaration once per worker, so a repeated one cannot retake the active provider.
+- Keep a later webhook failure's event data on the delivery's earlier terminal failure row while payload retention is on, so the event can still be redriven.
+- Keep an S3 media download open for a slow client when the store took more than 3 seconds to send its headers; such downloads were cut after about 30 seconds instead of the 10 minutes a stalled reader is allowed.
+- Rank and highlight `match=contains` hits on the first 4,096 UTF-16 units of each message, so a search over long received messages no longer blocks every session for seconds; a hit whose terms appear only past that point scores 0 and gets a snippet without `<mark>`.
+- Count API requests answered before routing (the shutdown `503`, the in-flight body budget's `503`/`413`/`415`, an encoded-NUL `400`, malformed or too deeply nested bodies) in `http_requests_total` and `http_request_duration_seconds` under the `(unmatched)` route, together with CORS preflights.
+- Log a failing Redis check of the rate limiter once per outage, and once more when Redis answers again, instead of three warnings for every request while it lasts.
+- Stop warning at every boot that `WEBHOOK_SHUTDOWN_DRAIN_MS` is shorter than `WEBHOOK_TIMEOUT` when both are at their defaults; a changed value that leaves them crossed still warns.
+- Return at most `limit` hits from a plugin search provider that answers with more.
+- Count the files of an S3 store for `GET /api/infra/storage/files/count` without holding every bucket key in memory.
+- Mark the `ids` query of `GET /api/sessions/{sessionId}/contacts/profile-pictures` optional in the OpenAPI contract; the route already answers `{ "pictures": {} }` without it.
+- Put the text of a dashboard chat message the gateway refuses back in that chat's message field.
+- Hold a dashboard chat message past 4096 characters, or a caption past 1024, and say so under the field.
+- Close the dashboard status form when its session is deleted and the next one opens, which posted the status through the other account.
+- Stop the dashboard asking a newly selected session about the previous session's open chat, open channel and chat list.
+- Keep the dashboard status viewer where its reader scrolled when a message for another chat arrives or the search changes.
+- Show a message sent from the dashboard at the gateway's time when its live echo arrives before the send's answer.
+- Share one dashboard session list read among the status pushes of a moment, so a burst of reconnecting sessions no longer trips the route's rate limit on the Sessions page, and retry a refused read after the wait its `Retry-After` names.
+- Open no QR dialog after starting a stopped dashboard session that is still linked.
+- Give the dashboard's API key Revoke action its own word in Arabic, Hebrew and Telugu, where it read the same as Cancel.
+- Disable the dashboard's Restart Now while a backup export or import is running.
+- Drop the Error option from the dashboard Logs severity filter, since the audit log records failures as warnings.
+- Send a Message Tester recipient written as a chat id, such as a lid, as written instead of reading its digits as a phone number.
+- Drop a leading `00` exit code from Message Tester and bulk recipient numbers, as the Number Checker does.
+- Hold the Message Tester's Send until the recipient or forward target holds a digit or a chat id, and stop requiring the phone field for a forward from a named chat.
+- Check template name, body, header and footer lengths in the dashboard and name the field, instead of a bare `Bad Request`.
+- Check a webhook URL's scheme and length in the dashboard and say what is wrong, including a stored URL saved before the scheme was required.
+- Report a failed sessions read on the Number Checker instead of claiming no session is connected, and show the gateway's reason when the webhook list is refused for a key whose role allows webhooks.
+- Preview a template placeholder named like `constructor` or `toString` as written, as a send leaves it.
+- Keep the dialog showing a new API key open until its Close button is pressed, so Escape or a stray click cannot lose the key.
+- Leave a `QUEUE_ENABLED` pinned by the environment out of a dashboard Infrastructure save, which wrote the pin into the saved config and could drop a stored bundled Redis.
+- Keep the plugin instance create and regenerate dialogs open until the one-time secret arrives.
+- Refuse a dashboard sign-in on a `200` answer that does not say the key is valid, such as a misrouted proxy page.
+- Refresh the dashboard overview's sessions and session statistics every 30 seconds while it stays open and they can be read.
+- Keep keyboard focus out of the page behind the dashboard's open phone drawer, and return it to the language button when the language menu closes from inside it.
+- Go SDK: retry a POST answered `503` under `WithRetry` only when it carries an `Idempotency-Key` or the `503` carries `Retry-After`, since a Baileys send or status post that WhatsApp timed out may already have been delivered; an unkeyed POST now gets its first `503` back.
+- Java SDK: refuse a `SendLocationRequest` built without a latitude or longitude, which sent a pin at 0,0; `build()` now throws.
+- Java and Go SDKs: stop sending `sessionId` on the cross-session webhook list, which ignores it.
+- PHP SDK: send the `groups->create` participant list and the `sendBulk` messages list as JSON arrays when their keys have gaps, which the gateway refused with `400`.
+- JavaScript SDK: encode the route segment of `OpenWAClient.sendMedia`, and reject an id holding a lone surrogate instead of throwing synchronously.
+- SDKs: refuse an id with a `.` or `..` part between slashes, which a reverse proxy that decodes `%2F` sent to another route.
+- Say, when `restore.sh` refuses a `psql` too old for the dump's `\restrict`, that a load into the built-in `openwa-postgres` container runs that container's `psql`, and that running the restore in the image gets past the check.
+- Warn in the Helm chart's install notes that an API key revoked or narrowed on one replica stays valid on the others.
+- Document in the Helm chart's `values.yaml` that `serviceMonitor.bearerTokenSecret.key` must be `METRICS_TOKEN` when it names the chart's own Secret or `existingSecret`.
+- Apply the whatsapp-web.js message-id backport through `git apply` on a source install whose `patch` is BusyBox's applet, which refused its options and failed `npm install`.
+- Say to reinstall `@whiskeysockets/baileys`, instead of to re-evaluate upstream, when an interrupted install left the Baileys pairing backport half applied.
+
+### Documentation
+
+- The API reference says how the socket `data` of an event differs from its webhook payload, including `qrCode` on `session.qr`, and uses session ids rather than names in its examples.
+- The API reference says the LID lookup needs an OPERATOR key and lists `quotedMessageId` and `ptt` in the shared media table.
+- The migration guide lists the 0.27.0 `DATABASE_SYNCHRONIZE` boot refusal and the `restore.sh` and scoped-backup client floors as upgrade hazards.
+- The SDK design doc names the Baileys `409` of a logout with no linked device.
+- The security design states the `chatId` format check and lists the `phone_second_lid_reported` audit row.
+- `.env.example` and the plugin search guide say a search plugin is chosen by enabling it, since `SEARCH_PROVIDER` takes no plugin id.
+- The troubleshooting FAQ lists the `501`, `502` and `504` answers and the common causes of a `503`.
+- The phone-number pairing guide gives the Baileys pairing code window.
+- The API reference and the global search guide say that the built-in `match=word` `score` is lower for a better hit on SQLite (FTS5 bm25) and higher on PostgreSQL (`ts_rank`), and that on PostgreSQL the early stop of `match=contains` at its 1,000 newest matches needs version 13.
+- The SDK READMEs say a client timeout does not stop the gateway, what the base error class does not cover, and that webhook receivers should dedupe on `idempotencyKey`.
+
+### Security
+
+- Make the preview of a Baileys video send or video status through the gateway's bounded ffmpeg run, instead of letting Baileys run ffmpeg on the caller's bytes with no protocol or format whitelist, deadline or limit, which let a crafted video make ffmpeg connect to an address of the caller's choosing outside the SSRF guard; the video goes out without a preview when ffmpeg is missing or takes over 10 seconds.
+- Deliver an ingress request that carries its content in the query string of an empty body with `verified: false` on `hmac-sha256` and `standard-webhooks` routes, including a delivery recorded as verified by an earlier release that is retried or redriven, since no signature covers the query and one captured signature on an empty body vouched for any query.
+- Answer `400` to a `send-bulk` entry that is itself an array, which the chat fence and the 100-entry cap did not see.
+- Stop printing the first characters of an `API_MASTER_KEY` in the startup banner on every boot after the first.
+
+## [0.27.0] - 2026-10-31
+
+### Added
+
+- Add a session switcher to the dashboard Chats page that lists every session with its state, picture, push name and number, and lets only a ready one be selected. Thanks @rjsebening.
+- Add a contact info panel to the dashboard chat room with the contact's picture, name, number and copyable chat id. Thanks @rjsebening.
+- Add Today, Yesterday and date separators to the dashboard chat thread. Thanks @rjsebening.
+- Add `match=contains` to `GET /api/search`, which needs `SEARCH_CONTAINS_ENABLED=true`: case- and accent-insensitive substring search on a trigram index (FTS5 on SQLite, `pg_trgm` and `unaccent` on PostgreSQL) that ranks the 1,000 most recently stored matches, so `total` is at most 1,000 in this mode; `match=word` stays the default and the SDKs accept `match` (#1899). Thanks @luisffm.
+- Add the `MessageSearch` MCP tool, which runs the global message search for agents, with `match=contains` by default only when `SEARCH_CONTAINS_ENABLED=true` (#1899). Thanks @luisffm.
+- Add `PUT /api/sessions/{sessionId}/groups/{groupId}/member-label` to set this account's member label in a group on Baileys; whatsapp-web.js answers `501`, and `setMemberLabel` in all five SDKs (#1918). Thanks @xwork1 for the report.
+- Add `thumbnailUrl` and `thumbnailBase64` to `customLinkPreview` on Baileys for an image that renders the large preview card, at most 5 MiB, also in the typed SDKs (#1917). Thanks @lrissatto.
+- Add a warning log and a `phone_second_lid_reported` audit row, filed under the reporting session, when a session reports a privacy id the gateway did not hold, or held only outside its mapping cache, for a phone number the lid table already maps to another reported id.
+- Add a hint to the dashboard API Keys form that an `@lid` chat entry also admits the phone number mapped to it.
+
+### Changed
+
+- Redesign the dashboard Chats page in a WhatsApp Web style, full height without the page header, with its own light and dark palette, a patterned wallpaper behind the thread, coloured avatars, tailed bubbles and a single-pill composer; every existing chat feature stays (#1887). Thanks @rjsebening.
+- Show the dashboard Chats page's message search behind a toggle in the chat list header, still hidden for read-only keys. Thanks @rjsebening.
+- Show the raw chat id of a dashboard chat in its contact info panel instead of the room header. Thanks @rjsebening.
+- Show a dashboard chat message's time and delivery ticks inside its last line of text, with the delivery status still named for screen readers. Thanks @rjsebening.
+- Show dashboard chat list times as the clock today, Yesterday, the weekday within the last week and a short date before that. Thanks @rjsebening.
+- Move the dashboard sidebar's collapse button from the sidebar edge into its header, beside the logo or under it when collapsed, with a panel icon mirrored for right-to-left languages. Thanks @rjsebening.
+- Offer Clear chat and Delete chat in the dashboard on Baileys sessions too, now that the phone applies both (#1891).
+- Show each audit row's message under its action on the dashboard Logs page.
+
+### Fixed
+
+- List a whatsapp-web.js group from the metadata the page already holds when WhatsApp Web fails one of its own invariants while refreshing it, so one such group no longer turns `GET /api/sessions/{sessionId}/groups` and `/chats` into a permanent 500 (#1950). Thanks @Bhavikg27.
+- Index a Baileys clear, delete, archive or unread by the same chat jid as its message key, so the phone applies it (#1891). Thanks @rjsebening.
+- Key Baileys chat writes and read receipts to the gateway's newest stored message when the session holds none in memory (#1891). Thanks @rjsebening.
+- Send a Baileys archive or mark unread without a range for a chat the session knows but holds no message for, where it answered `success: false` (#1891). Thanks @rjsebening.
+- Group dashboard phone numbers in threes and fours, so `+49 157 333 4 4455` now reads `+49 157 3334 4455`; 10-digit numbers keep their shape (#1940).
+- Make the deleted-message and omitted-media labels in outgoing dashboard chat bubbles readable in dark mode.
+- Match the dashboard New chat search against contact numbers only when the query reads as a phone number, so a name with a digit no longer lists every contact whose number holds that digit.
+- Read the dashboard Chats page's session list again when the page is shown, so a session deleted elsewhere no longer stays open.
+- Draw group sender names in dashboard chat threads in colours that clear 4.5:1 on the incoming bubble in light and dark themes.
+- Draw links inside a quoted dashboard chat message in the chat link colours, which clear 4.5:1 on the quote in light and dark themes.
+- Draw the selection check in the dashboard New group list dark on its green fill, where white measured under 3:1.
+- Name the buttons that remove a staged file and close a reply above the dashboard chat composer for screen readers.
+- Announce the unread badges on dashboard chat list rows to screen readers, including the dot of a chat marked as unread.
+- Mark dashboard chat messages as tappable on touch screens, so iOS reveals their reply, react and delete actions on a tap as hover does with a mouse.
+- Fit the dashboard chat room's menu to the room's height, scrolling its entries, so a short window no longer cuts off the last ones.
+- Keep a member's name and number at the start edge of the dashboard group dialog in right-to-left languages, where a Latin name and every number sat at the left.
+- Name an unnamed dashboard chat by its formatted number on its list row, in its menu, dialogs and toasts and on the reply banner, instead of the bare digits of its id.
+- Close the connection of a refused `/events` handshake, or of a subscribe refused because its key is no longer valid, which stayed open with no namespace.
+- Name the refused API key in the audit row of a WebSocket refusal, and answer a key store that cannot be read with `INTERNAL_ERROR` instead of a refused key.
+- Show the caption of a Baileys photo, video or document, the text of a disappearing or view-once message, and the button label of a native-flow reply, in the chat list preview instead of a blank line, and the native-flow label and envelope text in `quotedMessage.body` of a message quoting it.
+- Keep a Baileys chat list preview from taking an edit or delete sent by someone other than the message's author; in a group a delete from any member still counts, as an admin may delete.
+- Report `message.ack` only for messages the account sent, so reading a received message on the phone no longer marks it read (both engines).
+- Answer `409` "nothing to unlink" for a logout of a Baileys session with no linked device, instead of a `502` that asked to retry.
+- Show a QR on the next start of a Baileys session whose pairing code was never entered.
+- End the wait for a Baileys pairing code nobody enters after 5 minutes and show a new QR.
+- Bound the Baileys group invite-code read and revoke at 30 s like the other group calls.
+- Answer `503` (not sent) for a Baileys send or status post cut off by a closed connection, instead of an opaque `500`, handing back its pacing admission and a keyed send's `Idempotency-Key`.
+- Free a keyed send's `Idempotency-Key` when it was refused before anything was sent: its media could not be fetched, its session was not ready or its WhatsApp Web page was reloading, or, on Baileys, its sticker or preview image could not be read, its recipient is not registered, its quoted or forwarded message is not stored or is stored under another chat, or its connection was replaced or stopped before the write, so the retry is sent instead of answering `409 IDEMPOTENCY_OUTCOME_UNKNOWN`.
+- List a Baileys chat again, with its unread count, when a message arrives in the same second as its deletion.
+- Keep a Baileys receipt from one chat off another chat's message with the same id.
+- Answer the engine error instead of `400` "not on WhatsApp" for a whatsapp-web.js send whose recipient lookup did not answer, without counting it toward the send breaker.
+- Recycle a whatsapp-web.js session whose page reloaded without re-injecting its helpers once it has gone 3 minutes that way, without recycling a slow reload that did re-inject.
+- Skip the whatsapp-web.js message-id backport of a `--best-effort` install on a read-only tree it never wrote to, instead of failing it.
+- Keep a session start or reconnect that lost its claim to another node from marking that node's session disconnected.
+- Link the number that scans the reconnect QR after WhatsApp unlinks a session, also when a reconnect was already pending, instead of logging it out and failing the session.
+- Say a session with reconnect disabled was marked failed when it drops.
+- Return `reconnectBaseDelay` as an integer from session config, so the Go and Java SDKs decode a value stored with a fraction before validation.
+- Run the graceful drain on one Ctrl+C or stop signal under npm or the Nest CLI, which delivered it twice and forced exit 130; a repeat 1 s or more later still forces the exit.
+- Write the env loader's boot lines at the configured `LOG_LEVEL` and format, after `.env` is read.
+- Name an unknown `LOG_FORMAT` at boot, with the format used instead.
+- Log a failed chmod of the generated env or bootstrap key file through the structured logger, at the configured `LOG_LEVEL` and after the env loader's first-run line, instead of a raw console line.
+- Boot through PgBouncer in session mode: the PostgreSQL statement timeout and a custom schema's search path are set after connect, as the time zone already was, instead of in the startup packet.
+- Back up only the configured non-public `POSTGRES_SCHEMA` with its search extensions, and pgcrypto when it lives in that schema, so a database shared with other applications no longer fails the backup or comes back with their schemas on restore.
+- Stream chat and status media downloads from the store instead of reading the whole file into memory.
+- Drop the `archived` marker of media that retention deletes under `MESSAGE_INLINE_MEDIA=archive`.
+- Stop holding every S3 key in memory during the chat-media orphan sweep.
+- Remove conversion temp directories a killed process left behind, at start.
+- Emit `message:persisted` again when an edit changes a stored message's text, so plugin search indexes see the edit.
+- Store the account JID as `from` of a message sent through the API, as on phone-sent ones; `from` filters also match rows stored with the bare number.
+- Stop listing a delivery failure of a deleted webhook as `replayable`.
+- Hand a plugin config saved while the plugin was starting to the running plugin.
+- Refuse a plugin config, activation, enable or disable change the plugin registry cannot store, instead of reporting it applied and losing it at the next restart.
+- Empty a plugin's registry entry before its uninstall, so an entry the registry could not drop no longer hands its config, secrets and enable decision to a reinstall of the id after a restart.
+- Refuse a plugin config, per-session config or activation change with `409` while an uninstall of that plugin is unloading it.
+- Publish the `limit` and `offset` query parameters of the list routes as integers in `openapi.json`.
+- Declare the `503` of `DELETE /api/sessions/{sessionId}` in the OpenAPI document.
+- Say in the API reference, the OpenAPI schema and the JavaScript SDK that a contact's or group participant's `number` for a `<lid>@lid` id can hold the lid's digits or an empty string rather than a phone number.
+- Java SDK: attach the Gson failure as the cause of the `OpenWAError` for a 2xx body it cannot read, now worded `Unexpected response body for <method> <path>` instead of `Non-JSON response`.
+- Keep nested dependency and build trees and a legacy `uploads/` directory out of the Docker build context.
+- Keep a Baileys chat deleted on the phone out of the chat list when a mute or pin sent through the API echoes back, until a new message re-creates it, and apply a disappearing-timer change made while it is deleted (#1949).
+- Keep a Baileys chat's disappearing timer from being set back by a history record or message older than the change, and keep two chats of a recycled number from reading or overwriting each other's timer.
+- Accept `PUT /api/sessions/{sessionId}/presence` on a newly linked Baileys session once its push name has synced, where it answered `409` until a restart.
+- Store a newly linked Baileys account's push name on its session once WhatsApp syncs it, instead of leaving it empty until the next reconnect.
+- End a Baileys media upload through a session proxy that stops answering, where a media send, status post or preview image waited for good.
+- Answer `409` (reloading) instead of `500` for whatsapp-web.js operations on a reloaded page the liveness probe found without its helpers, without counting them toward the send breaker.
+- Refuse a whatsapp-web.js mark read or unread, clear or delete chat, block or unblock, or channel mute with `409` when the session stops during its lookup, instead of sending it.
+- Keep an engine init timeout from marking a session disconnected on a row another node took over meanwhile.
+- Mark a session disconnected when its start or takeover adoption fails before an engine exists, instead of leaving the status a vanished node wrote.
+- Audit a WhatsApp unlink, send `session.disconnected` for it and clear the session's phone binding also when its session row cannot be read while a reconnect is armed or running or a read retry is pending.
+- Reconnect a session whose new engine drops while a retry of its replaced engine's failed session read is pending, instead of leaving it disconnected with no reconnect armed.
+- Refuse a status or chat media download on S3 storage with `503` and `Retry-After: 1` at once when 50 are already open; the dashboard retries it for archived chat media, status media and the download button of an omitted attachment.
+- Cut an S3 media download, file read or export entry whose store sends nothing for 30 s or whose reader takes nothing for 10 minutes, and an S3 listing page after 30 s, so a stalled store or a client that stopped reading no longer holds its download for good or stops the orphan sweeps until a restart.
+- Report a bulk voice note as type `voice` to the `message:sending` and `message:failed` plugin hooks, as its stored row and a single voice send are.
+- Refuse a group id with more than one `@` on the group picture and member-label routes with `400`.
+- Dispatch every ingress delivery carried only in its query string (a GET callback, a bodiless POST) without a dedup header, where all but the first were acknowledged and dropped.
+- Keep a built-in engine's `.env` settings in effect when the masked config `GET /api/plugins/{id}` returns is sent back to `PUT /api/plugins/{id}/config`.
+- Let `null` for a built-in engine key in `PUT /api/plugins/{id}/config` remove the stored override, so the key takes its `.env` value again, where the null was stored and hid `.env` on every boot.
+- List plugins when a plugin manifest declares a `configSchema` property as `null` or another non-object value, where `GET /api/plugins` answered `500` for every plugin.
+- Stop writing a lost-binding warning to the audit log for each instance of a global ingress plugin at every boot and on every create, change or delete of one.
+- Report a plugin package that fails boot validation as invalid, not as missing code with advice to reinstall it.
+- Refuse to boot with a `DATABASE_SYNCHRONIZE` other than `true` or `false`, which read as `false`.
+- Stop `restore.sh` before it writes anything when the `psql` on `PATH` cannot load the archive's PostgreSQL dump, and name the psql versions the load needs.
+- Stop a PostgreSQL 12 migration that needs `pgcrypto`, when it lives in a schema off the connection's `search_path`, with a message that names the schema and the `ALTER EXTENSION` that moves it, instead of `function gen_random_uuid() does not exist`.
+- PHP SDK: send the participant list of the group participant and membership-request methods as a JSON array when its keys have gaps (`array_unique`, `array_filter`), which the gateway refused with `400`.
+- PHP SDK: raise a `TransferException` for a response body cut before its `Content-Length` on Guzzle 7's stream handler, which returned a cut media download as the whole file.
+- Open the listed privacy-id chat when a saved contact is picked in the dashboard New chat panel, instead of an empty chat beside it.
+- Keep a dashboard draft with the chat it was typed in, so it no longer follows into another chat or session and gets sent there.
+- Open a dashboard search hit stored under another spelling of its chat id, at the message, and say when its chat could not be found in the list.
+- Open an inline image or sticker in the dashboard media viewer, also from the keyboard.
+- Redraw only the dashboard chat rows that change, so typing stays fast on accounts with many chats.
+- Refuse a phone number longer than 15 digits in the dashboard Number Checker, bulk recipients, webhook filters, Message Tester and group member field, such as two numbers typed on one line, which was looked up or sent as one number.
+- Fetch no dashboard preview for archived media that retention already deleted.
+- Name the dashboard's icon-only copy and chip remove buttons, expose webhook and filter tag states and plugin dialog tabs to screen readers, and keep webhook filter suggestions usable from the keyboard.
+- Show refused webhook test statuses and API key role names in the dashboard language.
+- Translate the API key role names and the S3 access and secret key labels of the Hebrew dashboard, the viewer role and S3 key labels of the Indonesian one and the S3 key labels of the Italian one, which showed in English.
+- List and preview legacy single-brace placeholders on the dashboard Templates page, as the gateway still fills them.
+- Keep dashboard message search results open when focus returns within a moment.
+- Show the gateway's reason when a dashboard unlink of a Baileys session with no linked device answers `409`.
+- Show a warning, until it is closed, on the dashboard Plugins page when an uninstall could not drop the plugin's registry entry.
+- Clear a dashboard pairing code once Baileys ends its unused five-minute wait and shows a new QR.
+- Retry a dashboard live-feed subscribe the gateway could not check or rate-limited, read again what it missed once it joins, and show the connection banner when it keeps failing.
+- Keep the dashboard media viewer on the image it opened when another image leaves the thread or a send it shows is confirmed, and closed once its own image is deleted.
+- Keep the dashboard message field focused through a send made with Enter or a focused Send button, so the next message can be typed at once.
+- Keep a dashboard dialog and its form open when Escape cancels the text an input method is composing.
+- Keep the dashboard from acting on the Enter that commits an input method composition in the New Session name, pairing phone, Number Checker, New chat search and webhook contact fields.
+- Let the keyboard reach the dashboard's plugin .zip chooser and the Import data backup chooser, which Tab skipped.
+- Name the dashboard plugin update chip by the version it shows, so voice control and screen readers get it too.
+- Address the reader as du in ten more German dashboard strings.
+- Name the dashboard sidebar theme and language buttons by the text they show and then their action, the Logs and Sessions filters by what they filter as well as the value shown, and the status composer's Text and Image toggle by its pressed state.
+- Say why a dashboard webhook filter number longer than 15 digits is not added.
+- Close the dashboard webhook filter popover on Escape, and keep it open while the pointer moves onto it.
+
+### Dependencies
+
+- Update Chrome for Testing in the amd64 image from 156.0.8078.47 to 156.0.8078.80; the arm64 image keeps Debian's chromium package.
+
+### Upgrade notes (behavior changes)
+
+- A Baileys logout of a session with no linked device answers `409` instead of `502`.
+- A Baileys send or status post cut off by a closed connection answers `503` where it answered `500`; a keyed send frees its `Idempotency-Key`, so a retry with the same key is accepted and sent, where the key stayed held.
+- A keyed send refused before anything was sent frees its `Idempotency-Key`: its media could not be fetched, its session was not ready (`409`, both engines) or its WhatsApp Web page was reloading, or, on Baileys, its sticker or preview image could not be read, its recipient is not registered, its quoted or forwarded message is not stored or is stored under another chat, or its connection was replaced or stopped before the write; a retry with the same key is sent where it answered `409 IDEMPOTENCY_OUTCOME_UNKNOWN`.
+- A whatsapp-web.js send whose recipient lookup does not answer answers `500` (`ENGINE_PAGE_ERROR`), or `409` when a page reload cut the lookup short, instead of `400`.
+- A plugin change the plugin registry cannot store answers `success: false` (config, per-session config, enable, disable) or `500` (`PUT /plugins/{id}/sessions`, and an uninstall, which then leaves the plugin running) where it answered success.
+- The `/events` gateway answers `INTERNAL_ERROR` when it cannot read the key store, where it answered `UNAUTHORIZED` and audited a failed key; a subscribe answered so joins nothing and keeps the socket, so send it again, and a handshake still disconnects.
+- A backup of a non-public `POSTGRES_SCHEMA` holds only that schema and needs pg_dump 14 or newer; restore it with the load `restore.sh` prints. Archives made earlier restore as before.
+- A message sent through the API stores `from` as `<phone>@c.us` instead of the bare number; rows stored earlier keep their value and `from` filters match both.
+- Dashboard number fields refuse an entry of more than 15 digits, which they looked up or sent as one number; the bulk recipients list leaves such a line out.
+- On Baileys, `GET /api/sessions/{sessionId}/qr` answers `400` from 60 s after a pairing-code request until the new QR, where it served the QR from before the request, which could no longer link.
+- `message.ack` webhooks and socket events, and the plugin `message:ack` hook, no longer fire for a received message, and reading one on the phone no longer moves its stored status to `read`.
+- An uninstall that fails part-way (`400`) leaves the plugin installed but disabled, with its config, session activation and enable decision cleared, where it kept them; it is audited as `plugin_uninstalled` with `partial: true`.
+- `message:persisted` fires again, with the same `id`, when an edit changes a stored message's text; upsert by `id`.
+- A second stop signal within 1 s of the first is ignored as the same stop; send it 1 s or more later to force exit 130.
+- Chat and status media downloads are streamed: `Content-Length` is sent only when the store reports a size, and a store failure after the first byte aborts the connection instead of answering `500`.
+- A Baileys chat deleted on the phone or through the API stays out of `GET /chats` until a new message re-creates it, also one re-created during the reconnect that synced the deletion; `chat_states` gains a `deletedAt` column.
+- Rolling back to 0.26.0 with the database kept lists every Baileys chat deleted since the upgrade again; with the app stopped, run `npm run migration:revert:prod` once in the new image before the swap, or restore the pre-upgrade backup.
+- `restore.sh` exits `1` before it writes anything when the archive's PostgreSQL dump opens with `\restrict` and the `psql` on `PATH` is older than 13.22, 14.19, 15.14, 16.10 or 17.6 (or any 12), which cannot load it.
+- `DATABASE_SYNCHRONIZE=True`, `TRUE`, `1` or `yes` now refuses to boot, where it read as `false`; set `true` or `false`.
+- On S3 storage, a status or chat media download answers `503` with `Retry-After: 1` while 50 others are still being read, where 0.26.0, which read each file whole before sending it, queued it; a download whose store sends nothing for 30 s, or whose client takes nothing for 10 minutes, is cut.
+- On Baileys, a send addressed only to a phone number the gateway maps to more than one lid carries no disappearing timer, where it carried the timer of one of those chats.
+- On the built-in engines (`whatsapp-web.js`, `baileys`), `null` for a top-level key in `PUT /api/plugins/{id}/config` removes the stored key, so it takes its `.env` value again, where the null was stored over `.env`; a running session keeps its launch options until it restarts. A registry that froze the engine settings by sending back the masked config is repaired by sending those keys as `null`.
+- whatsapp-web.js operations on a reloaded page the probe found without its helpers, and chat, contact and channel writes whose session stops during their lookup, answer `409` where they answered `500`, `503` or succeeded.
+- A whatsapp-web.js re-inject that fails after a page reload is logged as a `page_reinject_failed` warning naming the session and no longer counts in `openwa_unhandled_rejections_total`.
+- An ingress delivery carried only in its query string with no dedup header gets a new delivery id, so one its provider retries across the upgrade is dispatched once more.
+- The `message:sending` and `message:failed` plugin hooks report a bulk voice note as `voice`, where they said `audio`.
+
+### Security
+
+- Pin the bundled Compose `docker-socket-proxy` image by digest as well as tag.
+
+## [0.26.0] - 2026-10-28
+
+### Added
+
+- Report poll votes as a `poll.vote` webhook and WebSocket event on whatsapp-web.js: the poll, chat, voter, the option texts now selected (`[]` when the vote is cleared), the poll question when WhatsApp Web still holds the poll, and the time of the change in seconds and in milliseconds (`timestampMs`, which orders a voter's changes within one second); the JavaScript, Python, Go and Java SDKs list the event name from SDK 0.7.0 ([#1922](https://github.com/rmyndharis/OpenWA/pull/1922)). Thanks @laviniarochaprec.
+- Add Number Checker page in dashboard for single and bulk WhatsApp recipient pre-validation, in every dashboard language (#1865). Thanks @Purushotham-Prajapati-24.
+- Add the opt-in `message.receipt` event for per-recipient group and status receipts on Baileys, sent to the webhooks and `/events` subscribers that name it (#1748); the JavaScript, Python, Go and Java SDKs list the event name from SDK 0.7.0. Receipts are bounded per webhook: a quarter of `WEBHOOK_DISPATCH_CONCURRENCY` deliveries run at once, shared by a session's receipt webhooks, three quarters of `WEBHOOK_DISPATCH_MAX_QUEUED` events wait for each, and further receipts are dropped and counted in `openwa_webhook_delivery_failures_total`. Thanks @KGMA74, and @berodcdev for the request.
+- Record plugin install, update, uninstall, enable, disable, configuration and session activation changes in the audit log.
+- Add `QUEUE_PREFIX` to set the Redis key prefix of the BullMQ queues, so deployments that share a Redis stop taking each other's webhook and ingress jobs; it covers the queues only, not the rate-limit store or the WebSocket fan-out, and a value that is not 1 to 64 letters, digits, dots, underscores or hyphens starting with a letter or digit fails the boot.
+- Add All, Unread, 1:1, Groups and Unknown quick filters to the dashboard chat list. Thanks @rjsebening.
+- Add a New chat panel to the dashboard Chats page that opens a chat with a saved contact or a number WhatsApp confirms, and on Baileys creates a group. Thanks @rjsebening.
+- Add chat and contact menus to the dashboard Chats page: pin, mute, archive, mark unread, save, rename and block a contact, leave a group, and clear or delete a chat on whatsapp-web.js only until #1891 is fixed. Thanks @rjsebening.
+- Add an Archived view to the dashboard chat list; archived chats no longer appear in the main list unless searched, and pinned chats lead it. Thanks @rjsebening.
+- Add a group info dialog to the dashboard Chats page that edits a group and manages its participants. Thanks @rjsebening.
+
+### Changed
+
+- Upgrade Puppeteer to 25.16.0 with Zod 4, preserving whatsapp-web.js browser teardown.
+- Update fast-uri to 3.1.9 and ip-address to 10.7.4.
+- Update dashboard validation tooling to Zod 4.6.7.
+- Support Guzzle 8 in the PHP SDK while retaining Guzzle 7 compatibility, from PHP SDK 0.7.0 (#1870).
+- Reject empty PHP SDK `defaultHeaders` lists before sending requests, from PHP SDK 0.7.0; use `''` for an empty header value (#1870).
+- Convert legacy message types in a one-time migration instead of on every boot, which read the whole messages table before the HTTP port opened.
+- Open the HTTP port after at most 60 s of plugin restore; plugins still restoring finish in the background.
+- Apply the hooks of a plugin still restoring only once it is up, and answer 409 to enabling, disabling, updating, uninstalling or reinstalling it until then.
+- Track a plugin's storage use as a running total instead of rescanning every stored key on each write.
+- Request only the profile pictures the dashboard chat list does not hold yet, and keep the current ones on screen while the rest load.
+- Remove the unused `STORAGE_LIST_MAX_FILES` setting; a leftover value is ignored instead of validated at boot.
+- Remove the `INFO` permission from the bundled Docker socket proxy; nothing used it, and `GET /info` through the proxy is now refused.
+- Drop the `archiver` dependency; the storage export writes its tar.gz with `tar-stream` and `zlib`.
+- Remove a stored plugin secret when a config write sends `null` for it, where `null` used to keep it; an empty string still keeps it.
+- Send `null` for a cleared secret field in the plugin config form of the dashboard, which removes the stored secret.
+- Reuse the participant list of a Baileys group for up to 5 minutes (`BAILEYS_GROUP_METADATA_CACHE_TTL_MS`, `0` queries for every send) instead of querying it for every group message.
+- Close a `/events` WebSocket connection that sends a client frame over 8 KiB, where Socket.IO's default allowed 1 MB; the subscribe frames of the dashboard and the SDKs are under 1 KB.
+- Cut an inbound poll to 32 options and 1024 characters per option and for the question, far above WhatsApp's own limits, so a malformed poll cannot bloat stored rows, webhooks or socket frames.
+- Refuse a JSON boolean or object in a string field of a request body with 400; they used to be converted to text, so `{"text":{"a":1}}` sent the customer `[object Object]`. A JSON number is still converted.
+- Refuse an array where a request body expects an object (bulk options, `customLinkPreview`, bulk item content and media, infrastructure config sections, status media sources) and an object where it expects a list with 400; they were stored as defaults or as an empty list.
+- Refuse a request body nested more than 100 levels deep with 400; a body a few thousand levels deep used to answer 500 with a stack trace in the error log.
+- Refuse a `muteUntil` above 9007199254740991 on `POST /api/sessions/{sessionId}/chats/mute` with 400; larger values are not exact integers, and from 2^63 they wrapped the Baileys int64.
+- Mark the fields the gateway always sends as required in the JavaScript, Python and Go SDK response types and drop the `null` it never sends; `ParticipantsResult` no longer extends `SuccessResult` in the JavaScript and Python SDKs, and the key validation `role` is typed `admin`, `operator` or `viewer` in the JavaScript and Python SDKs, from SDK 0.7.0.
+- Hold the dashboard automatic mark-as-read while the browser tab is hidden and send it when the tab is visible again.
+- Acknowledge, when the dashboard opens a chat on Baileys, up to the 100 newest loaded incoming messages it has not acknowledged yet, where it acknowledged only the newest.
+- Add `builtInSet` to the `database`, `redis` and `storage` sections of `GET /api/infra/config`, true when the saved configuration states the built-in mode; a host pinned by the environment now decides `builtIn`.
+- List `message.receipt` among the webhook events of the Webhooks page and say in the description of `*` that it does not deliver `message.receipt`.
+- List in `envPinned` of `GET /api/infra/status` any of the 31 settings a save of the Infrastructure page writes that the environment pins, where 0.25.0 listed eight, and report the storage `endpoint` there in S3 mode; the page names each pinned setting beside its field and its restart warning follows the pinned value.
+- Add `running` to the `database`, `redis` and `storage` sections of `GET /api/infra/status`, true while a bundled container OpenWA created runs and this instance's built-in flag is set, whether or not the service uses it, and false for one Docker Compose created; it is absent while Docker is unreachable.
+- Accept a `database` or `storage` section without `type` on `PUT /api/infra/config`, keeping the stored type.
+- Serve every page after the first of `GET /api/sessions/{sessionId}/chats` and `GET /api/sessions/{sessionId}/contacts` from the list the engine returned within the last 5 s, so walking a large account costs one engine read instead of one per page.
+- Name the Go SDK status font constants after the WhatsApp protocol (`StatusFontSystemText`, `StatusFontFBScript`, `StatusFontMorningBreezeRegular`, `StatusFontCalistogaRegular`, `StatusFontExo2ExtraBold`, `StatusFontCourierPrimeBold`), from Go SDK 0.7.0; the old names, which did not match the font each id selects, stay as deprecated aliases.
+- Refuse to start with `REDIS_TLS=true` or a `REDIS_USERNAME` other than `default` beside the built-in Redis, which serves plain TCP and only its default user, where every Redis connection failed; the Infrastructure page refuses to save that combination.
+- Log an error at start for `STORAGE_TYPE=s3` with an `S3_ENDPOINT` that is not an absolute `http://` or `https://` URL, where every S3 call failed and media went to local disk, and refuse a save from the Infrastructure page that changes it or newly selects S3 beside it.
+
+### Fixed
+
+- Update multer to 2.5.0 and undici to 8.12.3 to prevent request teardown and response decoding failures.
+- Patch npm's bundled Undici to 6.29.1 in the production image and JavaScript SDK publishing toolchain.
+- Keep deleted sessions free of late message, status and bulk writes, and of the `message:failed` event of a bulk item whose session was deleted before it was sent.
+- Retain sending limits while hooks or preparation are pending, including across UTC midnight.
+- Preserve whatsapp-web.js readiness when an earlier QR render completes.
+- Cancel stale Message Tester actions after logout, key changes or leaving the page.
+- Load every page of the chat list in the dashboard; an account with more than 1000 chats saw only the first 1000.
+- Cut a long chat name in the dashboard on the side its own script ends, so a Latin name on an Arabic or Hebrew page no longer loses its first letters.
+- Shorten the id of an unnamed group on the dashboard Top chats chart to its first and last digits, and fit the Number Checker phone placeholder in every language.
+- Keep the dashboard charts left to right on right to left pages, where the Top chats labels were drawn across their bars.
+- Bound Redis cache commands and discard expired operations during reconnect.
+- Read the top chats of `GET /api/stats/messages` on SQLite through the `createdAt` index, where it scanned the whole messages table (3 s over 59,000 messages for a one-day window, with every request waiting), and skip the row lookup for group messages in the top chats of `GET /api/stats/sessions/{sessionId}`.
+- Preserve literal request values in custom ingress acknowledgments.
+- Honor inclusive millisecond lower bounds in built-in search.
+- Stop the dashboard from asking Baileys for live chat history on every chat it opens; Baileys answers 501 to it, which logged a failed request each time.
+- Preserve replacement plugin search providers during worker recovery.
+- Answer 409 instead of a bare 500 when WhatsApp Web reloads its page under a running whatsapp-web.js read, and no longer report a group, contact, label or invite lookup cut short that way as not found (404); accepting an invite answers 503 because the join may have landed.
+- Answer 409 naming the path and the cause on `GET /api/infra/storage/files/count` and `/export` when the local storage directory holds a symbolic link, a directory the app cannot read or one nested 20 levels deep, instead of silently leaving those files out of the count and the archive.
+- Normalize CRLF line endings in SDK contract parsers so Windows checkouts do not produce false contract mismatches (#1885). Thanks @Purushotham-Prajapati-24.
+- Exclude local repository metadata from Java SDK Maven Central bundles built with Maven 3.10 (#1879).
+- Bound a silent Redis connection in the rate-limit store with a socket timeout, so only the first request waits out a timeout.
+- Delete a session's messages, webhook outbox events and webhook delivery failures in batches, with a new index on outbox events by session, so removing a session with a large history does not hold the database in one statement.
+- Answer 503 instead of 500 when WhatsApp answers a Baileys message send, reaction, edit, delete, pin or status post with a throttle (429) or timeout (408) code, and free the idempotency key of a throttled send.
+- Match a built-in search chat or sender filter against every stored form of the id (`@c.us`, `@s.whatsapp.net`, lid), and a group message's author for the sender.
+- Probe a whatsapp-web.js session that awaits operator action, so the watchdog tells a live page from a dead one.
+- Answer 409 instead of 500 or 503 for a whatsapp-web.js send, status post, profile, group, label, mute or pin request that races a session teardown.
+- Reload the dashboard chat list at most once at a time per session when live events arrive in a burst.
+- Keep storage export entry names identical to the stored keys; a backslash, a doubled slash or a leading `name:` segment used to rewrite them.
+- Leave S3 folder placeholders (keys ending in `/`) out of the storage export.
+- Keep the chat media and status media orphan sweeps from overlapping when a pass outlasts its interval.
+- Answer 400 for a media conversion `url` that is not an absolute http(s) address instead of the blocked-address message; the answer names `url` outside production or with `VALIDATION_ERROR_DETAIL=true`.
+- Stop an automation rule edit from undoing an overlapping edit or bringing back a rule deleted meanwhile.
+- Make one direct attempt per further stranded webhook outbox row once its receiver has failed in the same sweep, so an unreachable receiver does not hold the sweep for a full retry schedule per row.
+- Keep a session start that worked when the database fails a read after the engine came up, which made the retry answer "already started".
+- Answer a session delete normally when handing back its claim fails after the delete committed.
+- Clear a logged-out session's phone before the status write, so a failed write cannot leave it in the boot auto-start query.
+- Log a failed wipe of the stored messages and chat states when a Baileys session is unlinked.
+- Answer the number check with the phone id (`<phone>@c.us`) on whatsapp-web.js for a contact migrated to LID addressing, as Baileys does.
+- Read a list of lid allowlist entries from the database in one query instead of one per unseen entry first.
+- Keep a plugin hook handler that outlives the hook timeout inside the re-entrancy guard, so its late sends no longer re-fire the event and dispatch the handler again.
+- Complete a data import on PostgreSQL when clearing a large messages table outlasts the statement timeout.
+- Create the built-in PostgreSQL container with the saved `DATABASE_PASSWORD`, so a custom password saved with the built-in database no longer fails the next boot; a data volume that already exists keeps the role password it was created with.
+- Serialize a plugin upload with an uninstall or update of the same plugin id.
+- Show hours for a session active within the last day on the Sessions page, as the Dashboard does.
+- List a whatsapp-web.js contact held under both its LID and its phone once in the contacts and blocked lists, and give it the phone as `number` in the contacts list and by id, where the first copy carried the LID digits.
+- Clear both entries when unblocking a whatsapp-web.js contact blocked under its phone number and its LID; it stayed in the blocked list after a successful unblock.
+- Show a localized edited indicator in Chats for observed edits before or after storage, including after reload; deleted messages retain their placeholder (#1905). Thanks @yederlv.
+- Store messages delivered already deleted as empty tombstones and clear earlier history and search content; suppress repeated content in hooks and events when a stored tombstone can be read.
+- Answer 409 to a start of a session whose delete is still running; it started an engine that stayed registered for the deleted session.
+- Preserve a pending session delete's lease fields when another stop arrives.
+- Stop an older delete before its next removal transaction after ownership changes; a failed claim write answers 503 without removing data.
+- Keep a session create, a session delete and a plugin instance delete on SQLite out of another request's open transaction, whose rollback could undo a write already answered as done and bring a deleted session back after a `204`; each waits up to 10 s for that transaction to end.
+- Stop two session creates or plugin instance deletes at the same moment on SQLite from leaving every later data import refused with `409` until a restart.
+- Save a webhook or automation rule without a transaction, so on SQLite one that fails because its session was just deleted no longer undoes the writes other requests made meanwhile.
+- Preserve pending start retries when a session delete is refused before removal, while retaining independent operator stops.
+- Prevent in-flight session starts and expired-owner renewals from undoing an accepted stop.
+- Prevent overlapping session reconnects from leaking engines or retiring their replacements.
+- Commit successful expired-owner batch cleanup with the ownership transition, so delayed cleanup cannot fail a later owner's new batches.
+- Remove the auth directories a deleted session's name keyed before 0.23.5 on PostgreSQL too; a failed id lookup left the old WhatsApp login on the volume.
+- List a Baileys contact blocked under both its LID and its phone once in the blocked list, as whatsapp-web.js does.
+- Hold a queued ingress delivery and a reconciler replay for a plugin still restoring after startup without spending a retry attempt, instead of dead-lettering it; held deliveries wake together, which keeps their order apart from the limits docs/25 states.
+- Answer 400 for a `GET /api/search` `dateFrom` or `dateTo` outside the safe integer range and publish that range in the schema; on PostgreSQL a value past about 9.2e21 answered 500.
+- Answer an empty page instead of 500 for a list `offset` of 2^63 or more on the audit, session, webhook, delivery failure and message lists.
+- Stop a Redis that stops answering or answers slowly from making the WebSocket publish client hold every event in memory: a connection silent for 10 s is dropped, events raised while it is down and during its reconnect backoff of up to 5 s are dropped for clients on other replicas instead of replayed late, and a slow Redis is held to about 12,000 unanswered events plus roughly 2 s of traffic.
+- Ping the Redis subscriber connection of the multi-replica WebSocket fan-out every 15 s and replace it after 30 s without an answer, so a connection a proxy holds open after Redis stopped answering costs other replicas' events for about 45 s at most instead of until it closes.
+- Count in `GET /api/infra/storage/files/count` only the keys the export carries, leaving out S3 folder placeholders and unsafe keys.
+- Fall back to the 5000 ms default for a negative `SIMULATE_TYPING_MAX_MS`, which cut the typing pause to about 1 ms.
+- Never fail a log call on metadata that holds a circular reference, a BigInt or a throwing getter, and redact secret-named keys at any depth instead of the first five levels, including on an object with its own `toJSON`.
+- Bound the copy of log metadata: below the fifth level at most 1000 more objects and arrays are written and an array or object that does not fit what is left of that budget is written as `[Truncated]`; an array, Map or Set of more than 1,000,000 entries is `[Truncated]` at any level.
+- Bound one copy of log metadata to 2,000,000 entries (object keys and array lengths, three to a Map's pair) and 2^26 characters (string values, key names and BigInt text, a digit counted sixteen times), a shared value counted at every use, and write what does not fit as `[Truncated]`; a few references to one large value expanded into a copy or a line of unbounded size.
+- Write an Error in log metadata as its name, message and stack, a Date as its ISO text, a boxed string, number or boolean as its value, a Map or Set as an array of its entries and a Buffer or typed array as its type and length; they were written as `{}` or one field per byte or character.
+- Redact credentials at any depth in the Baileys wire log (`BAILEYS_LOG_LEVEL`) and copy nested errors before they are written.
+- Leave functions out of log lines; a function with its own `toJSON` used to be written.
+- Write a plugin log call whose meta is a string, array, boxed string, typed array, Map, Date, Error or class instance as one `meta` field instead of one field per character or index.
+- Measure the log metadata of a sandboxed plugin as the logger writes it, a credential value as `[REDACTED]` included, and replace one that exceeds 8192 values and characters by the size marker without building its text first, so it can no longer pass the cap and a large or heavily shared object no longer blocks the host.
+- Relay a non-string log message of a sandboxed plugin as `[non-string log message]`.
+- Stop `ctx.logger.error` called without an error from writing the trace `undefined`.
+- Stop an in-process plugin's `ctx.logger` call from throwing on a message, error or meta it cannot read, such as a Symbol, a revoked Proxy or a throwing `toString`; the line is written with `[Unprintable]` or `[Unreadable]` in its place.
+- Apply a delete for everyone, an edit or a reaction that reaches a whatsapp-web.js message on SQLite while its contact or media is still being fetched, instead of hooking, storing and announcing the message with its deleted or unedited content.
+- Store a Baileys reaction to a message that is still downloading its media with the message on SQLite, as on PostgreSQL, and announce it and an edit of the same window once the gateway has the message.
+- Keep Baileys chat pin, mute and archive state from reverting, or coming back for a deleted or unlinked chat, or reading as defaults for a lid-addressed contact, when a restore, a session start or a chat-list read overlaps a change; a change written under a contact's lid while its state is merged onto the phone number, or in the same millisecond as the phone entry, is no longer lost.
+- Refuse a chat id that is not in the form `localpart@host` in the MCP tools `SessionSubscribePresence`, `SessionMarkChatRead`, `SessionMarkChatUnread` and `SessionSendChatState`, as their REST routes do.
+- Send the method of a raw `client.Do` (Go) or `client.request` (JavaScript) call in upper case, so a lowercase verb no longer reaches the gateway as `patch` and answers 400, from SDK 0.7.0.
+- Refuse every spelling of `/` (`//`, `/.`, `/..`, a link to `/`, `<link to />/..`) for `OPENWA_DATA_DIR`, the state directories, `MAIN_DATABASE_NAME`, `DATABASE_NAME` and `BOOTSTRAP_KEY_FILE` in `scripts/restore.sh`, and resolve `..` after a symlink as the kernel does; run as root, its safety snapshot could copy the filesystem into itself.
+- Describe the 400 of `POST /api/sessions/{id}/messages/react` and `/delete` as `Session not active or invalid request` in the OpenAPI schema; a missing message answers 404.
+- Keep the Infrastructure page from reverting a database, Redis, queue or storage switch that was saved and awaits a restart, and from deleting the stored credentials of the backend it switched away from, on the next save.
+- Seed the Use Built-in toggles of the Infrastructure page from the saved configuration, add a pending-restart note per card and warn in the restart dialog for a switch between a bundled and an external service or to another S3 bucket or endpoint; settings typed beside a switch awaiting a restart were discarded on save.
+- Stop a save of the Infrastructure page from writing an untouched database type, storage type or Redis switch that the environment pins over the stored choice.
+- Treat a host that reaches a bundled container by its container name, another letter case or a trailing dot as that container in `GET /api/infra/status` and on the Infrastructure page, whose Use Built-in toggles, notes and switch warnings follow it.
+- Preserve saved bundled database and S3 connection details beneath host pins, including PostgreSQL TLS when the built-in choice is omitted.
+- Disable PostgreSQL TLS when an Infrastructure save selects the bundled database for the next boot.
+- Keep saved PostgreSQL and S3 credentials with their selected service host; inactive SQLite and local-storage settings no longer seed a newly selected service.
+- Clear supported legacy S3 credential aliases when switching to local storage.
+- Start a built-in container at boot only for a datastore in use whose host the environment does not pin elsewhere; a restart from the Infrastructure page, whose dialog names each container it stops, stops the built-in Redis when Redis is switched off and neither the queue nor the cache uses it, and a container the dashboard created whose host the environment now pins to another server. A leftover flag started a container nothing used.
+- Allow saving the Infrastructure page with the PostgreSQL pool size field emptied, which sent null and answered 400.
+- Allow saving a plugin config whose secret field declares a pattern, which the stored mask failed.
+- Stop the Webhooks and Templates pages from sending operator-only reads with a viewer key.
+- Stop the Sessions and Plugins pages from showing "No sessions found" or "No plugins installed" under the error banner when the first list read failed.
+- Keep the dashboard chat thread where the reader is: reopen a chat left at the bottom at its newest message, keep a saved position while images decode, scroll to new messages the account sent elsewhere, and key the saved position by session and chat.
+- Keep a dashboard chat reader on their message when several images above it decode at once, when images decode above it while older messages load, and when they open another chat and come back while those messages load or after they arrived.
+- Scroll a message sent while its chat or an older page is still loading into view, keep a reader at the bottom of the chat when an image decodes as their sent message is confirmed, and open a chat at its own saved position when an image of the previous chat was still decoding.
+- Keep keyboard focus on the Copy button after a copy where the Clipboard API is missing (plain HTTP), on the API keys, webhooks, templates, plugins and Infrastructure pages.
+- Fix the dashboard layout on phones, short and half-screen windows: the Dashboard sessions table, Sessions cards, login screen, API key names, install dialog header, webhook filter rows and popover, Infrastructure, Plugins and Templates columns, page headers, Infrastructure card titles and the Chats search scope in longer languages, the Plugins rail and its config dialog's tab strip, the Templates session select, the closed navigation drawer's edge, the language menu, icons at larger text sizes and the page height under a phone browser toolbar.
+- Improve dashboard keyboard focus, text contrast and right-to-left layouts, and honor reduced motion.
+- Stop the Message Tester multi-group send when the session is not running or the gateway cannot be reached, instead of recording one failure per remaining group.
+- Read phone numbers typed in native digits in the Message Tester, bulk list, webhook filter, pairing field, the chat, channel and status searches, the status recipient search and the chat access list of an API key.
+- Keep the database, Redis and S3 secret fields of the Infrastructure page from being filled by a browser's password manager with the saved dashboard key.
+- Keep an error toast above an open image in Chats; it was painted under the lightbox backdrop.
+- Style the Instances tab of the Plugins page: its action buttons, the delete dialog and rows that wrap.
+- Colour the status pill of the session details dialog for every session status.
+- Fix the phone navigation drawer: it no longer shows icons only after the sidebar was collapsed on a wider window or covers its close button, it closes with Escape and leaves the tab order while closed, and its menu button announces Close and its expanded state.
+- Keep icons from shrinking in flex rows at a larger browser text size.
+- Release the database connection of a data import on PostgreSQL when its transaction cannot begin.
+- Answer 400 instead of 500 for a template or bulk variable that has no text form.
+- Report as `message.ack` a delivery or read of a one-to-one message the account sent, or a server rejection, that Baileys folds into the message's own upsert when the two land within about 100 ms of each other; it was dropped and left the message at `sent`.
+- Send the stored author as the sender of a Baileys group read receipt for a message the engine no longer holds, and leave out an id with no known author; such a receipt carried no sender and still answered `success: true`.
+- Read a Baileys inbound poll sent under the `pollCreationMessageV4` or `pollCreationMessageV5` content key as a poll with its question and options instead of an empty unknown message.
+- Stop whatsapp-web.js from announcing `message.edited` and overwriting the stored caption when WhatsApp Web only replaces a media thumbnail or a location preview.
+- Retry a whatsapp-web.js profile picture asked for by phone id under the contact's LID when the phone form answers nothing or fails, for a contact WhatsApp keys by LID.
+- Stop a session that cannot see a contact's number from erasing the number another session stored for that contact's lid, so a key restricted to that number keeps the chat; the number is cleared by the session that stored it, or by any session once that one is deleted, logged out or unlinked.
+- Retry failed LID mapping writes on fresh observations without replaying cached answers as new reports (#1058).
+- Keep LID lookup expiry independent of system clock changes.
+- Refresh cached missing LID numbers on the first message after five minutes.
+- Use shared reported LID mappings consistently for single-chat and chat-list access checks, and withhold stale local aliases after a failed identity change.
+- Preserve LIDs as message and listing IDs, with display phone numbers separate.
+- Require an engine-reported LID/phone pair for alias matching in routing, filters and message changes; distinct LIDs remain separate.
+- Wait for the message writes still in flight for the sessions a data import removes, so no message row is left for a removed session; an import that does not commit fails the unfinished bulk batches of those sessions.
+- Name each font in the dashboard status composer (System, System text, Script, Bold, Morning Breeze, Calistoga, Exo 2, Courier Prime) instead of its number, offer only ids 0 to 7 on whatsapp-web.js, which posts 8 to 10 in the default font, and draw a received status with font 1 in the system face instead of a serif one.
+- Throw `OpenWATimeoutException` from the PHP SDK on a host without ext-curl when the gateway stays silent past `timeout`, instead of a Guzzle exception, from PHP SDK 0.7.0.
+- Keep a reopened proxy editor open on the Sessions page when an earlier save of the same session answers late.
+- Keep a template draft and a newer delete confirmation on the Templates page when an earlier delete answers late.
+- Keep a new-session draft on the Sessions page when an earlier create answers late.
+- Keep a pasted phone number whole in the pairing field of the Sessions page; a native 15-character cap cut "+62 812-3456-7890" and could request a code for the wrong account. A paste with more than 15 digits, or with text other than digits, a plus and phone separators, is refused with the field error instead of requesting a code.
+- Keep Shift+Tab inside a dashboard dialog when focus is on the dialog itself.
+- Announce a refused sign-in and a failed first load of the Dashboard to screen readers.
+- Count the sessions on the Dashboard from the session list while the statistics are unavailable, where the overview read "Showing 3 of 0 sessions" and the Connected Sessions card read 0.
+- Show a failed session read on the Chats page with a Retry button instead of "No connected sessions".
+- Keep a banner with a Retry button on the Chats page when the chat list cannot be read, instead of "No chats".
+- Fix a slow API key save closing the editor of another key opened meanwhile.
+- Fix a single number check answering after sign-out, a key change or leaving the page.
+- Name a pinned `REDIS_TLS` or `REDIS_USERNAME` on the Redis card of the Infrastructure page.
+- List in the restart dialog the bundled containers a disabled datastore leaves behind when its host is pinned to the bundled name.
+- Fix the Number Checker joining a tab-separated index column into the number.
+- Fix the Plugins page showing install state from an older catalog read.
+- Stop a bulk number check at the first 403 instead of failing every number.
+- Fix the restart dialog staying on the waiting screen when the readiness request never answers.
+- Fix an old QR reply replacing a newer code or closing a reopened pairing dialog.
+- Fix the reading position jumping after a chat switch while images were still loading.
+- Fix quoted chat ids in an uploaded recipients CSV being dropped from a bulk send.
+- Retry a hung readiness check during a restart and report a restart request that never answers within five minutes as outcome unknown.
+- Check the plugin instance secret in the dashboard against the 16 to 512 character bounds of the API, counting characters rather than UTF-16 units.
+- Fix a backup restore continuing under a different API key after sign-out.
+- Show the Portuguese dashboard to browsers set to European or generic Portuguese.
+- Remove the hidden field of the clipboard fallback and return focus when copying throws.
+- Keep Tab inside a dialog that has no focusable control, such as the restart progress view.
+- Rebuild the SQLite message search index when it no longer matches `messages`, so a search stops returning other messages.
+- Bound the PostgreSQL UTC session setup with the connection timeout, so a database that accepts a connection and then stalls fails the connection instead of hanging the boot.
+- Keep chat mute, archive and pin state with its session when the re-key migration meets a session named after another session's id.
+- Fix Baileys chat mute, pin and archive state being lost after a failed database write.
+- Fix a Baileys contact lookup answering with a contact of another identity kind that shares the same digits.
+- Fix Baileys replies carried by contact cards, polls, live locations and orders, and history messages, losing their quoted message and mentions.
+- Fix the Baileys chat list previewing the first of two messages sent in the same second.
+- Fix Baileys call outcomes being lost or misreported when a call ended while its rejection was pending.
+- Stop a Baileys session stopped or deleted while the library loads from creating its auth directory again.
+- Keep phone and LID identities apart when Baileys finds the account's own row in a group, so a member whose LID digits read like the account's number no longer decides `isAdmin` and `isReadOnly`.
+- Fix two label changes to one chat made at the same time undoing each other on whatsapp-web.js.
+- Fix a page reload during a liveness probe closing the reload grace window early on whatsapp-web.js.
+- Fix a failed phone-to-LID mapping write on whatsapp-web.js not being retried until restart.
+- Answer 409 instead of 503 for a whatsapp-web.js message or group picture write that races a session stop.
+- Fix `GET /api/sessions/{sessionId}/channels/{channelId}/messages` answering 404 on whatsapp-web.js for a channel whose id the channel list spells another way.
+- Stop reading a link preview body at its byte cap, so a title past the cap no longer becomes the preview.
+- Stop the batch profile-picture lookup after one times out, so no more than five engine lookups run at once; the ids it skips are left out of the answer.
+- Refuse a boolean `startTime` on `POST /api/sessions/{sessionId}/calls/link` instead of reading it as 1.
+- Fix approving or rejecting group join requests acting on every pending request when the body was a JSON list or was sent with a content type other than JSON or form encoding; both now answer 400.
+- Fix saving a contact with a null last name sending the null to WhatsApp Web on whatsapp-web.js.
+- Fix creating a channel with a null description answering a null description on whatsapp-web.js.
+- Fix a group add or create charging a bare number and its `@c.us` form as two new contacts against the daily cold allowance.
+- Keep the SQLite database file path when the Infrastructure page saves SQLite.
+- Write `data/.env.generated` through a staged file and a rename, so a failed save keeps the previous configuration; where a rename cannot replace the file, or the directory refuses the staged file, such as on a single-file mount or in a directory the app cannot write, it is written in place, and a symlink is written through to its target.
+- Refuse a configuration save that the next boot would reject, with the boot validation message, instead of persisting it.
+- Reset `REDIS_TLS` and clear `REDIS_USERNAME` when the Infrastructure page selects the built-in Redis.
+- Stop a bundled container on restart once its datastore is switched off, even when a pinned host still names it.
+- Prepare the storage export directory before starting the archive and destroy the archive on every failure path.
+- Count the template variables a bulk media field names in the data export media budget.
+- Restore a data backup onto a PostgreSQL schema that lacks an optional table instead of failing with a 500.
+- Start the selected built-in containers once Docker answers after a failed first connection, and report an unreachable Docker inventory as unknown.
+- Bound the Docker image and container inspections with the deadline of the other short calls, and pull an image only when the daemon says it is absent.
+- Wait at most 2 s for the database statistics in a metrics scrape; a late read is kept and served for up to 5 minutes, and the series are omitted only when a read failed or none is recent.
+- Record a `session_stopped` audit log entry for each session an import with `stopOrphans` stops, including when the import does not commit.
+- Fix the Python SDK raising `ValueError` instead of the API error when a response carries an oversized numeric `Retry-After`, from SDK 0.7.0.
+- Fix the Python SDK API and timeout errors failing to unpickle or copy, so they survive a worker process boundary, from SDK 0.7.0.
+- Ignore a `Retry-After` beyond the number range in the JavaScript SDK, which read it as Infinity seconds, from SDK 0.7.0.
+- Cap an oversized `Retry-After` in the Go and PHP SDKs instead of wrapping to a short or negative wait, from SDK 0.7.0.
+- Keep the API error in the Java SDK when a `Retry-After` date is out of range, where an `ArithmeticException` replaced it, from SDK 0.7.0.
+- Treat a final 1xx response as an error in the Python, Go and PHP SDKs instead of returning it as a success, from SDK 0.7.0.
+- Keep the query values of a raw path that carries a fragment in the Go, Java and PHP SDKs, where they were sent inside the fragment, from SDK 0.7.0.
+- Send the `Idempotency-Key` on a Go SDK raw send path that carries a query or a fragment, from Go SDK 0.7.0.
+- Fix the Go SDK treating a 429 whose body could not be read as retryable, and reporting a stalled 429 body as an API error instead of a timeout, from Go SDK 0.7.0.
+- Fix the PHP SDK sending template variables, bulk variables and bulk options as a JSON list when the map has numeric keys or is empty, from PHP SDK 0.7.0.
+- Fix the PHP SDK failing with a `TypeError` when the gateway answers a typed call with a body that is not JSON; it now throws `OpenWAException`, from PHP SDK 0.7.0.
+- Read the response of a PHP SDK injected client that sets `stream` to `true` inside the timeout handling, so a stalled body is a timeout, from PHP SDK 0.7.0.
+- Stop media conversion from starting new ffmpeg work once shutdown has begun.
+- Fall back to `url` in `POST /api/sessions/{sessionId}/media/convert/*` when `base64` holds only a data URI prefix.
+- Use the saved proxy for media conversion by URL in a restored session whose id is not a UUID.
+- Drop media supplied through `variables` from finished bulk batches.
+- Accept a placeholder in `content.mentions` of `send-bulk` and validate the rendered WIDs per item.
+- Keep send admissions counted across UTC midnight, including bulk and product sends still waiting on the engine.
+- Hold the typing pause to `SIMULATE_TYPING_MAX_MS`, jitter included.
+- Drop expired statistics memo entries as new results are stored, so the memo no longer grows with every deleted session.
+- Update only the supplied fields on `PUT /api/sessions/{sessionId}/templates/{id}` and answer 404 for a template deleted meanwhile, where an overlapping edit was undone or the template came back.
+- Report a status whose row was removed while its media was written as not stored, and delete its file.
+- Accept an empty `url` next to `base64` in status posts and media conversion.
+- Write each dependency file the postinstall scripts rewrite, except the whatsapp-web.js diff patch, to a temporary file and rename it over the original, so a write that fails part-way, such as on a full disk, leaves the file unchanged; a best-effort patch is then skipped, and any other install fails instead of keeping a truncated file.
+- Keep the `latest` and `X.Y` image tags from moving to an older release when an older tag is released or re-run.
+- Create the GitHub Release from a notes file, so a CHANGELOG section containing a line that is exactly `EOF` no longer breaks it.
+- Mirror the PHP SDK to `openwa-php` only from `main` and only while its content matches `main`, so a manual run from another branch or a re-run of an older push no longer replaces a newer mirror.
+- Tell numeric from string enum members in the SDK shape check.
+- Remove the temporary directory of `npm run openapi:export` after a usage error or a failed bootstrap.
+- Forward `S3_ACCESS_KEY` and `S3_SECRET_KEY` in `docker-compose.dev.yml`, as `docker-compose.yml` does, so an older `.env` keeps its storage credentials.
+- Fix deleting a session on PostgreSQL removing the login of another session whose imported id equals the deleted name.
+- Fix a session start that was waiting for its claim relaunching the session after a logout.
+- Fix a stopped or deleted session announcing INITIALIZING after its stop when the first status write replied late.
+- Fix a start that timed out on engine initialization overwriting the status of the engine a restart launched meanwhile.
+- Fix a delete during a reconnect leaving the re-created auth directory of the deleted session on disk.
+- Fix the liveness watchdog recycling an engine that left READY while a probe was in flight.
+- Fix requests for imported sessions with non-UUID ids not being forwarded to the node that runs them.
+- Fix `PUT /api/sessions/{sessionId}/presence` re-applying its value on the replacement engine when the call outlived the engine it published to.
+- Fix a reconnect that found its session stopped keeping the session counted as running, so its lease was renewed and its `MAX_CONCURRENT_SESSIONS` slot stayed taken.
+- Fix a message that arrived while its session was being deleted surviving the delete.
+- Stop sending `status.received` for a status that expired before it was stored.
+- Fix a revoke event without a readable message id erasing an unrelated message that was still arriving.
+- Fix a message reaction not reaching webhooks and the socket when its stored copy could not be written.
+- Cap the receipt deliveries of one session to a quarter of the shared webhook dispatch slots in total, however many of its webhooks name `message.receipt`.
+- Read an ingress route's `conversationId` JSON pointer by RFC 6901 tokens: `~1` and `~0` escapes, empty keys and array indexes only.
+- Store the `webhook-signature` header of a Standard Webhooks ingress delivery as `[redacted]` in events, queue jobs and dead letters.
+- Stop a WebSocket subscribe overtaken by an unsubscribe from joining its rooms afterwards; it answers `SUBSCRIPTION_CANCELLED`.
+- Rank a webhook delivery-failure redrive that a plugin cancels behind untried rows, so it no longer heads every batch; the row keeps its payload.
+- Dead-letter a queue job as stall exhaustion only when BullMQ failed it for stalling, not for any handler error that carries the stall text.
+- Retry an ingress delivery whose dispatch error reads `bullmq:rateLimitExceeded` within its attempt budget instead of re-running it without limit.
+- Bound the wait for the queue producer when ingress dead-letter recovery re-queues a job.
+- End the idempotency key of recurring webhook events (edits, reactions, session and group changes) in a per-dispatch id instead of a timestamp, so two occurrences in one millisecond no longer share a key.
+- Refund the WebSocket handshake attempt that succeeded, not the newest attempt of its address.
+- Fix archived and status media keys embedding Object constructor source text when a sender used the mimetype subtype "constructor".
+- Fix the production default-secret check refusing a built-in PostgreSQL or MinIO addressed by its container name, another letter case or a trailing dot.
+- Keep API key usage counts when a use is recorded while the shutdown flush awaits its write.
+- Fix the storage export skipping its import-limit warnings for files whose size the store does not report.
+- Stop an MCP MessageHistory read when the client disconnects or cancels.
+- Accept base64 media with an empty or non-http `url` on the MCP media send tools, as the REST routes do.
+- Offload MCP tool results larger than 4 KB of UTF-8, not 4096 UTF-16 units.
+- Accept a fractional `timeoutMs` in a plugin's `net.fetch`.
+- Honor an error returned with data from a sandboxed hook handler, as the host chain does.
+- Give hook registrations made in the same millisecond separate ids.
+- Keep plugin storage keys apart: a legacy key spelled like another key's encoded filename no longer reads or deletes that key, and `list()` returns only keys that `get`, `set` and `delete` accept.
+- Keep a plugin's registry entry until its uninstall has removed its files, so a failed uninstall can be repeated.
+- Carry a plugin's stored data into the new tree before an update swaps it in.
+- Refuse a plugin catalog entry whose id, name, version or text fields are not text, and accept null in its optional fields.
+- Log at start the position and reason of each `SSRF_ALLOWED_HOSTS` entry that never matches a host: a scheme, credentials, port, path or wildcard, or an IP address not written as the URL parser prints it (`127.0.0.1`, not `127.1`); at most 20 entries are listed, and a value the URL parser rejects is named as such.
+- Run every `message:sending` handler, a moderation veto included, for a send that a hook handler schedules after its own call has ended; it was skipped as re-entrant.
+- Redrive only the dead letters written under an ingress instance's current session binding.
+- Drop a null optional field from plugin catalog entries instead of answering it.
+- Fix the JavaScript SDK raw requests with a fragment in the path dropping their query parameters.
+- Cap the JavaScript SDK `retryAfterSeconds` at 2147483 seconds, the longest delay `setTimeout` accepts once multiplied by 1000.
+- Report the database name to the Infrastructure form only under PostgreSQL, and drop a stored SQLite file path when a PostgreSQL save sends no name.
+- The message list no longer answers an empty page when its `after` row is deleted while the page is being read.
+- The message list reads its page rows by primary key on SQLite, which cuts a 100 row read of a 300k row session from about 70 ms to 5 ms.
+- Fix the PHP SDK reading a `Retry-After` header of 309 or more digits as 0 seconds; it is now capped like a smaller oversized value.
+- Do not mark a patch release on an older line as the GitHub Latest release, which the update check reads.
+- Answer a body over `BODY_SIZE_LIMIT`, malformed JSON, a body nested past the bound and an undecodable path parameter under `/api` and `/mcp` with 413 or 400 when the bundled dashboard is served, where they answered `404 Cannot POST` ([#1921](https://github.com/rmyndharis/OpenWA/issues/1921)). Thanks @ScalingMBA for the report.
+- Answer a `chatId` that is not `localpart@host` on a send or message-action body, and on the MCP message tools, with `400` instead of `500`; a bare phone number reached the engine, and every such request counted against the session's send breaker.
+
+### Dependencies
+
+- `body-parser` 2.3.0 to 2.4.0 for safe compressed-request error handling in the HTTP server.
+- `i18next` 26.4.2 to 26.4.4 in the dashboard tree, closing a regular-expression denial of service in its nested-translation parser. It ships in the dashboard bundle.
+- The image's Node.js 22.23.3 to 22.23.4, a security release for the `http`, `dns`, `tls`, `permission` and `crypto` modules.
+- The image's npm CLI 12.1.0 to 12.2.1, clearing CVE-2026-102276, CVE-2026-102278 (brace-expansion) and CVE-2026-19534 (undici) in its own bundled tree; npm only runs for the documented migration commands, and the three Trivy exceptions for them are gone.
+- The amd64 image's Chrome for Testing 153.0.8010.36 to 156.0.8078.47, picking up the browser security fixes released since; the arm64 image keeps the chromium package Debian ships.
+
+### Upgrade notes (behavior changes)
+
+- Source installs using Puppeteer's downloaded browser move from Chrome 146 to 156; back up `SESSION_DATA_PATH` (default `data/sessions/`) before starting and restore it before downgrading Chrome. An explicit `PUPPETEER_EXECUTABLE_PATH` keeps selecting that browser.
+- ⚠️ **Breaking (config).** A production boot refuses a `METRICS_TOKEN` that is the `.env.example` placeholder or a known weak value such as `test` or `change-me`, since the scrape endpoint is public; set a long random token, or leave it unset to keep the endpoint disabled.
+- The HTTP port now opens after at most 60 s of plugin restore. Until a plugin still restoring is up, the hooks it owns (a send moderation veto, for one) do not run, an enable, disable, update, uninstall or reinstall of it answers `409`, an ingress route with a response contract answers `503` with `Retry-After`, and other ingress deliveries are held and dispatched once it is up (with the queue off, by the reconciler after `INGRESS_RECONCILE_GRACE_MS`); do not rely on a plugin veto for requests in the first minute after a boot with slow plugins.
+- An explicit `null` for a secret field of a plugin config removes the stored secret, where 0.25.0 kept it; a client that sends `null` for "not provided" must leave the key out.
+- A client that connects to the Socket.IO root namespace `/` is refused; connect to `/events`.
+- Baileys group sends reuse a cached participant list for up to 5 minutes; set `BAILEYS_GROUP_METADATA_CACHE_TTL_MS=0` to query for every send as before.
+- `GET /info` through the bundled Docker socket proxy is refused; a client of your own that reads it needs `INFO: 1` on the proxy.
+- Changing `QUEUE_PREFIX` on a live deployment leaves the jobs queued under the old prefix unprocessed.
+- The first boot on PostgreSQL converts the legacy message types in one statement inside the boot transaction, about 1 minute per million legacy rows while the port stays closed; raise `startupProbe.failureThreshold` or run the migrations first (docs/14, section 14.5).
+- Session deletion commits bounded batches before the final transaction. Earlier removals survive a later failure; repeat DELETE to finish, or explicitly start the remaining session. Size client and proxy timeouts for large histories (docs/14, section 14.5).
+- During rolling upgrades, 0.25.0 nodes can explicitly start or take over sessions marked `deleting` or `deleting-stopped` without clearing those records. Upgrade every node before relying on delete holds, removal fences or serialized batch cleanup.
+- LID mappings inherited from older versions or backups without report-origin data no longer authorize phone aliases until an engine reports the pair. Upgrade every reader together; Baileys now returns LIDs with display phone numbers separate.
+- On SQLite, `POST /api/sessions`, `DELETE /api/sessions/{sessionId}` and `DELETE /api/integration/plugins/{pluginId}/instances/{instanceId}` wait for another open database transaction and answer `503` when it stays open for 10 s: the create stores nothing and the instance delete deletes nothing; a session delete may already have committed earlier batches. Retry after the transaction ends.
+- A storage export or file count now answers 409 on a symbolic link inside the local storage directory (replace it with the real directory or a bind mount), on a directory the app cannot read and on one nested 20 levels deep.
+- Request validation is stricter: a JSON boolean or object in a string field, an object for a list or an array for an object, a body nested over 100 levels and a `muteUntil` above 9007199254740991 answer `400` where they were accepted or answered `500`; a client that posts a number for a string field is unaffected.
+- ⚠️ **Breaking (SDK types only, no gateway change).** From SDK 0.7.0, the JavaScript, Python and Go SDKs type the response fields the gateway always sends as required and no longer allow the `null` it never sends, the Go response fields marked required no longer leave a zero value out when marshaled, `ParticipantsResult` no longer extends `SuccessResult` in the JavaScript and Python SDKs, and the key validation `role` is typed `admin`, `operator` or `viewer` in both; code that builds these objects by hand or tests those fields for `null` needs updating.
+- From SDK 0.7.0, the PHP SDK throws from the constructor for an empty list as a `defaultHeaders` value, which 0.6.0 accepted; use `''` for an empty header value.
+- `restore.sh` stops before it copies anything, naming the key, when a path from the archive's own `.env.generated` leads out of the data directory, passes through a link that does not resolve, or lies inside or around another directory the restore refills; set that key in the environment or `./.env` to restore there. The default paths and a leftover `./uploads` restore as before.
+- The amd64 image moves from Chrome for Testing 153 to 156, so an amd64 rollback to 0.25.0 or earlier crosses a browser major and deletes the stored whatsapp-web.js logins unless `sessions/` is restored from a backup taken before the first start on the new image (see `docs/11-operational-runbooks.md`); Baileys sessions are unaffected.
+- A `POSTGRES_BUILTIN`, `REDIS_BUILTIN` or `MINIO_BUILTIN` flag starts its container at boot only while the datastore is in use (PostgreSQL selected; Redis, the queue or the cache on; S3 storage) and its host is not pinned to another server; a container nothing used is no longer started, and a restart from the Infrastructure page stops one the dashboard created whose host is pinned elsewhere.
+- `envPinned` of `GET /api/infra/status` can list any of the 31 settings a save of the Infrastructure page writes, where 0.25.0 listed eight; a client that reads it must expect the database, Redis and S3 keys and the built-in flags too.
+- The dashboard status composer offers only fonts 0 to 7 on whatsapp-web.js, which posts 8 to 10 in the default font; the API still accepts every font id.
+- A boot with `REDIS_TLS=true` or a named `REDIS_USERNAME` beside the built-in Redis (`REDIS_BUILTIN=true` with the bundled host) is refused; set `REDIS_TLS=false` and clear the username, or use an external Redis.
+- A boot with `STORAGE_TYPE=s3` and an `S3_ENDPOINT` without `http://` or `https://` (for example `minio:9000`) still starts, on the local media directory, and logs an error; add the scheme.
+- `POST /api/sessions/{sessionId}/groups/{groupId}/membership-requests/approve` and `/reject` answer `400` for a JSON list body or a content type other than JSON or form encoding; they used to act on every pending request. Send `{}` or no body for that.
+- On whatsapp-web.js, `POST /api/sessions/{sessionId}/pairing-code` answers `409` for a number that is the stored phone of another session of the gateway.
+- On SQLite the first boot checks the message search index against all stored text and rebuilds it when they differ, so a large database starts more slowly while the port is closed.
+- The idempotency key of recurring webhook events ends in a random id minted per dispatch instead of an ISO timestamp; a receiver that reads its last segment as a time must dedupe on the whole key.
+- An ingress route's `conversationId` JSON pointer is read by RFC 6901 tokens, so a trailing or doubled slash names an empty key; a delivery such a pointer no longer resolves takes the per-instance lane.
+- A boot with `DATABASE_SSL=true` beside the built-in PostgreSQL (`POSTGRES_BUILTIN=true` with the bundled host) is refused; set `DATABASE_SSL=false`, or use an external PostgreSQL.
+- `GET /api/sessions/{sessionId}/contacts/profile-pictures` leaves out an id it skipped after another lookup timed out, where an id without a picture or with a failed lookup stays `null`; a client that indexes the answer by every requested id must handle a missing key.
+- A plugin catalog with an entry whose `id`, `name`, `version` or text field is not text is refused with `400`, naming the entry; the default catalog is unaffected, and a private `PLUGIN_CATALOG_URL` catalog must correct the entry.
+- `POST /api/integration/instances/{pluginId}/{instanceId}/redrive` replays and counts only the dead letters written under the instance's current session binding; rows of an earlier binding stay in the dead-letter table.
+- A per-session plugin config or an integration instance that sets a `net.allowConfigHosts` key (for example `baseUrl`) to another origin than the layer beneath no longer inherits that layer's `secret` fields, and a list holding one is not inherited either; put the secret in that config or instance, or the plugin reaches the new host without it. A deployment that shared one token across per-session hosts must copy the token to each. A host key that holds a list, an object or a number counts as another origin, and a write to an override or an instance that moves a host key to another origin no longer gets the stored secret back for `***` or an empty string; send the secret with it. An instance row loses its own secrets while a per-session override has moved a host key the row leaves unset away from the base config, and a config `PATCH` of an instance whose plugin is not loaded answers `409`.
+- A send or message-action body whose `chatId`, `fromChatId` or `toChatId` has no domain (`6281234567890` instead of `6281234567890@c.us`), or is a JSON number, answers `400`; it answered `500` before and never sent.
+
+### Security
+
+- `scripts/restore.sh` refuses, before it copies anything and naming the key, a path from the archive's own `.env.generated` that leads out of the data directory, passes through a link that does not resolve, or lies inside or around another directory the restore refills; an archive someone else built or altered could make it replace directories and files outside the data directory. A key set in the environment or `./.env` is honored as before.
+- Template and bulk sends measure the rendered length before building the text: a template send past `TEMPLATE_RENDER_MAX_CHARS` answers `400`, a bulk item whose text or caption would pass it fails, and a bulk media item that would render past the media size limit is refused; a placeholder repeated through the text made the server build the whole text first, which could exhaust its memory.
+- Socket.IO connections to the root namespace `/` are refused, where an unauthenticated client stayed connected outside the handshake and per-key socket limits; only `/events` accepts clients.
+- An object sent for `allowedChats`, `allowedSessions` or `allowedIps` when an API key is created or updated answers `400`; it was stored as an empty list, which means no restriction, so the key reached every chat, session or address.
+- The secrets of a wildcard integration instance are removed from the plugin config when the instance is deleted, disabled, moved to one session or saved without them; they stayed in use after that.
+- A pairing code request on whatsapp-web.js for a number that is the stored phone of another session answers `409`; a key restricted to one session could have WhatsApp revoke the login of another through it. The refusal also tells such a key that a number it tries is held by another session.
+- A session-restricted ADMIN key that creates, moves, disables or deletes an integration instance no longer retires the plugin's all-sessions activation, which silenced the plugin on sessions the key cannot see.
+- A queued or replayed ingress delivery keeps the verified flag recorded when it was accepted, so a plugin update that makes an unsigned route sign no longer labels a payload nobody authenticated as verified.
+- An ingress delivery admitted for one session fails when its instance moved to another session while it waited, where it reached the handler with the other session's config.
+- Disconnect a WebSocket whose API key's stored expiry stops parsing, as REST already refuses it.
+- The message list no longer returns a row that was replaced between page selection and read and no longer matches the requested chat, time window, direction or type; for a chat-restricted key it could be another chat's message.
+- `scripts/restore.sh` also refuses an archive configuration that puts the admin key file, `.env.generated` or `database.sql` on a directory the restore refills, where a link planted in the archive made the copy write outside the data directory.
+- A per-session plugin config or an integration instance that points a `net.allowConfigHosts` key at another origin than the layer beneath no longer receives that layer's secrets, where a session-restricted admin key could send the operator's stored tokens to a host of its choosing.
+
 ## [0.25.0] - 2026-10-15
 
 ### Added
@@ -14,16 +1382,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Allow chat-restricted API keys to subscribe to chat WebSocket events.
 - Allow chat-restricted MCP keys to read and send within their chat allowlist using the REST authorization rules.
 - Carry `chatId` in `message.ack` and `message.failed` payloads so a webhook `chatId` or `kind` filter scopes delivery events per chat.
-- Filter stored messages by time, direction, type or message reference, with stable message-time pagination; the JavaScript, Python, Java and Go SDKs take these filters from the next SDK release after 0.5.1, and the PHP SDK already forwards any query key.
+- Filter stored messages by time, direction, type or message reference, with stable message-time pagination; the JavaScript, Python, Java and Go SDKs take these filters from SDK 0.6.0, and the PHP SDK already forwards any query key.
 - Scope built-in message search and group detail/settings to a chat-restricted key's allowed chats; reject plugin search for these keys.
-- Expose poll choices and selection mode in message events, stored messages and history, and poll choices in dashboard chats; the SDKs type the poll of a live history message from the next SDK release after 0.5.1.
-- Expose optional last-message types in chat lists and, from the next SDK release after 0.5.1, in the SDKs.
-- Add bounded webhook failure redrive with optional payload retention; the SDKs expose it from the next SDK release after 0.5.1.
+- Expose poll choices and selection mode in message events, stored messages and history, and poll choices in dashboard chats; the SDKs type the poll of a live history message from SDK 0.6.0.
+- Expose optional last-message types in chat lists and, from SDK 0.6.0, in the SDKs.
+- Add bounded webhook failure redrive with optional payload retention; the SDKs expose it from SDK 0.6.0.
 - Add `startupProbe.periodSeconds` and `startupProbe.failureThreshold` to the Helm chart's values, defaulting to the 5 s and 60 the chart rendered before, so a large messages table can be given a longer boot budget.
-- Expose caller-supplied send idempotency keys in all five SDKs from the next SDK release after 0.5.1; the 0.5.1 JavaScript and PHP packages ignore the extra argument.
+- Expose caller-supplied send idempotency keys in all five SDKs from SDK 0.6.0; the 0.5.1 JavaScript and PHP packages ignore the extra argument.
 - Add optional 24-hour idempotency keys to twelve single-recipient send routes.
 - Add opt-in archive-only chat media with dashboard previews.
-- Report RSVPs to WhatsApp events as an `event.response` webhook and WebSocket event on Baileys; the JavaScript, Python, Go and Java SDKs list the event name from the next SDK release after 0.5.1 (#1788, thanks @jelasus).
+- Report RSVPs to WhatsApp events as an `event.response` webhook and WebSocket event on Baileys; the JavaScript, Python, Go and Java SDKs list the event name from SDK 0.6.0 (#1788, thanks @jelasus).
 
 ### Changed
 
@@ -97,8 +1465,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Probe the configured `PORT` in the Docker image healthcheck instead of a fixed 2785.
 - Cap the total bytes one storage import extracts at `STORAGE_IMPORT_MAX_TOTAL_BYTES`.
 - Close the Baileys session proxy's fetch dispatcher when the session disconnects, logs out or is destroyed.
-- Java SDK (next SDK release after 0.5.1): the request timeout also bounds the response body, so a stalled body raises `OpenWATimeoutError`.
-- Java SDK (next SDK release after 0.5.1): the default transport speaks HTTP/1.1, so calls to a gateway over plain `http://` no longer fail with `HTTP/1.1 header parser received no bytes`.
+- Java SDK (0.6.0): the request timeout also bounds the response body, so a stalled body raises `OpenWATimeoutError`.
+- Java SDK (0.6.0): the default transport speaks HTTP/1.1, so calls to a gateway over plain `http://` no longer fail with `HTTP/1.1 header parser received no bytes`.
 - Keep a new dashboard template draft when an earlier template save finishes.
 - Stop the dashboard Chats page from marking the open chat read on a newly selected session.
 - Refuse bulk batches once shutdown begins, and answer `503` for a batch saved during shutdown instead of sending it.
@@ -159,22 +1527,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop a dashboard backup export or media download answered after sign-out from saving its file.
 - Parse a dashboard message made of many code spans or code blocks in linear time, so one long message no longer freezes the tab for seconds.
 - Render a dashboard message body over 4096 characters without links, so link detection no longer freezes the tab on a very long body.
-- Python SDK (next SDK release after 0.5.1): an error with an empty body names the response's status text instead of `None`.
-- Python SDK (next SDK release after 0.5.1): a `timeout` of `None`, 0 or infinity means no timeout, a four-value tuple takes the same for each element, an `httpx.Timeout` is passed to httpx as given, and a negative, NaN or non-number raises `ValueError`.
-- Python SDK (next SDK release after 0.5.1): `WebhookFilterCondition` and `CustomLinkPreview` require the keys the gateway requires.
-- JavaScript and PHP SDKs (next SDK release after 0.5.1): printing or dumping a client no longer shows its API key, and the PHP client keeps its default header values out of a dump, an export and a cast as well.
-- Python and PHP SDKs (next SDK release after 0.5.1): the API key is trimmed, and one with a control or non-ASCII character is refused when the client is built, without repeating it.
-- JavaScript SDK (next SDK release after 0.5.1): the API key is trimmed, and a key or default header value with a control or non-Latin-1 character is refused when the client is built, naming the header and never repeating the value.
-- Go SDK (next SDK release after 0.5.1): the API key is trimmed, and one with a control character is refused when the client is built, without repeating it.
-- Python and PHP SDKs (next SDK release after 0.5.1): a default header value with a control or non-ASCII character is refused when the client is built, naming the header and never repeating the value.
-- Java SDK (next SDK release after 0.5.1): a connection failure names its exception class and keeps it as the cause instead of ending in `null`.
-- Java SDK (next SDK release after 0.5.1): a key or default header value with a control or non-ASCII character is refused when the client is built, naming the header and never repeating the value.
-- Java SDK (next SDK release after 0.5.1): a logged `HttpRequestData` shows neither the key nor the body.
-- Go SDK (next SDK release after 0.5.1): `WithIdempotencyKey` sends the header only on the twelve routes that honor it, so a request to any other route is no longer re-sent by `net/http` after a dropped connection.
-- Go SDK (next SDK release after 0.5.1): an error answer from a proxy reads its own `message` or the status text.
-- PHP SDK (next SDK release after 0.5.1): an omitted participant list in `approveMembershipRequests` and `rejectMembershipRequests` goes out as `{}`.
-- PHP SDK (next SDK release after 0.5.1): an error body whose `error` is not a string maps to the SDK's exception instead of raising a `TypeError`.
-- Every SDK package ships the MIT license text from the next SDK release after 0.5.1.
+- Python SDK (0.6.0): an error with an empty body names the response's status text instead of `None`.
+- Python SDK (0.6.0): a `timeout` of `None`, 0 or infinity means no timeout, a four-value tuple takes the same for each element, an `httpx.Timeout` is passed to httpx as given, and a negative, NaN or non-number raises `ValueError`.
+- Python SDK (0.6.0): `WebhookFilterCondition` and `CustomLinkPreview` require the keys the gateway requires.
+- JavaScript and PHP SDKs (0.6.0): printing or dumping a client no longer shows its API key, and the PHP client keeps its default header values out of a dump, an export and a cast as well.
+- Python and PHP SDKs (0.6.0): the API key is trimmed, and one with a control or non-ASCII character is refused when the client is built, without repeating it.
+- JavaScript SDK (0.6.0): the API key is trimmed, and a key or default header value with a control or non-Latin-1 character is refused when the client is built, naming the header and never repeating the value.
+- Go SDK (0.6.0): the API key is trimmed, and one with a control character is refused when the client is built, without repeating it.
+- Python and PHP SDKs (0.6.0): a default header value with a control or non-ASCII character is refused when the client is built, naming the header and never repeating the value.
+- Java SDK (0.6.0): a connection failure names its exception class and keeps it as the cause instead of ending in `null`.
+- Java SDK (0.6.0): a key or default header value with a control or non-ASCII character is refused when the client is built, naming the header and never repeating the value.
+- Java SDK (0.6.0): a logged `HttpRequestData` shows neither the key nor the body.
+- Go SDK (0.6.0): `WithIdempotencyKey` sends the header only on the twelve routes that honor it, so a request to any other route is no longer re-sent by `net/http` after a dropped connection.
+- Go SDK (0.6.0): an error answer from a proxy reads its own `message` or the status text.
+- PHP SDK (0.6.0): an omitted participant list in `approveMembershipRequests` and `rejectMembershipRequests` goes out as `{}`.
+- PHP SDK (0.6.0): an error body whose `error` is not a string maps to the SDK's exception instead of raising a `TypeError`.
+- Every SDK package ships the MIT license text from SDK 0.6.0.
 
 ### Documentation
 
@@ -208,7 +1576,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Boot fails on a `PORT` with surrounding whitespace or a whitespace-only `PORT`; remove the padding.
 - Boot fails on a `WEBHOOK_SHUTDOWN_DRAIN_MS` that is not a non-negative integer (for example `30s`) instead of silently using 5000.
 - Aged undispatched ingress events are dead-lettered instead of deleted; some may already have been delivered, so check before redriving them.
-- Java SDK (next SDK release after 0.5.1): the request timeout (default 30 s) also bounds the response body; raise it for large media downloads.
+- Java SDK (0.6.0): the request timeout (default 30 s) also bounds the response body; raise it for large media downloads.
 - With `OPENWA_DATA_DIR` set, `backup.sh` and `restore.sh` read the default SQLite databases and `./data/...` paths in `./.env` under it; pass a path in the environment to keep it in the working directory.
 - A storage import stops at `STORAGE_IMPORT_MAX_TOTAL_BYTES` (default 10 GiB); raise it before importing a larger export.
 - ⚠️ **Breaking (API).** Creating or updating an API key with more than 2000 `allowedChats` entries answers `400`; a stored longer list keeps working on the REST routes, but over `/events` a subscribe that would hold more than 4096 rooms (the subscribed events times the key's chat ids, two per phone number) is refused with `TOO_MANY_SUBSCRIPTIONS`, so shorten it.

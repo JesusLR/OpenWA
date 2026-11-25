@@ -93,17 +93,20 @@ describe('ChannelController OpenAPI 400 responses', () => {
   );
 });
 
-describe('ChannelController OpenAPI 404 on delete and unsubscribe', () => {
-  // Both routes refuse only an id that is not a channel id; neither looks the channel up, so the
+describe('ChannelController OpenAPI 404 on the routes that refuse a non-channel id up front', () => {
+  // These routes refuse only an id that is not a channel id; none looks the channel up, so the
   // subscribed-list "not synced yet" wording would invite a retry that cannot succeed.
-  it.each(['remove', 'unsubscribe'] as const)('%s describes the 404 as a malformed channel id', route => {
-    const responses = Reflect.getMetadata(
-      'swagger/apiResponse',
-      Object.getOwnPropertyDescriptor(ChannelController.prototype, route)?.value as object,
-    ) as Record<string, { description?: string }>;
-    expect(responses['404']?.description).toContain('@newsletter');
-    expect(responses['404']?.description).not.toContain('synced');
-  });
+  it.each(['remove', 'unsubscribe', 'demoteAdmin', 'transferOwnership'] as const)(
+    '%s describes the 404 as a malformed channel id',
+    route => {
+      const responses = Reflect.getMetadata(
+        'swagger/apiResponse',
+        Object.getOwnPropertyDescriptor(ChannelController.prototype, route)?.value as object,
+      ) as Record<string, { description?: string }>;
+      expect(responses['404']?.description).toContain('@newsletter');
+      expect(responses['404']?.description).not.toContain('synced');
+    },
+  );
 });
 
 describe('ChannelController OpenAPI 503 responses', () => {
@@ -113,13 +116,25 @@ describe('ChannelController OpenAPI 503 responses', () => {
       Object.getOwnPropertyDescriptor(ChannelController.prototype, name)!.value as object,
     ) ?? {}) as Record<string, { description?: string }>;
 
+  // The two reads Baileys cannot do answer 501 there, so their 503 belongs to whatsapp-web.js alone and has no
+  // Baileys rate limit to name.
+  const BAILEYS_UNSUPPORTED = ['findAll', 'getMessages'];
+
   // Baileys answers 503 for WhatsApp's own rate limit (429) as well as for an unanswered query.
   it('names the WhatsApp rate limit on every 503 it declares', () => {
     const silent = Object.getOwnPropertyNames(ChannelController.prototype).filter(name => {
+      if (BAILEYS_UNSUPPORTED.includes(name)) return false;
       const description = responsesOf(name)['503']?.description;
       return description !== undefined && !description.includes('429');
     });
     expect(silent).toEqual([]);
+  });
+
+  it('declares the 503 of the reads Baileys cannot do as whatsapp-web.js only, next to their 501', () => {
+    for (const name of BAILEYS_UNSUPPORTED) {
+      expect(responsesOf(name)['501']).toBeDefined();
+      expect(responsesOf(name)['503']?.description).toContain('whatsapp-web.js');
+    }
   });
 
   it('declares the rate-limited 503 on channel creation', () => {

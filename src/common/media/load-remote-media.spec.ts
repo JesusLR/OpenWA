@@ -3,6 +3,7 @@ import { loadRemoteMediaBuffer } from './load-remote-media';
 import { BadRequestException, PayloadTooLargeException, ServiceUnavailableException } from '@nestjs/common';
 import { SsrfBlockedError } from '../security/ssrf-guard';
 import { countsTowardSendBreaker, sentNothing } from '../../modules/message/send-pacing.service';
+import { provesNothingSent } from '../errors/engine-not-sent.error';
 
 // Media download goes through undici's fetch (via the SSRF-pinning helper); mock it, not global fetch.
 jest.mock('undici', () => {
@@ -38,7 +39,9 @@ describe('loadRemoteMediaBuffer', () => {
 
   it('blocks an internal URL via the SSRF guard before any fetch', async () => {
     const fetchMock = undiciFetch as jest.Mock;
-    await expect(loadRemoteMediaBuffer('http://127.0.0.1/x.png', undefined)).rejects.toBeInstanceOf(SsrfBlockedError);
+    const error = await loadRemoteMediaBuffer('http://127.0.0.1/x.png', undefined).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SsrfBlockedError);
+    expect(provesNothingSent(error)).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -76,6 +79,8 @@ describe('loadRemoteMediaBuffer', () => {
       expect(error).toBeInstanceOf(BadRequestException);
       expect((error as Error).message).toBe('Media fetch failed with status 404');
       expect(countsTowardSendBreaker(error)).toBe(false);
+      // Raised before anything reached WhatsApp, so a keyed send frees its Idempotency-Key.
+      expect(provesNothingSent(error)).toBe(true);
     });
 
     it('answers 413 for a declared or streamed size over the cap', async () => {
@@ -84,14 +89,19 @@ describe('loadRemoteMediaBuffer', () => {
       const declared = await failureOf();
       expect(declared).toBeInstanceOf(PayloadTooLargeException);
       expect(countsTowardSendBreaker(declared)).toBe(false);
+      expect(provesNothingSent(declared)).toBe(true);
 
       (undiciFetch as jest.Mock).mockResolvedValue(fakeResponse([1, 2, 3], {}));
-      expect(await failureOf()).toBeInstanceOf(PayloadTooLargeException);
+      const streamed = await failureOf();
+      expect(streamed).toBeInstanceOf(PayloadTooLargeException);
+      expect(provesNothingSent(streamed)).toBe(true);
     });
 
     it('answers 400 for a response without a body', async () => {
       (undiciFetch as jest.Mock).mockResolvedValue({ ...fakeResponse([], {}), body: null });
-      expect(await failureOf()).toBeInstanceOf(BadRequestException);
+      const error = await failureOf();
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(provesNothingSent(error)).toBe(true);
     });
 
     it('answers 400 for a timeout', async () => {
@@ -99,6 +109,7 @@ describe('loadRemoteMediaBuffer', () => {
       const error = await failureOf();
       expect(error).toBeInstanceOf(BadRequestException);
       expect((error as Error).message).toMatch(/^Media fetch timed out after \d+ ms$/);
+      expect(provesNothingSent(error)).toBe(true);
     });
 
     it('answers 400 for a failed connection without echoing its cause', async () => {
@@ -109,6 +120,7 @@ describe('loadRemoteMediaBuffer', () => {
       expect(error).toBeInstanceOf(BadRequestException);
       expect(JSON.stringify((error as BadRequestException).getResponse())).not.toContain('10.0.0.5');
       expect(countsTowardSendBreaker(error)).toBe(false);
+      expect(provesNothingSent(error)).toBe(true);
     });
 
     it('answers 400 for a body cut off mid-read', async () => {
@@ -126,6 +138,7 @@ describe('loadRemoteMediaBuffer', () => {
       const invalid = new TypeError('Invalid URL');
       (undiciFetch as jest.Mock).mockRejectedValue(invalid);
       expect(await failureOf()).toBe(invalid);
+      expect(provesNothingSent(invalid)).toBe(false);
     });
 
     it('leaves any other error unchanged', async () => {
@@ -133,6 +146,14 @@ describe('loadRemoteMediaBuffer', () => {
       (undiciFetch as jest.Mock).mockRejectedValue(boom);
       expect(await failureOf()).toBe(boom);
     });
+  });
+
+  // The credentials refusal parses the URL first; one that does not parse is the SSRF guard's to name.
+  it('leaves an unparsable URL to the SSRF guard', async () => {
+    const error = await loadRemoteMediaBuffer('http://', undefined).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SsrfBlockedError);
+    expect((error as Error).message).toMatch(/^Invalid URL/);
+    expect(undiciFetch).not.toHaveBeenCalled();
   });
 
   /**
@@ -157,7 +178,7 @@ describe('loadRemoteMediaBuffer', () => {
       const body = JSON.stringify((error as ServiceUnavailableException).getResponse());
       expect(body).not.toMatch(/10\.0\.0\.5|proxy\.example|secret/);
       expect(countsTowardSendBreaker(error)).toBe(false);
-      // Nothing reached WhatsApp, so a paced send hands its admission back.
+      // Nothing reached WhatsApp, so a bulk item or a product send hands its admission back.
       expect(sentNothing(error)).toBe(true);
     });
 

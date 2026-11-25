@@ -4,6 +4,7 @@ import i18n from '../i18n';
 
 interface Props {
   children: ReactNode;
+  resetKey?: string;
 }
 
 interface State {
@@ -19,6 +20,12 @@ export class ErrorBoundary extends Component<Props, State> {
 
   static getDerivedStateFromError(error: Error): State {
     return { hasError: true, error };
+  }
+
+  componentDidUpdate(prevProps: Props) {
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false, error: null });
+    }
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
@@ -38,13 +45,13 @@ export class ErrorBoundary extends Component<Props, State> {
             flexDirection: 'column',
             alignItems: 'center',
             justifyContent: 'center',
-            minHeight: '100vh',
+            minHeight: this.props.resetKey !== undefined ? '60vh' : '100vh',
             padding: '2rem',
             fontFamily: 'system-ui, sans-serif',
             color: 'var(--text-primary)',
           }}
         >
-          <AlertCircle size={48} style={{ color: 'var(--error)', marginBottom: '1rem' }} />
+          <AlertCircle size={48} style={{ color: 'var(--error-text)', marginBottom: '1rem' }} />
           <h1 style={{ fontSize: '1.5rem', marginBottom: '0.5rem' }}>{i18n.t('errorBoundary.title')}</h1>
           <p style={{ color: 'var(--text-muted)', marginBottom: '1.5rem', textAlign: 'center' }}>
             {i18n.t('errorBoundary.description')}
@@ -57,7 +64,7 @@ export class ErrorBoundary extends Component<Props, State> {
               gap: '0.5rem',
               padding: '0.75rem 1.5rem',
               backgroundColor: 'var(--primary)',
-              color: 'white',
+              color: '#0f172a',
               border: 'none',
               borderRadius: '0.5rem',
               cursor: 'pointer',

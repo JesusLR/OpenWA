@@ -324,10 +324,14 @@ describe('one prerelease rule across the GitHub Release and the image channels',
 
 /**
  * check:audit skips when npm's audit endpoint cannot answer, so an npm outage does not block every
- * merge. The release and the weekly scan must not take that skip: one would publish, the other would
- * report the week clean, with no advisory checked. CHECK_AUDIT_REQUIRED=1 turns the skip into a failure.
+ * merge. A release, of the image or of the JavaScript SDK, and the weekly scan must not take that skip:
+ * one would publish, the other would report the week clean, with no advisory checked.
+ * CHECK_AUDIT_REQUIRED=1 turns the skip into a failure.
  */
 describe('the release and weekly audits fail when the audit cannot run', () => {
+  // The gate as the root runs it and as another tree starts it from its own directory.
+  const ROOT_AUDIT = 'npm run check:audit';
+  const RUNS_AUDIT = /npm run check:audit|scripts\/check-audit\.mjs/;
   type AuditStep = { run?: string; env?: Record<string, unknown> };
   type AuditWorkflow = { jobs?: Record<string, { steps?: AuditStep[] }> };
   const auditWorkflow = (file: string): AuditWorkflow =>
@@ -338,7 +342,7 @@ describe('the release and weekly audits fail when the audit cannot run', () => {
   const auditSteps = (workflow: AuditWorkflow, read: (run: string) => string): AuditStep[] =>
     Object.values(workflow.jobs ?? {})
       .flatMap(job => job.steps ?? [])
-      .filter(step => read(step.run ?? '').includes('npm run check:audit'));
+      .filter(step => RUNS_AUDIT.test(read(step.run ?? '')));
   const unrequired = (workflow: AuditWorkflow): string[] => [
     ...(auditSteps(workflow, executableLinesConservative).length === 0 ? ['no step certainly runs the audit'] : []),
     ...auditSteps(workflow, executableLines)
@@ -346,11 +350,13 @@ describe('the release and weekly audits fail when the audit cannot run', () => {
       .map(() => 'a step that may run the audit does not require it'),
   ];
 
-  it.each(['release.yml', 'security-scan.yml'])('%s requires the audit', file => {
+  const REQUIRED = ['release.yml', 'security-scan.yml', 'js-sdk-release.yml'];
+
+  it.each(REQUIRED)('%s requires the audit', file => {
     expect(unrequired(auditWorkflow(file))).toEqual([]);
   });
 
-  it.each(['release.yml', 'security-scan.yml'])('%s: refuses an audit step that does not require it', file => {
+  it.each(REQUIRED)('%s: refuses an audit step that does not require it', file => {
     const copy = (): AuditWorkflow => JSON.parse(JSON.stringify(auditWorkflow(file))) as AuditWorkflow;
     const anyJob = (workflow: AuditWorkflow): AuditStep[] => Object.values(workflow.jobs ?? {})[0].steps ?? [];
     // Each blank the shell reads as part of a word: the `#` after it is no comment, so the audit after the `;`
@@ -361,13 +367,21 @@ describe('the release and weekly audits fail when the audit cannot run', () => {
       anyJob(extra).push({ run: `echo x${blank}#; npm run check:audit` });
       expect([code, unrequired(extra)]).toEqual([code, ['a step that may run the audit does not require it']]);
     }
+    // The form another tree uses is held to the same rule.
+    const tree = copy();
+    anyJob(tree).push({ run: 'cd dashboard && node ../scripts/check-audit.mjs' });
+    expect(unrequired(tree)).toEqual(['a step that may run the audit does not require it']);
     // The same line behind a space is a comment, and the real step with its requirement taken off is not.
     const comment = copy();
     anyJob(comment).push({ run: 'echo x # npm run check:audit' });
     expect(unrequired(comment)).toEqual([]);
     const lax = copy();
     for (const step of auditSteps(lax, executableLines)) step.env = { CHECK_AUDIT_REQUIRED: '0' };
-    expect(unrequired(lax)).toEqual(['a step that may run the audit does not require it']);
+    // One per audit step: a workflow that audits several trees has several.
+    expect(auditSteps(lax, executableLines).length).toBeGreaterThan(0);
+    expect(unrequired(lax)).toEqual(
+      auditSteps(lax, executableLines).map(() => 'a step that may run the audit does not require it'),
+    );
     // A step that only names the audit behind such a blank and a `#` is no audit: one must really run.
     const named = copy();
     for (const step of auditSteps(named, executableLines))
@@ -382,11 +396,130 @@ describe('the release and weekly audits fail when the audit cannot run', () => {
     expect(paragraph).not.toMatch(/exact\s+`audit`/);
   });
 
-  it('ci.yml keeps the skip for merges', () => {
+  it('ci.yml keeps the skip for merges in the root step alone', () => {
     const ci = auditWorkflow('ci.yml');
-    expect(auditSteps(ci, executableLinesConservative).length).toBeGreaterThan(0);
+    const rootSteps = (read: (run: string) => string): AuditStep[] =>
+      auditSteps(ci, read).filter(step => read(step.run ?? '').includes(ROOT_AUDIT));
+    expect(rootSteps(executableLinesConservative).length).toBeGreaterThan(0);
     // Every step that may run it, not only one that certainly does.
-    expect(auditSteps(ci, executableLines).some(step => step.env?.CHECK_AUDIT_REQUIRED !== undefined)).toBe(false);
+    expect(rootSteps(executableLines).some(step => step.env?.CHECK_AUDIT_REQUIRED !== undefined)).toBe(false);
+    // The other two trees fail on an outage, so a merge is not read as audited with only the root asked.
+    const others = auditSteps(ci, executableLines).filter(step => !rootSteps(executableLines).includes(step));
+    expect(others).toHaveLength(2);
+    expect(others.filter(step => step.env?.CHECK_AUDIT_REQUIRED !== '1')).toEqual([]);
+  });
+});
+
+/**
+ * An audit that a condition skips, or that may fail without failing its job, checks nothing while the job reads as
+ * passed. So no job that has a step running the audit, and no such step, carries a condition or continue-on-error,
+ * and the release workflows, which read the step line by line, hold nothing else in it: an export that undoes
+ * CHECK_AUDIT_REQUIRED, `set +e`, `|| true` or an `exit 0` changes how the step ends without touching the audit line.
+ * The edits are applied to a copy of each real step and job, so every one of them has to turn the check red.
+ */
+describe('an audit step cannot be skipped, softened or surrounded by lines that change how it ends', () => {
+  type SoftStep = { run?: string; if?: unknown; 'continue-on-error'?: unknown };
+  type SoftJob = { if?: unknown; 'continue-on-error'?: unknown; steps?: SoftStep[] };
+  type SoftWorkflow = { jobs?: Record<string, SoftJob> };
+  const FILES = ['ci.yml', 'security-scan.yml', 'js-sdk-release.yml', 'release.yml'];
+  const READ_LINE_BY_LINE = ['release.yml', 'js-sdk-release.yml'];
+  // A step may run the audit as the exact reading sees it, as auditSteps does for the requirement above.
+  const RUNS_THE_AUDIT = /npm run check:audit|scripts\/check-audit\.mjs/;
+  const AUDIT_LINE = /^(?:cd \S+ && )?(?:npm run check:audit|node (?:\.\.\/)+scripts\/check-audit\.mjs)$/;
+
+  const workflowOf = (file: string): SoftWorkflow =>
+    yaml.load(fs.readFileSync(path.join(workflowDir, file), 'utf8')) as SoftWorkflow;
+  const copyOf = (file: string): SoftWorkflow => JSON.parse(JSON.stringify(workflowOf(file))) as SoftWorkflow;
+  const holders = (workflow: SoftWorkflow) =>
+    Object.entries(workflow.jobs ?? {}).flatMap(([name, job]) => {
+      const steps = (job.steps ?? []).filter(step => RUNS_THE_AUDIT.test(executableLines(step.run ?? '')));
+      return steps.length === 0 ? [] : [{ name, job, steps }];
+    });
+
+  /** What lets an audit be skipped, or fail without failing its job. */
+  const softened = (workflow: SoftWorkflow): string[] =>
+    holders(workflow).flatMap(({ name, job, steps }) => [
+      ...(job['continue-on-error'] !== undefined ? [`job ${name}: continue-on-error`] : []),
+      ...(job.if !== undefined ? [`job ${name}: a condition of its own`] : []),
+      ...steps.flatMap(step => [
+        ...(step.if !== undefined ? [`job ${name}: a step that runs the audit has a condition`] : []),
+        ...(step['continue-on-error'] !== undefined ? [`job ${name}: a step that runs the audit may fail`] : []),
+      ]),
+    ]);
+  /** The lines of a step that runs the audit other than the audit command itself. */
+  const otherLines = (workflow: SoftWorkflow): string[] =>
+    holders(workflow).flatMap(({ steps }) =>
+      steps.flatMap(step =>
+        executableLines(step.run ?? '')
+          .split('\n')
+          .map(stripBlanks)
+          .filter(line => line !== '' && !AUDIT_LINE.test(line)),
+      ),
+    );
+
+  it.each(FILES)('%s: no job or step that runs the audit is conditional or allowed to fail', file => {
+    expect(holders(workflowOf(file)).length).toBeGreaterThan(0);
+    expect(softened(workflowOf(file))).toEqual([]);
+  });
+
+  it.each(READ_LINE_BY_LINE)('%s: a step that runs the audit runs nothing else', file => {
+    expect(holders(workflowOf(file)).length).toBeGreaterThan(0);
+    expect(otherLines(workflowOf(file))).toEqual([]);
+  });
+
+  type Edit = (job: SoftJob, step: SoftStep) => void;
+  const stepEdits: Array<[string, Edit]> = [
+    ['continue-on-error on the step', (_job, step) => void (step['continue-on-error'] = true)],
+    ['a false condition on the step', (_job, step) => void (step.if = false)],
+  ];
+  const jobEdits: Array<[string, Edit]> = [
+    ['continue-on-error on the job', job => void (job['continue-on-error'] = true)],
+    ['a false condition on the job', job => void (job.if = false)],
+  ];
+  // [description, file, job, which of the job's audit steps, edit]: one case per audit step and per audit job.
+  const softCases = FILES.flatMap(file =>
+    holders(workflowOf(file)).flatMap(({ name, steps }) => [
+      ...steps.flatMap((_step, at) =>
+        stepEdits.map(
+          ([edit, apply]) => [`${file} job ${name} audit step ${at + 1}: ${edit}`, file, name, at, apply] as const,
+        ),
+      ),
+      ...jobEdits.map(([edit, apply]) => [`${file} job ${name}: ${edit}`, file, name, 0, apply] as const),
+    ]),
+  );
+
+  it.each(softCases)('refuses %s', (_description, file, jobName, at, edit) => {
+    const workflow = copyOf(file);
+    expect(softened(workflow)).toEqual([]);
+    const holder = holders(workflow).find(({ name }) => name === jobName);
+    edit(holder!.job, holder!.steps[at]);
+
+    expect(softened(workflow)).not.toEqual([]);
+  });
+
+  const runEdits: Array<[string, (run: string) => string]> = [
+    ['an export of CHECK_AUDIT_REQUIRED=0 before the audit', run => `export CHECK_AUDIT_REQUIRED=0\n${run}`],
+    ['set +e before the audit and a command that succeeds after', run => `set +e\n${run}\ntrue`],
+    ['|| true on the audit line', run => run.replace(/(check:audit|check-audit\.mjs)/, '$1 || true')],
+    ['an exit 0 after the audit', run => `${run}\nexit 0`],
+  ];
+  const lineCases = READ_LINE_BY_LINE.flatMap(file =>
+    holders(workflowOf(file)).flatMap(({ name, steps }) =>
+      steps.flatMap((_step, at) =>
+        runEdits.map(
+          ([edit, apply]) => [`${file} job ${name} audit step ${at + 1}: ${edit}`, file, name, at, apply] as const,
+        ),
+      ),
+    ),
+  );
+
+  it.each(lineCases)('refuses %s', (_description, file, jobName, at, edit) => {
+    const workflow = copyOf(file);
+    expect(otherLines(workflow)).toEqual([]);
+    const step = holders(workflow).find(({ name }) => name === jobName)!.steps[at];
+    step.run = edit(step.run ?? '');
+
+    expect(otherLines(workflow)).not.toEqual([]);
   });
 });
 
@@ -401,8 +534,11 @@ describe('every npm tree is audited and kept current', () => {
       .stdout.split('\n')
       .filter(Boolean)
       .map(file => path.posix.dirname(file).replace(/^\.$/, ''));
+  // One gate for every tree, so an advisory excused by id is excused wherever its entry names the tree.
   const auditCommand = (tree: string): string =>
-    tree === '' ? 'npm run check:audit' : `cd ${tree} && npm audit --audit-level=high`;
+    tree === ''
+      ? 'npm run check:audit'
+      : `cd ${tree} && node ${'../'.repeat(tree.split('/').length)}scripts/check-audit.mjs`;
 
   it('finds every tree', () => {
     expect(trees()).toEqual(expect.arrayContaining(['', 'dashboard', 'sdk/javascript']));
@@ -424,7 +560,11 @@ describe('every npm tree is audited and kept current', () => {
     return workflow.jobs[job].steps.flatMap((step, index) =>
       executableLines(step.run ?? '')
         .split('\n')
-        .map(line => /^(?:cd (\S+) && )?npm (?:run check:audit|audit --audit-level=high)$/.exec(stripBlanks(line)))
+        .map(line =>
+          /^(?:cd (\S+) && )?(?:npm run check:audit|node (?:\.\.\/)+scripts\/check-audit\.mjs)$/.exec(
+            stripBlanks(line),
+          ),
+        )
         .flatMap(match =>
           match ? [{ index, step, tree: path.posix.join(cwd, match[1] ?? '').replace(/^\.$/, '') }] : [],
         ),
@@ -756,6 +896,56 @@ describe('both paths exercise the real engine libraries', () => {
     }
   });
 
+  /**
+   * Runs scripts/smoke-test-engine-libs.sh against a stub `docker` that records every call. What follows the
+   * image name is what the container would run: a `find` runs on the host inside a synthetic /app (the image's
+   * working directory), the migration CLI prints `listing`, and anything else is only recorded.
+   */
+  const smokeAgainstStubDocker = (
+    options: { platform?: string; layout?: (app: string) => void; listing?: string } = {},
+  ): { status: number | null; stderr: string; runs: string[] } => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-libs-docker-'));
+    try {
+      const app = path.join(dir, 'app');
+      fs.mkdirSync(path.join(app, 'node_modules', '.bin'), { recursive: true });
+      options.layout?.(app);
+      const calls = path.join(dir, 'calls');
+      fs.writeFileSync(
+        path.join(dir, 'docker'),
+        [
+          '#!/bin/sh',
+          'if [ "$1" = version ]; then echo amd64; exit 0; fi',
+          `printf '%s\\n@@end@@\\n' "$*" >> '${calls}'`,
+          'while [ "$#" -gt 0 ] && [ "$1" != img ]; do shift; done',
+          'if [ "$#" -gt 0 ]; then shift; fi',
+          'case "$1" in',
+          `  find) cd '${app}' && exec "$@" ;;`,
+          '  npm) printf "%s" "$MIGRATION_LISTING" ;;',
+          'esac',
+          '',
+        ].join('\n'),
+        { mode: 0o755 },
+      );
+      // The CLI underlines each line it lists where the environment advertises color.
+      const esc = String.fromCharCode(27);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PATH: `${dir}:${process.env.PATH}`,
+        OPENWA_SMOKE_IMAGE: 'img',
+        MIGRATION_LISTING: options.listing ?? `${esc}[4m[ ] AddMessageStatus1770108659848${esc}[24m\n`,
+      };
+      delete env.OPENWA_SMOKE_PLATFORM;
+      if (options.platform) env.OPENWA_SMOKE_PLATFORM = options.platform;
+      const result = spawnSync('sh', [path.join(__dirname, '..', '..', 'scripts', 'smoke-test-engine-libs.sh')], {
+        env,
+      });
+      const runs = fs.readFileSync(calls, 'utf8').split('@@end@@\n').filter(Boolean);
+      return { status: result.status, stderr: result.stderr.toString(), runs };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
   // A full browser launch under QEMU user emulation is slow and unreliable, and the release gate
   // cannot fail on an emulator fault. An emulated platform runs the browser binary instead; the
   // daemon's own platform, and the host-platform run in ci.yml, still launch it.
@@ -764,35 +954,88 @@ describe('both paths exercise the real engine libraries', () => {
     ['linux/amd64', true],
     ['linux/arm64', false],
   ])('the engine library smoke on %s launches the browser: %s', (platform, launches) => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-libs-docker-'));
-    try {
-      const calls = path.join(dir, 'calls');
-      fs.writeFileSync(
-        path.join(dir, 'docker'),
-        `#!/bin/sh\nif [ "$1" = version ]; then echo amd64; exit 0; fi\nprintf '%s\\n@@end@@\\n' "$*" >> '${calls}'\n`,
-        { mode: 0o755 },
-      );
-      const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}:${process.env.PATH}`, OPENWA_SMOKE_IMAGE: 'img' };
-      delete env.OPENWA_SMOKE_PLATFORM;
-      if (platform) env.OPENWA_SMOKE_PLATFORM = platform;
-      const result = spawnSync('sh', [path.join(__dirname, '..', '..', 'scripts', 'smoke-test-engine-libs.sh')], {
-        env,
-      });
-      expect(result.status).toBe(0);
-      const runs = fs.readFileSync(calls, 'utf8').split('@@end@@\n').filter(Boolean);
-      expect(runs).toHaveLength(2);
-      const browser = runs[1];
-      expect(browser).toContain("require('whatsapp-web.js')");
-      if (platform) expect(browser).toContain(`--platform ${platform}`);
-      if (launches) {
-        expect(browser).toContain('.launch(');
-      } else {
-        expect(browser).not.toContain('.launch(');
-        expect(browser).toContain('--version');
-      }
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+    const { status, runs } = smokeAgainstStubDocker({ platform });
+    expect(status).toBe(0);
+    expect(runs).toHaveLength(4);
+    const browser = runs[1];
+    expect(browser).toContain("require('whatsapp-web.js')");
+    if (platform) expect(browser).toContain(`--platform ${platform}`);
+    if (launches) {
+      expect(browser).toContain('.launch(');
+    } else {
+      expect(browser).not.toContain('.launch(');
+      expect(browser).toContain('--version');
     }
+  });
+
+  // The image is built per platform, so the toolchain check and the migration CLI run on each, an
+  // emulated one included.
+  it.each([undefined, 'linux/amd64', 'linux/arm64'])(
+    'the engine library smoke on %s checks the toolchain and runs the migration CLI',
+    platform => {
+      const [toolchain, migrations] = smokeAgainstStubDocker({ platform }).runs.slice(2);
+      expect(toolchain).toContain('find node_modules node_modules/.bin');
+      expect(migrations).toContain('npm run --silent migration:show:prod');
+      if (platform) {
+        expect(toolchain).toContain(`--platform ${platform}`);
+        expect(migrations).toContain(`--platform ${platform}`);
+      }
+    },
+  );
+
+  // npm ci --omit=dev keeps typescript and ts-node (devDependencies that valibot and typeorm list as optional
+  // peers), so the Dockerfile removes both with their bin links and the smoke proves it on the built image.
+  // A bin link left behind by a removal that stopped halfway is dangling, which a plain existence test misses.
+  const danglingBin = (app: string, name: string, target: string): void =>
+    fs.symlinkSync(target, path.join(app, 'node_modules', '.bin', name));
+  const leftovers: Array<[string, string, (app: string) => void]> = [
+    [
+      'a typescript package',
+      'node_modules/typescript',
+      app => fs.mkdirSync(path.join(app, 'node_modules', 'typescript')),
+    ],
+    ['a ts-node package', 'node_modules/ts-node', app => fs.mkdirSync(path.join(app, 'node_modules', 'ts-node'))],
+    ['a dangling tsc link', 'node_modules/.bin/tsc', app => danglingBin(app, 'tsc', '../typescript/bin/tsc')],
+    [
+      'a dangling tsserver link',
+      'node_modules/.bin/tsserver',
+      app => danglingBin(app, 'tsserver', '../typescript/bin/tsserver'),
+    ],
+    [
+      'a dangling ts-script link',
+      'node_modules/.bin/ts-script',
+      app => danglingBin(app, 'ts-script', '../ts-node/dist/bin-script-deprecated.js'),
+    ],
+    [
+      'a dangling ts-node-esm link',
+      'node_modules/.bin/ts-node-esm',
+      app => danglingBin(app, 'ts-node-esm', '../ts-node/dist/bin-esm.js'),
+    ],
+  ];
+
+  it('the engine library smoke passes an image without the TypeScript toolchain', () => {
+    // The neighbours a loose pattern would catch: the typeorm package and its CLI link, and tslib.
+    const { status, runs } = smokeAgainstStubDocker({
+      layout: app => {
+        fs.mkdirSync(path.join(app, 'node_modules', 'typeorm'));
+        fs.mkdirSync(path.join(app, 'node_modules', 'tslib'));
+        fs.writeFileSync(path.join(app, 'node_modules', '.bin', 'typeorm'), '');
+      },
+    });
+    expect(status).toBe(0);
+    expect(runs).toHaveLength(4);
+  });
+
+  it.each(leftovers)('the engine library smoke fails on %s left in the image', (_what, leftover, layout) => {
+    const { status, stderr } = smokeAgainstStubDocker({ layout });
+    expect(status).not.toBe(0);
+    expect(stderr).toContain(leftover);
+  });
+
+  it('the engine library smoke fails when the migration CLI lists no migration', () => {
+    const { status, stderr } = smokeAgainstStubDocker({ listing: '' });
+    expect(status).not.toBe(0);
+    expect(stderr).toContain('migration:show:prod');
   });
 
   it('the lane script names the spec it runs', () => {
@@ -802,5 +1045,43 @@ describe('both paths exercise the real engine libraries', () => {
     const specs = (pkg.scripts['test:engine-real'] ?? '').split(/\s+/).filter(token => token.endsWith('.spec.mjs'));
     expect(specs.length).toBeGreaterThan(0);
     for (const spec of specs) expect(fs.existsSync(path.join(__dirname, '..', '..', spec))).toBe(true);
+  });
+});
+
+/**
+ * trivy-action installs Trivy through contrib/install.sh, which downloads the tarball from get.trivy.dev. That
+ * name returned NXDOMAIN on 2026-11-04 and the weekly scan failed before it started; the scan a release waits
+ * for installs Trivy the same way. Both scan jobs install the pinned release from GitHub themselves, against a
+ * digest kept in scripts/install-trivy.sh, and tell the action to use that binary.
+ */
+describe('the image scans install the pinned Trivy release themselves', () => {
+  type ScanStep = { uses?: string; run?: string; with?: Record<string, unknown> };
+  const scanSteps = (file: string): ScanStep[] =>
+    (
+      yaml.load(fs.readFileSync(path.join(workflowDir, file), 'utf8')) as {
+        jobs?: Record<string, { steps?: ScanStep[] }>;
+      }
+    ).jobs?.['image-scan']?.steps ?? [];
+  const script = path.join(__dirname, '..', '..', 'scripts', 'install-trivy.sh');
+
+  it.each(['release.yml', 'security-scan.yml'])('%s installs Trivy before the scan and has the action use it', file => {
+    const steps = scanSteps(file);
+    const install = steps.findIndex(step => step.run?.trim() === './scripts/install-trivy.sh');
+    const scan = steps.findIndex(step => (step.uses ?? '').startsWith('aquasecurity/trivy-action'));
+    expect(install).toBeGreaterThanOrEqual(0);
+    expect(scan).toBeGreaterThan(install);
+    expect(String(steps[scan].with?.['skip-setup-trivy'])).toBe('true');
+    expect(steps.filter(step => (step.uses ?? '').startsWith('aquasecurity/setup-trivy'))).toEqual([]);
+  });
+
+  it('install-trivy.sh pins a release and its SHA-256, verifies the download, and can be executed', () => {
+    const text = fs.readFileSync(script, 'utf8');
+    expect(text).toMatch(/^VERSION=\d+\.\d+\.\d+$/m);
+    expect(text).toMatch(/^SHA256=[0-9a-f]{64}$/m);
+    // Lines the shell runs: a comment that names the check, or a `|| true` after it, does not count as the check.
+    const code = executableLines(text);
+    expect(code).toMatch(/^set -eu$/m);
+    expect(code).toMatch(/^echo "\$SHA256 {2}\$archive" \| sha256sum --check --strict -$/m);
+    expect(fs.statSync(script).mode & 0o111).not.toBe(0);
   });
 });

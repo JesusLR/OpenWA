@@ -1,7 +1,20 @@
-import type { z } from 'zod';
+import { z } from 'zod';
+import { MAX_SESSION_ID_LENGTH } from '../../modules/session/session-id.pipe';
 import type { ApiKey } from '../../modules/auth/entities/api-key.entity';
 import type { ApiKeyRole } from '../../modules/auth/entities/api-key.entity';
 import type { ChatScopeService } from '../../modules/auth/chat-scope.service';
+
+/**
+ * A session id taken by a tool, bounded as the REST routes bound it (SessionIdPipe): letters, digits and hyphens, at
+ * most MAX_SESSION_ID_LENGTH characters. The tools call the services directly, so the pipe never runs, and any other
+ * id would reach the lookup, which has to cut what it quotes in its not-found answer.
+ */
+export const sessionIdSchema = z
+  .string()
+  .min(1)
+  .max(MAX_SESSION_ID_LENGTH)
+  .regex(/^[A-Za-z0-9-]+$/, 'a session id holds only letters, digits and hyphens')
+  .describe('Session UUID (the session id, not the name)');
 
 /** A single agent-invocable capability. Protocol-neutral: no MCP types here. */
 export interface ToolDescriptor<I = unknown> {
@@ -11,6 +24,8 @@ export interface ToolDescriptor<I = unknown> {
   description: string;
   /** Input contract: validates the call AND is advertised to the agent. */
   inputSchema: z.ZodType<I>;
+  /** Human-readable name shown to the user (MCP `title`). Defaults to the name split into words: 'Message send text'. */
+  title?: string;
   tier: 'read' | 'write';
   /** True for irreversible or state-overwriting ops; surfaced to MCP clients as destructiveHint. */
   destructive?: boolean;
@@ -24,10 +39,14 @@ export interface ToolDescriptor<I = unknown> {
   chatScope?: readonly string[] | 'filtered' | 'agnostic';
   /** The quote resolves within the authorized chat, as it does on the REST reply route. */
   chatQuotedAllowed?: boolean;
-  /** Result rendering hint for the MCP adapter. Default 'smart'. */
-  resultDisposition?: 'json' | 'smart';
+  /**
+   * True when the tool returns text authored by external WhatsApp users (messages, captions,
+   * contact/chat names, group subjects/descriptions). MCP frames such results in a randomized
+   * data-boundary envelope so clients treat the payload strictly as untrusted data.
+   */
+  returnsUntrustedContent?: boolean;
   /** Calls the service. Receives validated input + the resolved, scoped key. */
-  handler: (input: I, apiKey: ApiKey, chatScope?: ChatScopeService) => Promise<unknown>;
+  handler: (input: I, apiKey: ApiKey, chatScope?: ChatScopeService, signal?: AbortSignal) => Promise<unknown>;
 }
 
 /**
@@ -44,8 +63,43 @@ export interface ToolDescriptor<I = unknown> {
  */
 export type AnyToolDescriptor = Omit<ToolDescriptor, 'inputSchema' | 'handler'> & {
   inputSchema: z.ZodType;
-  handler: (input: never, apiKey: ApiKey, chatScope?: ChatScopeService) => Promise<unknown>;
+  handler: (input: never, apiKey: ApiKey, chatScope?: ChatScopeService, signal?: AbortSignal) => Promise<unknown>;
 };
+
+/** How many unrecognized argument names an error lists, and how much of each. */
+const UNKNOWN_KEYS_SHOWN = 5;
+const UNKNOWN_KEY_MAX_CHARS = 64;
+
+/**
+ * The error for arguments a tool does not name. The default message lists every one in full, and the transport
+ * answers with it before the tool runs, so a caller who sends a megabyte of names would get a megabyte back.
+ */
+function unknownKeysMessage(keys: readonly string[]): string {
+  const shown = keys
+    .slice(0, UNKNOWN_KEYS_SHOWN)
+    .map(key => JSON.stringify(key.length > UNKNOWN_KEY_MAX_CHARS ? `${key.slice(0, UNKNOWN_KEY_MAX_CHARS)}...` : key));
+  const more = keys.length > shown.length ? ` (and ${keys.length - shown.length} more)` : '';
+  return `Unrecognized key${keys.length === 1 ? '' : 's'}: ${shown.join(', ')}${more}`;
+}
+
+/** The schema-level error map of a strict object. The def types it for an issue of `never`, hence the cast. */
+const unknownKeysError = ((issue: { code: string; keys?: string[] }) =>
+  issue.code === 'unrecognized_keys' && issue.keys
+    ? unknownKeysMessage(issue.keys)
+    : undefined) as unknown as z.core.$ZodErrorMap<never>;
+
+/**
+ * Make an input object refuse arguments it does not name, as REST refuses a body property its DTO does not
+ * declare. A tool call that carried one used to run with it silently dropped: a misspelled `quotedMessageId`
+ * sent the message unquoted, a misspelled filter listed everything. The published schema then says
+ * `additionalProperties: false`, so a client knows before it calls. Object-level checks are kept.
+ * defineTool applies it to every input; a nested object that is not a whole input applies it itself.
+ */
+export function refuseUnknownArguments<S extends z.ZodType>(schema: S): S {
+  if (!(schema instanceof z.ZodObject)) return schema;
+  const object: z.ZodObject = schema;
+  return object.clone({ ...object.def, catchall: z.never(), error: unknownKeysError }) as unknown as S;
+}
 
 /**
  * Declare one tool, tying its handler to its own schema.
@@ -57,5 +111,5 @@ export type AnyToolDescriptor = Omit<ToolDescriptor, 'inputSchema' | 'handler'> 
  * whatever the schema produces, so the two cannot drift apart.
  */
 export function defineTool<I>(descriptor: ToolDescriptor<I>): AnyToolDescriptor {
-  return descriptor;
+  return { ...descriptor, inputSchema: refuseUnknownArguments(descriptor.inputSchema) };
 }

@@ -1,8 +1,3 @@
-// StorageService (imported transitively by the infra controllers) pulls in `archiver`
-// v8, which is ESM-only and cannot be parsed by ts-jest. The controller logic
-// under test never touches archiver, so a lightweight stub is sufficient.
-jest.mock('archiver', () => ({ default: jest.fn() }));
-
 // saveConfig writes the generated env via fs.writeFileSync and reads the existing file
 // via fs.existsSync/readFileSync; mock those so tests assert produced content without
 // touching the filesystem. existsSync defaults to false (no prior config) — except for
@@ -503,6 +498,62 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     expect(held).toBe(0);
   });
 
+  describe('gives the query runner back when the transaction never opens', () => {
+    const watchRunners = (prepare: (runner: ReturnType<DataSource['createQueryRunner']>) => void) => {
+      const releases: jest.SpyInstance[] = [];
+      const realCreate = ds.createQueryRunner.bind(ds);
+      jest.spyOn(ds, 'createQueryRunner').mockImplementation((...args: Parameters<typeof realCreate>) => {
+        const runner = realCreate(...args);
+        prepare(runner);
+        releases.push(jest.spyOn(runner, 'release'));
+        return runner;
+      });
+      return releases;
+    };
+
+    it('when BEGIN fails', async () => {
+      await seedSession('s1');
+      const dump = await controller.exportData();
+      const releases = watchRunners(runner => {
+        runner.startTransaction = () => Promise.reject(new Error('BEGIN failed'));
+      });
+
+      await expect(controller.importData({ tables: dump.tables })).rejects.toThrow('BEGIN failed');
+
+      expect(releases).toHaveLength(1);
+      expect(releases[0]).toHaveBeenCalledTimes(1);
+      jest.restoreAllMocks();
+    });
+
+    it('when another transaction already holds the connection', async () => {
+      await seedSession('s1');
+      const dump = await controller.exportData();
+      const releases = watchRunners(runner => {
+        Object.defineProperty(runner, 'isTransactionActive', { value: true });
+      });
+
+      await expect(controller.importData({ tables: dump.tables })).rejects.toMatchObject({
+        response: { code: 'IMPORT_NESTED_TRANSACTION' },
+      });
+
+      expect(releases).toHaveLength(1);
+      expect(releases[0]).toHaveBeenCalledTimes(1);
+      jest.restoreAllMocks();
+    });
+
+    it('and still reports the failure of BEGIN when giving the runner back fails too', async () => {
+      await seedSession('s1');
+      const dump = await controller.exportData();
+      watchRunners(runner => {
+        runner.startTransaction = () => Promise.reject(new Error('BEGIN failed'));
+        runner.release = () => Promise.reject(new Error('release failed'));
+      });
+
+      await expect(controller.importData({ tables: dump.tables })).rejects.toThrow('BEGIN failed');
+      jest.restoreAllMocks();
+    });
+  });
+
   it('does not suspend loss detection on a dialect where each query runner has its own connection', async () => {
     await seedSession('s1');
     const dump = await controller.exportData();
@@ -576,10 +627,16 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     // better-sqlite3 hands out one runner per DataSource, so the patch is undone on that instance.
     const runner = ds.createQueryRunner();
     const realQuery = runner.query.bind(runner);
+    const sessionSettings: string[] = [];
     jest.spyOn(ds, 'createQueryRunner').mockImplementation(() => {
       let aborted = false;
       runner.query = ((...callArgs: Parameters<typeof realQuery>) => {
         const sql = callArgs[0];
+        // PostgreSQL accepts the transaction-local settings the import opens with; SQLite has no SET.
+        if (/^SET LOCAL /.test(sql)) {
+          sessionSettings.push(sql);
+          return Promise.resolve([]);
+        }
         if (aborted && sql !== 'ROLLBACK') {
           return Promise.reject(
             new Error('current transaction is aborted, commands ignored until end of transaction block'),
@@ -608,6 +665,9 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
       'Failed to import session s1: duplicate key value violates unique constraint "PK_sessions"',
     ]);
     expect((await ds.getRepository(Session).find()).map(s => s.id).sort()).toEqual(['s1', 's2']);
+    // The clears scale with the live tables, so the runtime statement timeout is lifted for this
+    // transaction (a lock wait keeps its bound).
+    expect(sessionSettings).toEqual(['SET LOCAL statement_timeout = 0', 'SET LOCAL lock_timeout = 30000']);
   });
 
   it('leaves a session that had no claim unclaimed rather than inventing one', async () => {
@@ -1092,7 +1152,7 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     ]);
   });
 
-  it('round-trips plugin instances + integration delivery failures (Integration Fabric + DLQ)', async () => {
+  it('redacts plugin instance secrets by default and restores safely with regenerated secrets disabled', async () => {
     await seedSession('s1');
     await ds.getRepository(PluginInstance).save(
       ds.getRepository(PluginInstance).create({
@@ -1101,8 +1161,24 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
         instanceId: 'acct1',
         sessionScope: 's1',
         secret: 'hmac-secret',
-        verifyToken: null,
-        config: { baseUrl: 'https://x' },
+        verifyToken: 'verify-tok',
+        config: {
+          baseUrl: 'https://x',
+          apiToken: 'top-secret-token',
+          nested: { publicKey: 'pub', clientSecret: 'nested-secret' },
+        },
+        enabled: true,
+      }),
+    );
+    await ds.getRepository(PluginInstance).save(
+      ds.getRepository(PluginInstance).create({
+        id: 'unloaded-plugin:acct2',
+        pluginId: 'unloaded-plugin',
+        instanceId: 'acct2',
+        sessionScope: 's1',
+        secret: 'other-secret',
+        verifyToken: 'other-vt',
+        config: { unknownKey: 'maybe-secret' },
         enabled: true,
       }),
     );
@@ -1120,25 +1196,200 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
       }),
     );
 
-    const dump = await controller.exportData();
-    expect(dump.counts.pluginInstances).toBe(1);
+    const loader = {
+      getPlugin: (id: string) =>
+        id === 'chatwoot'
+          ? {
+              manifest: {
+                id: 'chatwoot',
+                configSchema: {
+                  type: 'object',
+                  properties: {
+                    baseUrl: { type: 'string' },
+                    apiToken: { type: 'string', secret: true },
+                    nested: {
+                      type: 'object',
+                      properties: {
+                        publicKey: { type: 'string' },
+                        clientSecret: { type: 'string', secret: true },
+                      },
+                    },
+                  },
+                },
+              },
+            }
+          : undefined,
+    };
+    const moduleRef = {
+      get: jest.fn((token: unknown) => (token === PluginLoaderService ? loader : undefined)),
+    };
+    const scopedController = new InfraDataController(
+      new InfraDataService(cfg as never, ds, undefined, undefined, undefined, undefined, undefined, moduleRef as never),
+    );
+
+    const dump = await scopedController.exportData();
+    expect(dump.counts.pluginInstances).toBe(2);
     expect(dump.counts.integrationDeliveryFailures).toBe(1);
+
+    const exportedChatwoot = dump.tables.pluginInstances.find(r => r.id === 'chatwoot:acct1')!;
+    expect('secret' in exportedChatwoot).toBe(false);
+    expect('verifyToken' in exportedChatwoot).toBe(false);
+    const parsedConfig: unknown =
+      typeof exportedChatwoot.config === 'string' ? JSON.parse(exportedChatwoot.config) : exportedChatwoot.config;
+    expect(parsedConfig).toEqual({ baseUrl: 'https://x', nested: { publicKey: 'pub' } });
+    expect(JSON.stringify(exportedChatwoot)).not.toContain('***');
+    expect(JSON.stringify(exportedChatwoot)).not.toContain('hmac-secret');
+    expect(JSON.stringify(exportedChatwoot)).not.toContain('top-secret-token');
+    expect(JSON.stringify(exportedChatwoot)).not.toContain('nested-secret');
+
+    const exportedUnloaded = dump.tables.pluginInstances.find(r => r.id === 'unloaded-plugin:acct2')!;
+    expect('secret' in exportedUnloaded).toBe(false);
+    expect('verifyToken' in exportedUnloaded).toBe(false);
+    expect('config' in exportedUnloaded).toBe(false);
+
+    const res = await scopedController.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(res.counts.pluginInstances).toBe(2);
+    expect(res.counts.integrationDeliveryFailures).toBe(1);
+    expect(res.notices.some(n => n.includes('chatwoot:acct1') && n.includes('unloaded-plugin:acct2'))).toBe(true);
+
+    const pi1 = await ds.getRepository(PluginInstance).findOneByOrFail({ id: 'chatwoot:acct1' });
+    expect(pi1.secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(pi1.secret).not.toBe('hmac-secret');
+    expect(pi1.secret).not.toBe('***');
+    expect(pi1.verifyToken).toBeNull();
+    expect(pi1.enabled).toBe(false);
+    expect(pi1.config).toEqual({ baseUrl: 'https://x', nested: { publicKey: 'pub' } });
+
+    const pi2 = await ds.getRepository(PluginInstance).findOneByOrFail({ id: 'unloaded-plugin:acct2' });
+    expect(pi2.secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(pi2.verifyToken).toBeNull();
+    expect(pi2.enabled).toBe(false);
+    expect(pi2.config).toBeNull();
+
+    const dlf = await ds.getRepository(IntegrationDeliveryFailure).findOneByOrFail({ deliveryId: 'd1' });
+    expect(dlf.lastError).toBe('boom');
+    expect(dlf.payload).toEqual({ foo: 'bar' });
+  });
+
+  it('round-trips plugin instance secrets when includePluginSecrets=true opt-in is passed', async () => {
+    await seedSession('s1');
+    await ds.getRepository(PluginInstance).save(
+      ds.getRepository(PluginInstance).create({
+        id: 'chatwoot:acct1',
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        sessionScope: 's1',
+        secret: 'hmac-secret',
+        verifyToken: 'verify-tok',
+        config: { baseUrl: 'https://x', apiToken: 'top-secret-token' },
+        enabled: true,
+      }),
+    );
+
+    const dump = await controller.exportData('true');
+    expect(dump.counts.pluginInstances).toBe(1);
+    expect(dump.tables.pluginInstances[0].secret).toBe('hmac-secret');
+    expect(dump.tables.pluginInstances[0].verifyToken).toBe('verify-tok');
 
     const res = await controller.importData({ tables: dump.tables });
 
     expect(res.warnings).toEqual([]);
     expect(res.imported).toBe(true);
-    expect(res.counts.pluginInstances).toBe(1);
-    expect(res.counts.integrationDeliveryFailures).toBe(1);
+    expect(res.notices.some(n => n.includes('plugin instance'))).toBe(false);
 
-    expect(await ds.getRepository(PluginInstance).count()).toBe(1);
-    expect(await ds.getRepository(IntegrationDeliveryFailure).count()).toBe(1);
     const pi = await ds.getRepository(PluginInstance).findOneByOrFail({ id: 'chatwoot:acct1' });
-    expect(pi.secret).toBe('hmac-secret'); // ingress HMAC secret survives a SQLite→Postgres migration
-    expect(pi.config).toEqual({ baseUrl: 'https://x' });
-    const dlf = await ds.getRepository(IntegrationDeliveryFailure).findOneByOrFail({ deliveryId: 'd1' });
-    expect(dlf.lastError).toBe('boom');
-    expect(dlf.payload).toEqual({ foo: 'bar' });
+    expect(pi.secret).toBe('hmac-secret');
+    expect(pi.verifyToken).toBe('verify-tok');
+    expect(pi.enabled).toBe(true);
+    expect(pi.config).toEqual({ baseUrl: 'https://x', apiToken: 'top-secret-token' });
+  });
+
+  it.each(['1', 'yes', '', 'TRUE', 'false ', ['true', 'false'] as unknown as string])(
+    'rejects malformed includePluginSecrets=%j with 400 BadRequestException',
+    async badValue => {
+      await expect(controller.exportData(badValue)).rejects.toThrow(BadRequestException);
+    },
+  );
+
+  it('keeps plugin instance secrets redacted when includePluginSecrets=false and fails closed on empty schema or malformed secret-item array', async () => {
+    await seedSession('s1');
+    await ds.getRepository(PluginInstance).save(
+      ds.getRepository(PluginInstance).create({
+        id: 'chatwoot:acct-arr',
+        pluginId: 'chatwoot',
+        instanceId: 'acct-arr',
+        sessionScope: 's1',
+        secret: 'hmac-secret',
+        verifyToken: 'verify-tok',
+        config: {
+          baseUrl: 'https://x',
+          // Malformed non-array stored under an array-of-secrets schema field must still be deleted.
+          secretTokens: 'not-an-array-but-secret',
+        },
+        enabled: true,
+      }),
+    );
+    await ds.getRepository(PluginInstance).save(
+      ds.getRepository(PluginInstance).create({
+        id: 'empty-schema:acct-empty',
+        pluginId: 'empty-schema',
+        instanceId: 'acct-empty',
+        sessionScope: 's1',
+        secret: 'other-secret',
+        verifyToken: 'other-vt',
+        config: { opaqueToken: 'must-not-leak' },
+        enabled: true,
+      }),
+    );
+
+    const loader = {
+      getPlugin: (id: string) => {
+        if (id === 'chatwoot') {
+          return {
+            manifest: {
+              id: 'chatwoot',
+              configSchema: {
+                type: 'object',
+                properties: {
+                  baseUrl: { type: 'string' },
+                  secretTokens: { type: 'array', items: { type: 'string', secret: true } },
+                },
+              },
+            },
+          };
+        }
+        if (id === 'empty-schema') {
+          return {
+            manifest: {
+              id: 'empty-schema',
+              configSchema: { type: 'object', properties: {} },
+            },
+          };
+        }
+        return undefined;
+      },
+    };
+    const moduleRef = {
+      get: jest.fn((token: unknown) => (token === PluginLoaderService ? loader : undefined)),
+    };
+    const scopedController = new InfraDataController(
+      new InfraDataService(cfg as never, ds, undefined, undefined, undefined, undefined, undefined, moduleRef as never),
+    );
+
+    const dump = await scopedController.exportData('false');
+    const chatwoot = dump.tables.pluginInstances.find(r => r.id === 'chatwoot:acct-arr')!;
+    expect('secret' in chatwoot).toBe(false);
+    expect('verifyToken' in chatwoot).toBe(false);
+    const parsedConfig: unknown = typeof chatwoot.config === 'string' ? JSON.parse(chatwoot.config) : chatwoot.config;
+    expect(parsedConfig).toEqual({ baseUrl: 'https://x' });
+
+    const emptySchema = dump.tables.pluginInstances.find(r => r.id === 'empty-schema:acct-empty')!;
+    expect('secret' in emptySchema).toBe(false);
+    expect('verifyToken' in emptySchema).toBe(false);
+    expect('config' in emptySchema).toBe(false);
   });
 
   // conversation_mappings' map() was never invoked by any prior test — a param transcription slip
@@ -1551,7 +1802,7 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
   it('restores lid_mappings instead of dropping them on a backup→restore', async () => {
     await seedSession('s1');
     const lidRepo = ds.getRepository(LidMapping);
-    await lidRepo.save(lidRepo.create({ lid: '111', phone: '628111', sessionId: 's1' }));
+    await lidRepo.save(lidRepo.create({ lid: '111', phone: '628111', sessionId: 's1', isReported: true }));
     await lidRepo.save(lidRepo.create({ lid: '222', phone: null, sessionId: 's1' })); // negative cache
 
     const dump = await controller.exportData();
@@ -1566,6 +1817,39 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect(await lidRepo.count()).toBe(2);
     expect((await lidRepo.findOneByOrFail({ lid: '111' })).phone).toBe('628111');
     expect((await lidRepo.findOneByOrFail({ lid: '222' })).phone).toBeNull();
+    expect((await lidRepo.findOneByOrFail({ lid: '111' })).isReported).toBe(true);
+    expect((await lidRepo.findOneByOrFail({ lid: '222' })).isReported).toBe(false);
+
+    const mappings = (dump.tables as unknown as { lidMappings: { isReported?: boolean | number }[] }).lidMappings;
+    for (const mapping of mappings) delete mapping.isReported;
+    const legacy = await controller.importData({ tables: dump.tables });
+    expect(legacy.warnings).toEqual([]);
+    expect((await lidRepo.findOneByOrFail({ lid: '111' })).isReported).toBe(false);
+  });
+
+  // The mark of a deleted chat outlives a restart because the stored messages it guards do, and a
+  // restore brings both back.
+  it('restores the deletion mark of a chat state, and reads an archive taken without one as none', async () => {
+    await seedSession('s1');
+    const repo = ds.getRepository(ChatState);
+    await repo.save([
+      repo.create({ sessionId: 's1', chatId: '628111@s.whatsapp.net', deletedAt: 1790000000000 }),
+      repo.create({ sessionId: 's1', chatId: '120363@g.us', pinned: true }),
+    ]);
+
+    const dump = await controller.exportData();
+    await repo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(await repo.findOneByOrFail({ chatId: '628111@s.whatsapp.net' })).toMatchObject({ deletedAt: 1790000000000 });
+    expect(await repo.findOneByOrFail({ chatId: '120363@g.us' })).toMatchObject({ pinned: true, deletedAt: null });
+
+    const states = (dump.tables as unknown as { chatStates: { deletedAt?: number | null }[] }).chatStates;
+    for (const state of states) delete state.deletedAt;
+    const legacy = await controller.importData({ tables: dump.tables });
+    expect(legacy.warnings).toEqual([]);
+    expect((await repo.findOneByOrFail({ chatId: '628111@s.whatsapp.net' })).deletedAt).toBeNull();
   });
 
   // Restoring ONTO the instance that produced the archive is the rollback flow, and it is the one the
@@ -2003,6 +2287,30 @@ describe('InfraDataController audit trail — import emits only on a committed r
     expect(actions).toContain(AuditAction.INFRA_DATA_IMPORTED);
   });
 
+  it('records each orphan session it stops, even when the restore is then rolled back', async () => {
+    await seedSession('s1');
+    const audit = { logInfo: jest.fn().mockResolvedValue(null) };
+    const sessionService = {
+      getActiveSessionIds: () => ['ghost'],
+      stopOrphanEngines: jest.fn().mockResolvedValue({ stopped: ['ghost'], notRunning: [], failed: [] }),
+    };
+    const controller = new InfraDataController(
+      new InfraDataService(cfg as never, ds, audit as never, sessionService as never),
+    );
+    const dump = await controller.exportData();
+    // A repeated primary key fails its insert inside the transaction, which rolls the restore back.
+    dump.tables.sessions = [dump.tables.sessions[0], dump.tables.sessions[0]];
+
+    const res = await controller.importData({ tables: dump.tables, stopOrphans: true });
+
+    expect(res.imported).toBe(false);
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { sessionId?: string; metadata?: unknown }]>;
+    expect(calls.filter(([action]) => action === AuditAction.INFRA_DATA_IMPORTED)).toEqual([]);
+    expect(calls.filter(([action]) => action === AuditAction.SESSION_STOPPED)).toEqual([
+      [AuditAction.SESSION_STOPPED, { sessionId: 'ghost', metadata: { via: 'infra_import_data' } }],
+    ]);
+  });
+
   it('does NOT emit INFRA_DATA_IMPORTED when an empty backup is refused (no data changed)', async () => {
     await seedSession('s1');
     const audit = { logInfo: jest.fn().mockResolvedValue(null) };
@@ -2426,6 +2734,42 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
     expect(await ds.query('SELECT lid, phone FROM lid_mappings')).toEqual([{ lid: '3', phone: '628123' }]);
   });
 
+  // Boot no longer converts the raw whatsapp-web.js tokens on a migration-managed database, so an archive taken
+  // before the neutral vocabulary has to be converted by the import that restores it.
+  it('converts the raw message types of a restored archive and leaves the neutral ones alone', async () => {
+    await seedSession('s1');
+    const dump = await build().exportData();
+    const at = dump.tables.sessions[0].updatedAt;
+    const message = (id: string, type: string) => ({
+      id,
+      sessionId: 's1',
+      waMessageId: `W-${id}`,
+      chatId: 'c@c.us',
+      chatName: null,
+      author: null,
+      from: 'c@c.us',
+      to: 'me@c.us',
+      body: 'hello',
+      type,
+      direction: MessageDirection.INCOMING,
+      timestamp: 1,
+      metadata: null,
+      status: MessageStatus.DELIVERED,
+      createdAt: at,
+      mediaPath: null,
+      mediaMimetype: null,
+    });
+    const types = ['chat', 'ptt', 'vcard', 'multi_vcard', 'image', 'call_log', 'text'];
+
+    const res = await build().importData({
+      tables: { ...dump.tables, messages: types.map((type, i) => message(`m${i}`, type)) },
+    });
+
+    expect(res.imported).toBe(true);
+    const stored = await ds.query<Array<{ id: string; type: string }>>('SELECT id, type FROM messages ORDER BY id');
+    expect(stored.map(row => row.type)).toEqual(['text', 'voice', 'contact', 'contact', 'image', 'call_log', 'text']);
+  });
+
   it('exports and restores automation_rules, which the session wipe would otherwise cascade away', async () => {
     await seedSession('s1');
     const ruleRepo = ds.getRepository(AutomationRule);
@@ -2667,6 +3011,29 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
     expect(await ds.getRepository(Session).count()).toBe(1);
   });
 
+  // Committed, such a row made every entity read of it throw: GET /sessions answered 500 for every session, and the
+  // webhook lookup of each event read the session's webhooks as none.
+  it.each([
+    ['a session config', 'Skipped session s1: config is not valid JSON'],
+    ['webhook headers', 'Skipped webhook wh1: headers is not valid JSON'],
+  ])('refuses an archive whose %s does not parse, replacing nothing', async (_case, warning) => {
+    await seedSession('s1');
+    await ds.getRepository(Webhook).save({ id: 'wh0', sessionId: 's1', url: 'https://example.com/kept' });
+    const dump = await build().exportData();
+    const [session] = dump.tables.sessions as unknown as Record<string, unknown>[];
+    const webhook = { id: 'wh1', sessionId: 's1', url: 'https://example.com/hook', events: ['message.received'] };
+    const tables = warning.includes('session')
+      ? { ...dump.tables, sessions: [{ ...session, config: '{"maxReconnectAttempts": 3' }] }
+      : { ...dump.tables, webhooks: [{ ...webhook, headers: '{"Authorization": "Bearer x"' }] };
+
+    const res = await build().importData({ tables: tables as never });
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings).toEqual([warning]);
+    expect(await ds.getRepository(Session).find()).toHaveLength(1);
+    expect((await ds.getRepository(Webhook).find()).map(w => w.id)).toEqual(['wh0']);
+  });
+
   it('still reports the engines it already stopped when the import rolls back', async () => {
     // The pre-flight teardown runs BEFORE the transaction opens and cannot be rolled back with it.
     // An operator reading imported:false plus empty orphan arrays would conclude nothing happened,
@@ -2798,9 +3165,16 @@ describe('InfraDataController audit trail (light-dependency handlers)', () => {
       },
     });
     await controller.exportData();
-    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { counts: { sessions: number } } }]>;
+    const calls = audit.logInfo.mock.calls as Array<
+      [AuditAction, { metadata: { counts: { sessions: number }; includePluginSecrets: boolean } }]
+    >;
     expect(calls[0][0]).toBe(AuditAction.INFRA_DATA_EXPORTED);
     expect(calls[0][1].metadata.counts.sessions).toBe(0);
+    expect(calls[0][1].metadata.includePluginSecrets).toBe(false);
+
+    await controller.exportData('true');
+    expect(calls[1][0]).toBe(AuditAction.INFRA_DATA_EXPORTED);
+    expect(calls[1][1].metadata.includePluginSecrets).toBe(true);
   });
 });
 
@@ -3061,9 +3435,9 @@ describe('InfraDataController.importData re-syncs plugin instance bindings', () 
   const serviceWith = (moduleRef: unknown) =>
     new InfraDataService(cfg as never, ds, undefined, undefined, undefined, undefined, undefined, moduleRef as never);
 
-  it('retires the binding of an instance the backup does not contain', async () => {
+  it('retires the binding of an instance the backup does not contain (opt-in plaintext export)', async () => {
     await seed();
-    const dump = await new InfraDataController(serviceWith(undefined)).exportData();
+    const dump = await new InfraDataController(serviceWith(undefined)).exportData('true');
     const tables = {
       ...dump.tables,
       pluginInstances: dump.tables.pluginInstances?.filter(row => row.instanceId !== 'dropped'),
@@ -3086,6 +3460,33 @@ describe('InfraDataController.importData re-syncs plugin instance bindings', () 
     expect(plugin.sessionConfig).toEqual({ 'sess-1': {}, 'sess-2': { token: 'token-kept' } });
   });
 
+  it('retires all bindings when importing a default-redacted export (kept instance restored disabled)', async () => {
+    await seed();
+    const dump = await new InfraDataController(serviceWith(undefined)).exportData();
+    const tables = {
+      ...dump.tables,
+      pluginInstances: dump.tables.pluginInstances?.filter(row => row.instanceId !== 'dropped'),
+    };
+    const { plugin, loader } = statefulLoader();
+    const scopeBinding = new ScopeBindingService(
+      new PluginInstanceService(ds.getRepository(PluginInstance)),
+      loader as unknown as PluginLoaderService,
+      { logInfo: jest.fn(), logWarn: jest.fn() } as never,
+      ds.getRepository(Session),
+    );
+    const moduleRef = {
+      get: jest.fn((token: unknown) => (token === ScopeBindingService ? scopeBinding : undefined)),
+    };
+
+    const res = await new InfraDataController(serviceWith(moduleRef)).importData({ tables });
+
+    expect(res.imported).toBe(true);
+    expect(res.restartRequired).toBe(false);
+    expect(res.notices.some(n => n.includes('chatwoot:kept'))).toBe(true);
+    expect(plugin.activeSessions).toEqual([]);
+    expect(plugin.sessionConfig).toEqual({ 'sess-1': {}, 'sess-2': {} });
+  });
+
   it('commits the import and reports a failed resync as a notice with restartRequired', async () => {
     await seed();
     const dump = await new InfraDataController(serviceWith(undefined)).exportData();
@@ -3104,5 +3505,44 @@ describe('InfraDataController.importData re-syncs plugin instance bindings', () 
         expect.objectContaining({ pluginId: 'chatwoot', sessionScope: 'sess-2', enabled: true }),
       ]),
     );
+  });
+});
+
+describe('InfraDataService.exportData PostgreSQL snapshot isolation', () => {
+  it('wraps PostgreSQL export queries in one READ ONLY REPEATABLE READ transaction with statement_timeout = 0', async () => {
+    const runnerQueries: string[] = [];
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      startTransaction: jest.fn().mockResolvedValue(undefined),
+      commitTransaction: jest.fn().mockResolvedValue(undefined),
+      rollbackTransaction: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn((sql: string) => {
+        runnerQueries.push(sql);
+        return Promise.resolve([]);
+      }),
+      isTransactionActive: true,
+    };
+    const entityMetadatas = EXPORT_TABLES.map(e => ({ tableName: e.table }));
+    const pgDs = {
+      options: { type: 'postgres' },
+      entityMetadatas,
+      createQueryRunner: jest.fn().mockReturnValue(runner),
+      query: jest.fn().mockResolvedValue([]),
+    };
+    const svc = new InfraDataService(
+      { get: (k: string, d?: unknown) => (k === 'dataDatabase.type' ? 'postgres' : d) } as never,
+      pgDs as never,
+    );
+
+    await svc.exportData();
+
+    expect(pgDs.createQueryRunner).toHaveBeenCalledTimes(1);
+    expect(runner.startTransaction).toHaveBeenCalledWith('REPEATABLE READ');
+    expect(runnerQueries[0]).toMatch(/SET TRANSACTION READ ONLY/i);
+    expect(runnerQueries[1]).toMatch(/SET LOCAL statement_timeout = 0/i);
+    expect(runner.commitTransaction).toHaveBeenCalledTimes(1);
+    expect(runner.release).toHaveBeenCalledTimes(1);
+    expect(pgDs.query).not.toHaveBeenCalled();
   });
 });

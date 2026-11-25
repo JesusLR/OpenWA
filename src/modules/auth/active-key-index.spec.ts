@@ -86,6 +86,27 @@ describe('ActiveKeyIndex', () => {
     expect(index.recognise({ 'x-api-key': 'k1' }, '192.0.2.1')).toBe(sha('k1'));
   });
 
+  it('recovers and populates the index when an initial bootstrap read fails transiently', async () => {
+    let attempts = 0;
+    const { index } = indexOver(() => {
+      attempts++;
+      if (attempts === 1) return Promise.reject(new Error('transient bootstrap db connection error'));
+      return Promise.resolve([row('k-bootstrap')]);
+    });
+
+    // Initial bootstrap load fails transiently; index stays empty without throwing
+    await index.onApplicationBootstrap();
+    expect(index.recognise({ 'x-api-key': 'k-bootstrap' }, '192.0.2.1')).toBeUndefined();
+
+    // Extra refresh (e.g. from seedApiKey bootstrap resilience) attempts reload
+    index.refreshSoon();
+    await (index as unknown as { loading: Promise<void> }).loading;
+    index.onModuleDestroy();
+
+    // Now populated successfully
+    expect(index.recognise({ 'x-api-key': 'k-bootstrap' }, '192.0.2.1')).toBe(sha('k-bootstrap'));
+  });
+
   it('runs one more load when asked to refresh during a load, and none after destroy', async () => {
     let rows = [row('k1')];
     const { index, find } = indexOver(() => Promise.resolve(rows));
@@ -140,5 +161,53 @@ describe('ActiveKeyIndex', () => {
     index.onModuleDestroy();
     await jest.advanceTimersByTimeAsync(60_000);
     expect(find).toHaveBeenCalledTimes(2);
+  });
+
+  it('recognises active browser session cookies for pre-body-parser keyed classification except on header-only paths', async () => {
+    const keyRow = { id: 'key-1', ...row('k1', { allowedIps: ['10.0.0.1'] }) };
+    const sessionToken = 'browser-session-tok-1';
+    const sessionRepo = {
+      find: jest.fn().mockResolvedValue([
+        {
+          tokenHash: sha(sessionToken),
+          apiKeyId: 'key-1',
+          expiresAt: new Date(Date.now() + 60_000),
+          revokedAt: null,
+        },
+      ]),
+    };
+    const keyRepo = { find: jest.fn().mockResolvedValue([keyRow]) };
+    const IndexCtor = ActiveKeyIndex as unknown as new (...args: unknown[]) => ActiveKeyIndex;
+    const index = new IndexCtor(keyRepo, sessionRepo);
+    await index.onApplicationBootstrap();
+    try {
+      expect(index.recognise({ cookie: `openwa_session=${sessionToken}` }, '10.0.0.1', '/api/infra/import-data')).toBe(
+        sha('k1'),
+      );
+      expect(
+        index.recognise({ cookie: `openwa_session=${sessionToken}` }, '10.0.0.99', '/api/infra/import-data'),
+      ).toBeUndefined();
+      expect(index.recognise({ cookie: `openwa_session=${sessionToken}` }, '10.0.0.1', '/mcp')).toBeUndefined();
+      expect(index.recognise({ cookie: `openwa_session=${sessionToken}` }, '10.0.0.1', '/api/metrics')).toBeUndefined();
+      expect(
+        index.recognise({ cookie: `openwa_session=${sessionToken}` }, '10.0.0.1', '/api/admin/queues'),
+      ).toBeUndefined();
+      // Header precedence: invalid or whitespace-only X-API-Key does not fall back to a valid cookie.
+      expect(
+        index.recognise(
+          { 'x-api-key': 'wrong', cookie: `openwa_session=${sessionToken}` },
+          '10.0.0.1',
+          '/api/sessions',
+        ),
+      ).toBeUndefined();
+      expect(
+        index.recognise({ 'x-api-key': '   ', cookie: `openwa_session=${sessionToken}` }, '10.0.0.1', '/api/sessions'),
+      ).toBeUndefined();
+      // ActiveKeyIndex.load() filters out expired rows at query time (expiresAt > now).
+      const findCalls = sessionRepo.find.mock.calls as Array<Array<{ where?: { expiresAt?: unknown } }>>;
+      expect(findCalls[0]?.[0]?.where?.expiresAt).toBeDefined();
+    } finally {
+      index.onModuleDestroy();
+    }
   });
 });

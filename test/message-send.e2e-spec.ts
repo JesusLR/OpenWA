@@ -1,6 +1,3 @@
-// archiver v8 is ESM-only (pulled in transitively via @Global StorageModule); stub for ts-jest CJS.
-jest.mock('archiver', () => ({ TarArchive: jest.fn() }));
-
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -12,6 +9,7 @@ import { applyGlobalValidation } from './../src/config/app-validation';
 import { AuthService } from './../src/modules/auth/auth.service';
 import { ApiKeyRole } from './../src/modules/auth/entities/api-key.entity';
 import { Session } from './../src/modules/session/entities/session.entity';
+import { SessionOwnershipService } from './../src/modules/session/session-ownership.service';
 import { EngineRegistry } from './../src/engine/engine-registry.service';
 import type { IWhatsAppEngine, MessageResult } from './../src/engine/interfaces/whatsapp-engine.interface';
 
@@ -94,6 +92,7 @@ describe('Message send endpoints (e2e)', () => {
     sessionId = (await sessionRepo.save(sessionRepo.create({ name: `e2e-send-${Date.now()}` }))).id;
 
     app.get(EngineRegistry).set(sessionId, engine as unknown as IWhatsAppEngine);
+    expect(await app.get(SessionOwnershipService).claim(sessionId)).toBe(true);
     operatorKey = (await app.get(AuthService).createApiKey({ name: 'e2e-send', role: ApiKeyRole.OPERATOR })).rawKey;
 
     // A real template row via the real route, so send-template exercises resolution and rendering
@@ -114,11 +113,7 @@ describe('Message send endpoints (e2e)', () => {
 
   afterAll(async () => {
     process.env.SIMULATE_TYPING = prevSimulateTyping;
-    try {
-      await app?.close();
-    } catch {
-      /* ignore teardown-only multi-datasource quirk */
-    }
+    await app?.close();
   });
 
   beforeEach(() => jest.clearAllMocks());
@@ -129,6 +124,23 @@ describe('Message send endpoints (e2e)', () => {
     expect(res.body).toEqual({ messageId: result.id, timestamp: result.timestamp });
     expect(engine.sendTextMessage).toHaveBeenCalledTimes(1);
     expect(engine.sendTextMessage).toHaveBeenCalledWith('628123@c.us', 'hello from e2e');
+  });
+
+  // Implicit conversion used to rewrite these into their string forms, so the engine was called with
+  // '[object Object]' or 'true' and the customer received that as the message.
+  it.each([[{ order: 42 }], [true]])('send-text refuses a text of %j and never reaches the engine', async text => {
+    await post('send-text', { chatId: '628123@c.us', text }).expect(400);
+    await post('send-text', { chatId: text, text: 'hello' }).expect(400);
+
+    expect(engine.sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  // A number keeps the conversion every release has had: no-code clients post a value held as a number,
+  // and the engine receives its decimal string.
+  it('send-text still reads a numeric text as its decimal string', async () => {
+    await post('send-text', { chatId: '628123@c.us', text: 5 }).expect(201);
+
+    expect(engine.sendTextMessage).toHaveBeenCalledWith('628123@c.us', '5');
   });
 
   it('send-image returns 201 and hands the base64 payload to the engine', async () => {

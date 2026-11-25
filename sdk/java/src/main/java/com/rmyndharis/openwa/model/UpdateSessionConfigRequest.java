@@ -2,8 +2,8 @@ package com.rmyndharis.openwa.model;
 
 /**
  * Partial update of a session's configuration — no re-link and no QR scan. {@code autoRejectCalls}
- * applies immediately; {@code maxReconnectAttempts} and {@code reconnectBaseDelay} apply on the
- * next start.
+ * and {@code linkPreview} apply immediately; {@code maxReconnectAttempts} and
+ * {@code reconnectBaseDelay} apply on the next start.
  *
  * <p>The route needs THREE states per field, not two: an absent key leaves the value unchanged, a key
  * sent as explicit null clears it back to the default, and a value sets it. A record of nullable
@@ -18,9 +18,30 @@ public record UpdateSessionConfigRequest(
         Boolean autoRejectCalls,
         Integer maxReconnectAttempts,
         Integer reconnectBaseDelay,
+        Boolean linkPreview,
         boolean clearAutoRejectCalls,
         boolean clearMaxReconnectAttempts,
-        boolean clearReconnectBaseDelay) {
+        boolean clearReconnectBaseDelay,
+        boolean clearLinkPreview) {
+
+    /** Back-compatible constructor without {@code linkPreview} or {@code clearLinkPreview}. */
+    public UpdateSessionConfigRequest(
+            Boolean autoRejectCalls,
+            Integer maxReconnectAttempts,
+            Integer reconnectBaseDelay,
+            boolean clearAutoRejectCalls,
+            boolean clearMaxReconnectAttempts,
+            boolean clearReconnectBaseDelay) {
+        this(
+                autoRejectCalls,
+                maxReconnectAttempts,
+                reconnectBaseDelay,
+                null,
+                clearAutoRejectCalls,
+                clearMaxReconnectAttempts,
+                clearReconnectBaseDelay,
+                false);
+    }
 
     public static Builder builder() {
         return new Builder();
@@ -30,11 +51,16 @@ public record UpdateSessionConfigRequest(
         private Boolean autoRejectCalls;
         private Integer maxReconnectAttempts;
         private Integer reconnectBaseDelay;
+        private Boolean linkPreview;
         private boolean clearAutoRejectCalls;
         private boolean clearMaxReconnectAttempts;
         private boolean clearReconnectBaseDelay;
+        private boolean clearLinkPreview;
 
-        /** Auto-reject incoming calls. */
+        /**
+         * Auto-reject incoming calls. Baileys only: whatsapp-web.js stores the flag but cannot reject a
+         * call, so calls keep ringing there.
+         */
         public Builder autoRejectCalls(Boolean v) {
             this.autoRejectCalls = v;
             return this;
@@ -49,6 +75,15 @@ public record UpdateSessionConfigRequest(
         /** Base delay of the reconnect backoff, in milliseconds. */
         public Builder reconnectBaseDelay(Integer v) {
             this.reconnectBaseDelay = v;
+            return this;
+        }
+
+        /**
+         * Link preview for a send-text or send-template that sets neither {@code linkPreview} nor
+         * {@code customLinkPreview}.
+         */
+        public Builder linkPreview(Boolean v) {
+            this.linkPreview = v;
             return this;
         }
 
@@ -70,14 +105,22 @@ public record UpdateSessionConfigRequest(
             return this;
         }
 
+        /** Send an explicit null for linkPreview, restoring the engine's own default. */
+        public Builder clearLinkPreview() {
+            this.clearLinkPreview = true;
+            return this;
+        }
+
         public UpdateSessionConfigRequest build() {
             return new UpdateSessionConfigRequest(
                     autoRejectCalls,
                     maxReconnectAttempts,
                     reconnectBaseDelay,
+                    linkPreview,
                     clearAutoRejectCalls,
                     clearMaxReconnectAttempts,
-                    clearReconnectBaseDelay);
+                    clearReconnectBaseDelay,
+                    clearLinkPreview);
         }
     }
 }

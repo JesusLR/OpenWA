@@ -2,10 +2,15 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import type { MessageService } from '../../../modules/message/message.service';
 import type { GroupService } from '../../../modules/group/group.service';
+import type { SessionService } from '../../../modules/session/session.service';
 import {
   CHAT_ID_MAX_LENGTH,
+  MEDIA_CAPTION_MAX_LENGTH,
+  MEDIA_FILENAME_MAX_LENGTH,
   MENTIONS_MAX,
   MESSAGE_TEXT_MAX_LENGTH,
+  SendAudioMessageDto,
+  SendMediaMessageDto,
   SendTextMessageDto,
 } from '../../../modules/message/dto/send-message.dto';
 import {
@@ -27,6 +32,11 @@ import {
   GroupSubjectDto,
   ParticipantsDto,
 } from '../../../modules/group/dto/group.dto';
+import { MAX_SESSION_ID_LENGTH, SessionIdPipe } from '../../../modules/session/session-id.pipe';
+import { MarkChatReadDto } from '../../../modules/session/dto/mark-chat-read.dto';
+import { MarkChatUnreadDto } from '../../../modules/session/dto/mark-chat-unread.dto';
+import { SubscribePresenceDto } from '../../../modules/session/dto/presence.dto';
+import { SendChatStateDto } from '../../../modules/session/dto/send-chat-state.dto';
 import { z } from 'zod';
 import type { AnyToolDescriptor } from '../tool-descriptor';
 import { allAgentTools } from '.';
@@ -38,7 +48,7 @@ import { groupTools } from './group.tools';
 const PIPE_TRANSFORM_OPTS = { enableImplicitConversion: true };
 
 const messages = messageTools({} as unknown as MessageService);
-const groups = groupTools({} as unknown as GroupService);
+const groups = groupTools({} as unknown as GroupService, {} as unknown as SessionService);
 
 function tool(name: string): AnyToolDescriptor {
   const found = [...messages, ...groups].find(t => t.name === name);
@@ -55,6 +65,27 @@ interface CapCase {
   dtoClass: new () => object;
   dtoPayload: Record<string, unknown>;
 }
+
+// The five media tools share one pair of free-text fields with the media DTOs. They restated the numbers as
+// literals once, which only this parity would have caught drifting, so each tool is paired with its own body.
+const MEDIA_TOOLS: Array<[string, new () => object]> = [
+  ['MessageSendImage', SendMediaMessageDto],
+  ['MessageSendVideo', SendMediaMessageDto],
+  ['MessageSendAudio', SendAudioMessageDto],
+  ['MessageSendDocument', SendMediaMessageDto],
+  ['MessageSendSticker', SendMediaMessageDto],
+];
+const MEDIA_CASES: CapCase[] = MEDIA_TOOLS.flatMap(([toolName, dtoClass]) =>
+  (['filename', 'caption'] as const).map(field => ({
+    label: `${toolName}.${field} ↔ ${dtoClass.name}.${field}`,
+    toolName,
+    field,
+    cap: field === 'filename' ? MEDIA_FILENAME_MAX_LENGTH : MEDIA_CAPTION_MAX_LENGTH,
+    toolInput: { sessionId: 's1', chatId: 'x@c.us', url: 'https://example.com/a.bin' },
+    dtoClass,
+    dtoPayload: { chatId: 'x@c.us', url: 'https://example.com/a.bin' },
+  })),
+);
 
 // Every string field whose Zod schema previously had no max while the equivalent REST DTO
 // enforces one via class-validator. Both sides now read the same exported constant.
@@ -140,6 +171,7 @@ const CASES: CapCase[] = [
     dtoClass: GroupDescriptionDto,
     dtoPayload: { description: 'rules' },
   },
+  ...MEDIA_CASES,
 ];
 
 // Same parity idea as the string caps above, for the participants arrays: the Zod schemas had
@@ -264,8 +296,106 @@ describe('agent-tool chat ids are capped as the REST bodies cap them', () => {
     );
   });
 
+  // A JID of the given length, so the cap is what accepts or rejects it on the fields that also check the shape.
+  const jidOfLength = (length: number): string => `${'x'.repeat(length - 2)}@c`;
+
   it.each(chatFields)('%s accepts an id at the cap and rejects one past it', (_label, schema) => {
-    expect(schema.safeParse('x'.repeat(CHAT_ID_MAX_LENGTH)).success).toBe(true);
-    expect(schema.safeParse('x'.repeat(CHAT_ID_MAX_LENGTH + 1)).success).toBe(false);
+    expect(schema.safeParse(jidOfLength(CHAT_ID_MAX_LENGTH)).success).toBe(true);
+    expect(schema.safeParse(jidOfLength(CHAT_ID_MAX_LENGTH + 1)).success).toBe(false);
+  });
+});
+
+/**
+ * Three chat routes also require the form localpart@host with no whitespace, and the tools call the
+ * service directly, so without the same rule a malformed id reaches the engine as a failed call where
+ * REST answers 400. Each tool must accept and reject exactly the ids its REST body does.
+ */
+describe('MCP tool chat ids take the shape the REST bodies require', () => {
+  const tools = allAgentTools({} as never);
+  const CASES: Array<[string, new () => object, Record<string, unknown>]> = [
+    ['SessionSubscribePresence', SubscribePresenceDto, {}],
+    ['SessionMarkChatRead', MarkChatReadDto, {}],
+    ['SessionMarkChatUnread', MarkChatUnreadDto, {}],
+    ['SessionSendChatState', SendChatStateDto, { state: 'typing' }],
+  ];
+  const WELL_FORMED = ['628123@c.us', '120363@g.us', '1234@s.whatsapp.net', '9876@lid'];
+  const MALFORMED = [
+    'abc',
+    '@c.us',
+    '628123@',
+    ' 628123@c.us',
+    '628123@c.us ',
+    '628123@c.us\n',
+    'a b@c.us',
+    '@@',
+    '628123@c.us@g.us',
+  ];
+
+  it.each(CASES)('%s accepts and rejects the same chat ids as its REST body', async (name, dtoClass, extra) => {
+    const tool = tools.find(t => t.name === name)!;
+    for (const chatId of [...WELL_FORMED, ...MALFORMED]) {
+      const toolAccepts = tool.inputSchema.safeParse({ sessionId: 's1', chatId, ...extra }).success;
+      const errors = await validate(plainToInstance(dtoClass, { chatId, ...extra }, PIPE_TRANSFORM_OPTS));
+      const restAccepts = !errors.some(e => e.property === 'chatId');
+      expect({ chatId, toolAccepts }).toEqual({ chatId, toolAccepts: restAccepts });
+      expect(restAccepts).toBe(WELL_FORMED.includes(chatId));
+    }
+  });
+});
+
+/**
+ * The REST routes take a session id of letters, digits and hyphens, at most 128 characters (SessionIdPipe), and the
+ * tools call the services directly, so the pipe never runs. Left as any string, an id of a megabyte reached the
+ * lookup, and only the cut of the not-found answer bounded what it quoted. Each tool that names a session accepts
+ * and refuses exactly the ids the
+ * pipe does, a restored id included (those are not UUIDs).
+ */
+describe('MCP tool session ids take the shape the REST routes require', () => {
+  const tools = allAgentTools({} as never);
+  const sessionFields = tools.flatMap(t => {
+    const shape = (t.inputSchema as unknown as z.ZodObject<Record<string, z.ZodType>>).shape;
+    return 'sessionId' in shape ? [[t.name, shape.sessionId] as const] : [];
+  });
+  const restAccepts = (id: string): boolean => {
+    try {
+      new SessionIdPipe().transform(id);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const ids = [
+    's1',
+    'sess-1',
+    '5b8f1c2e-1a2b-4c3d-8e9f-0a1b2c3d4e5f',
+    'a'.repeat(MAX_SESSION_ID_LENGTH),
+    'a'.repeat(MAX_SESSION_ID_LENGTH + 1),
+    'x'.repeat(100_000),
+    'a b',
+    ' s1',
+    's1\n',
+    '../x',
+    'a/b',
+    'a.b',
+    'a_b',
+    'sess:1',
+    'caf\u00e9',
+  ];
+
+  it('finds the session id fields to check', () => {
+    const scoped = tools.filter(t => t.sessionScoped).map(t => t.name);
+    expect(sessionFields.map(([name]) => name)).toEqual(expect.arrayContaining(scoped));
+    expect(sessionFields.length).toBeGreaterThan(30);
+  });
+
+  it.each(sessionFields)('%s accepts and refuses the same ids as its REST route', (_name, schema) => {
+    for (const id of ids) {
+      expect({ id: id.slice(0, 24), length: id.length, toolAccepts: schema.safeParse(id).success }).toEqual({
+        id: id.slice(0, 24),
+        length: id.length,
+        toolAccepts: restAccepts(id),
+      });
+    }
+    expect(ids.filter(restAccepts)).toContain('a'.repeat(MAX_SESSION_ID_LENGTH));
   });
 });

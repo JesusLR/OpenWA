@@ -5,6 +5,40 @@ import { plainToInstance } from 'class-transformer';
 import { GLOBAL_VALIDATION_OPTIONS } from '../../../config/app-validation';
 import { CreateSessionDto } from './create-session.dto';
 
+// docs/06: the session name is 3 to 50 characters of ASCII letters, digits and hyphens.
+describe('CreateSessionDto name validation', () => {
+  const failing = (name: unknown): string[] =>
+    validateSync(
+      plainToInstance(CreateSessionDto, { name }, GLOBAL_VALIDATION_OPTIONS.transformOptions),
+      GLOBAL_VALIDATION_OPTIONS,
+    ).map(error => error.property);
+
+  it.each([
+    ['the shortest name, 3 characters', 'abc'],
+    ['the longest name, 50 characters', 'a'.repeat(50)],
+    ['letters, digits and hyphens', 'My-Bot-01'],
+  ])('accepts %s', (_label, name) => {
+    expect(failing(name)).toEqual([]);
+  });
+
+  it.each([
+    ['2 characters', 'ab'],
+    ['51 characters', 'a'.repeat(51)],
+    ['an empty name', ''],
+    ['an underscore', 'my_bot'],
+    ['a space', 'my bot'],
+    ['a dot', 'my.bot'],
+    ['a non-ASCII letter', 'bot-é'],
+    ['an object instead of a string', { value: 'abc' }],
+  ])('rejects %s', (_label, name) => {
+    expect(failing(name)).toEqual(['name']);
+  });
+
+  it('rejects a missing name', () => {
+    expect(failing(undefined)).toEqual(['name']);
+  });
+});
+
 describe('CreateSessionDto proxyUrl validation', () => {
   const errs = (proxyUrl: string): ReturnType<typeof validateSync> =>
     validateSync(plainToInstance(CreateSessionDto, { name: 'my-bot', proxyUrl }));
@@ -59,7 +93,7 @@ describe('CreateSessionDto config validation', () => {
 });
 
 /**
- * The three keys the session reads are held to the same rules as PATCH /config. Stored unvalidated, an
+ * The four keys the session reads are held to the same rules as PATCH /config. Stored unvalidated, an
  * out-of-range value was clamped at start time without a word: -1 or 0.5 became 0 and disabled
  * reconnect, and the string "true" left autoRejectCalls off.
  */
@@ -77,6 +111,7 @@ describe('CreateSessionDto config keys through the global pipe', () => {
     [{ maxReconnectAttempts: 50 }, 'config.maxReconnectAttempts must not be greater than 20'],
     [{ reconnectBaseDelay: 500 }, 'config.reconnectBaseDelay must not be less than 1000'],
     [{ autoRejectCalls: 'yes' }, 'config.autoRejectCalls must be a boolean value'],
+    [{ linkPreview: 'no' }, 'config.linkPreview must be a boolean value'],
   ])('refuses %j with a 400 naming the key', async (config, message) => {
     const error = await create(config).then(
       () => undefined,
@@ -89,8 +124,18 @@ describe('CreateSessionDto config keys through the global pipe', () => {
   });
 
   it('stores the strict spellings PATCH /config accepts as their typed values', async () => {
-    const dto = await create({ autoRejectCalls: 'true', maxReconnectAttempts: '5', reconnectBaseDelay: 2000 });
-    expect(dto.config).toEqual({ autoRejectCalls: true, maxReconnectAttempts: 5, reconnectBaseDelay: 2000 });
+    const dto = await create({
+      autoRejectCalls: 'true',
+      maxReconnectAttempts: '5',
+      reconnectBaseDelay: 2000,
+      linkPreview: 'false',
+    });
+    expect(dto.config).toEqual({
+      autoRejectCalls: true,
+      maxReconnectAttempts: 5,
+      reconnectBaseDelay: 2000,
+      linkPreview: false,
+    });
   });
 
   it('keeps unknown keys and leaves absent ones absent', async () => {

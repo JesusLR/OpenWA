@@ -1,8 +1,11 @@
-import { BadRequestException, NotImplementedException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, NotImplementedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { SearchService } from './search.service';
 import { SearchProviderRegistry } from './search-provider.registry';
+import { PluginSearchProvider } from './providers/plugin-search-provider';
 import { SEARCH_DEFAULT_LIMIT, SEARCH_LIMIT_MAX, SEARCH_OFFSET_MAX, SEARCH_TERMS_MAX } from './search.constants';
 import type { SearchProvider, SearchResults } from './search.types';
+import type { ChatScopeService } from '../auth/chat-scope.service';
 
 function mkProvider(id: string, search: SearchProvider['search']): SearchProvider {
   return {
@@ -49,6 +52,71 @@ describe('SearchService', () => {
     // `chatIds` must be overwritten exactly like sessionIds.
     await svc.search({ q: 'x', chatIds: ['sneaky'] }, undefined, ['111@c.us', '111@lid']);
     expect(search).toHaveBeenCalledWith(expect.objectContaining({ chatIds: ['111@c.us', '111@lid'] }));
+  });
+
+  describe('chat and sender filters', () => {
+    const lidAware = (): Pick<ChatScopeService, 'candidatesFor'> => ({
+      candidatesFor: jest.fn((id: string) =>
+        Promise.resolve(id === '628123@c.us' ? ['628123@c.us', '628123@s.whatsapp.net', '999@lid'] : [id]),
+      ),
+    });
+
+    it('hands the provider every stored form of the ids, expanded by the host', async () => {
+      const reg = new SearchProviderRegistry();
+      const search = jest.fn().mockResolvedValue(emptyResults);
+      reg.register(mkProvider('builtin-fts', search));
+      const svc = new SearchService(reg, lidAware() as ChatScopeService);
+
+      await svc.search({ q: 'x', chatId: '628123@c.us', from: '628555@c.us' });
+
+      expect(search).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chatId: '628123@c.us',
+          chatIdAliases: ['628123@c.us', '628123@s.whatsapp.net', '999@lid'],
+          from: '628555@c.us',
+          // With the bare digits an earlier version stored as the account's own sender.
+          fromAliases: ['628555@c.us', '628555'],
+        }),
+      );
+    });
+
+    it('expands nothing when the query names neither a chat nor a sender', async () => {
+      const reg = new SearchProviderRegistry();
+      const search = jest.fn().mockResolvedValue(emptyResults);
+      reg.register(mkProvider('builtin-fts', search));
+      const chatScope = lidAware();
+      const svc = new SearchService(reg, chatScope as ChatScopeService);
+
+      await svc.search({ q: 'x' });
+
+      expect(chatScope.candidatesFor).not.toHaveBeenCalled();
+      expect(search).toHaveBeenCalledWith(
+        expect.objectContaining({ chatIdAliases: undefined, fromAliases: undefined }),
+      );
+    });
+
+    it('does not let a caller supply the expanded lists', async () => {
+      const reg = new SearchProviderRegistry();
+      const search = jest.fn().mockResolvedValue(emptyResults);
+      reg.register(mkProvider('builtin-fts', search));
+      const svc = new SearchService(reg, lidAware() as ChatScopeService);
+
+      await svc.search({ q: 'x', chatId: '628123@c.us', chatIdAliases: ['sneaky@c.us'], fromAliases: ['sneaky@c.us'] });
+
+      const [query] = search.mock.calls[0] as [{ chatIdAliases?: string[]; fromAliases?: string[] }];
+      expect(query.chatIdAliases).not.toContain('sneaky@c.us');
+      expect(query.fromAliases).toBeUndefined();
+    });
+
+    it('leaves the filters literal when no lid table is available', async () => {
+      const reg = new SearchProviderRegistry();
+      const search = jest.fn().mockResolvedValue(emptyResults);
+      reg.register(mkProvider('builtin-fts', search));
+
+      await new SearchService(reg).search({ q: 'x', chatId: '628123@c.us' });
+
+      expect(search).toHaveBeenCalledWith(expect.objectContaining({ chatId: '628123@c.us', chatIdAliases: undefined }));
+    });
   });
 
   it('refuses a query of more than SEARCH_TERMS_MAX words before any provider runs it', async () => {
@@ -124,5 +192,78 @@ describe('SearchService', () => {
     const svc = new SearchService(reg);
     await svc.search({ q: 'x', limit: 10, offset: 20 });
     expect(search).toHaveBeenCalledWith(expect.objectContaining({ limit: 10, offset: 20 }));
+  });
+
+  describe('chat-restricted fallback with plugin providers', () => {
+    const mkPlugin = () => {
+      const dispatchSearch = jest.fn().mockResolvedValue({
+        ok: true,
+        results: { hits: [], total: 42, tookMs: 2, provider: 'plugin:meili' },
+      });
+      const plugin = new PluginSearchProvider('meili', 'Meilisearch', { dispatchSearch, healthCheck: jest.fn() }, 1000);
+      return { plugin, dispatchSearch };
+    };
+
+    it('falls back to builtin-fts for a chat-restricted caller when SEARCH_PROVIDER=auto (or omitted)', async () => {
+      for (const config of [undefined, new ConfigService({ search: { provider: 'auto' } })]) {
+        const reg = new SearchProviderRegistry();
+        const builtinSearch = jest.fn().mockResolvedValue(emptyResults);
+        reg.register(mkProvider('builtin-fts', builtinSearch));
+        const { plugin, dispatchSearch } = mkPlugin();
+        reg.register(plugin);
+        reg.setActive(plugin.id);
+
+        const svc = new SearchService(reg, undefined, config);
+        const res = await svc.search({ q: 'hello' }, ['s1'], ['111@c.us', '111@lid']);
+
+        expect(res).toEqual(emptyResults);
+        expect(builtinSearch).toHaveBeenCalledWith(
+          expect.objectContaining({ q: 'hello', sessionIds: ['s1'], chatIds: ['111@c.us', '111@lid'] }),
+        );
+        expect(dispatchSearch).not.toHaveBeenCalled();
+      }
+    });
+
+    it('keeps routing to the active plugin (failing closed with 403) when search.provider is not auto', async () => {
+      const reg = new SearchProviderRegistry();
+      const builtinSearch = jest.fn().mockResolvedValue(emptyResults);
+      reg.register(mkProvider('builtin-fts', builtinSearch));
+      const { plugin, dispatchSearch } = mkPlugin();
+      reg.register(plugin);
+      reg.setActive(plugin.id);
+
+      const svc = new SearchService(reg, undefined, new ConfigService({ search: { provider: 'plugin:meili' } }));
+      await expect(svc.search({ q: 'hello' }, undefined, ['111@c.us'])).rejects.toBeInstanceOf(ForbiddenException);
+      expect(builtinSearch).not.toHaveBeenCalled();
+      expect(dispatchSearch).not.toHaveBeenCalled();
+    });
+
+    it('fails closed with 403 when SEARCH_PROVIDER=auto but builtin-fts is not registered', async () => {
+      const reg = new SearchProviderRegistry();
+      const { plugin, dispatchSearch } = mkPlugin();
+      reg.register(plugin);
+      reg.setActive(plugin.id);
+
+      const svc = new SearchService(reg, undefined, new ConfigService({ search: { provider: 'auto' } }));
+      await expect(svc.search({ q: 'hello' }, undefined, ['111@c.us'])).rejects.toBeInstanceOf(ForbiddenException);
+      expect(dispatchSearch).not.toHaveBeenCalled();
+    });
+
+    it('routes an unrestricted caller to the active plugin provider under SEARCH_PROVIDER=auto', async () => {
+      const reg = new SearchProviderRegistry();
+      const builtinSearch = jest.fn().mockResolvedValue(emptyResults);
+      reg.register(mkProvider('builtin-fts', builtinSearch));
+      const { plugin, dispatchSearch } = mkPlugin();
+      reg.register(plugin);
+      reg.setActive(plugin.id);
+
+      const svc = new SearchService(reg, undefined, new ConfigService({ search: { provider: 'auto' } }));
+      const res = await svc.search({ q: 'hello' });
+
+      expect(res.provider).toBe('plugin:meili');
+      expect(res.total).toBe(42);
+      expect(dispatchSearch).toHaveBeenCalledTimes(1);
+      expect(builtinSearch).not.toHaveBeenCalled();
+    });
   });
 });

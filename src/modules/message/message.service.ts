@@ -1,7 +1,9 @@
 import { Injectable, BadRequestException, NotFoundException, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, ObjectLiteral, Repository } from 'typeorm';
+import { Readable } from 'stream';
 import { EngineRegistry } from '../../engine/engine-registry.service';
+import type { IncomingMessage } from '../../engine/interfaces/whatsapp-engine.interface';
 import { MessageProjector } from '../session/message-projector.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
 import { SendTemplateMessageDto } from './dto/send-template.dto';
@@ -11,10 +13,19 @@ import { HookManager, applySendingGate } from '../../core/hooks';
 import { SendPacingService } from './send-pacing.service';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveJidCandidates as expandJidCandidates } from '../../engine/identity/jid-candidates';
+import {
+  SERIALIZED_MESSAGE_ID,
+  authorOfMessageId,
+  chatOfPage,
+  messageIdByAuthor,
+  messageIdInChat,
+  parseWaId,
+} from '../../engine/identity/wa-id';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { ChatMediaArchiveService } from '../chat-media/chat-media-archive.service';
 import { StorageService, isMissingObjectError } from '../../common/storage/storage.service';
 import { MessageSendService, SaveOutgoingMessageData } from './message-send.service';
+import { SessionWriteScope } from '../../common/utils/session-write-scope';
 // Type-only: the module binds this class to PLUGIN_MESSAGE_PORT with a `useExisting` alias, which
 // TypeScript does not check, so `implements` is what keeps the two in step.
 import type { PluginMessagePort } from '../../core/plugins/plugin-host-ports';
@@ -140,6 +151,18 @@ export function spendInlineMediaBudget(messages: Message[], budgetBytes: number)
  */
 const MESSAGE_LIST_READ_CHUNK_MIN_BYTES = 1024 * 1024;
 
+/** The phone digits of a user JID (`<digits>@c.us` or `@s.whatsapp.net`), as a one-item list, or none. */
+function bareUserDigits(id: string): string[] {
+  const { kind, userPart } = parseWaId(id);
+  return kind === 'user' && /^\d+$/.test(userPart) ? [userPart] : [];
+}
+
+/**
+ * How many ids one stored-row lookup of a chat history asks for. A deep page holds up to 2000 entries and each
+ * goes by one id per form of its chat, which together can pass the bind limit of a single statement.
+ */
+const STORED_ID_LOOKUP_CHUNK = 500;
+
 /** Pin window applied when the caller does not choose one — WhatsApp's own default of 24h. */
 export const DEFAULT_PIN_DURATION_SECONDS = 86400;
 
@@ -205,6 +228,19 @@ export class MessageService implements PluginMessagePort {
    */
   private get orderTiebreak(): 'rowid' | 'id' {
     return this.messageRepository.manager?.connection?.options?.type === 'postgres' ? 'id' : 'rowid';
+  }
+
+  /**
+   * The columns of a predicate, taken out of index consideration on SQLite, so a read of rows by `id` is a
+   * primary key lookup. Nothing runs ANALYZE there, and from about ten ids on it prefers an index on the session
+   * (or the chat) and visits every row of it, on the event loop. PostgreSQL has statistics and the plain
+   * predicate. The column is quoted because TypeORM only quotes a path that follows a space, `=` or `(`, and
+   * `from` is a keyword.
+   */
+  private byPrimaryKey(predicate: string): string {
+    return this.orderTiebreak === 'rowid'
+      ? predicate.replace(/\bmessage\.(?!id\b)(\w+)/g, '+"message"."$1"')
+      : predicate;
   }
 
   // ========== Outbound sends (delegated) ==========
@@ -288,8 +324,12 @@ export class MessageService implements PluginMessagePort {
   }
 
   /** Persist an outbound row; exposed for the bulk path, which reuses the send-persistence rules. */
-  saveOutgoingMessage(sessionId: string, data: SaveOutgoingMessageData): Promise<Message> {
-    return this.sender.saveOutgoingMessage(sessionId, data);
+  saveOutgoingMessage(
+    sessionId: string,
+    data: SaveOutgoingMessageData,
+    lifetime?: SessionWriteScope,
+  ): Promise<Message> {
+    return this.sender.saveOutgoingMessage(sessionId, data, lifetime);
   }
 
   /**
@@ -308,7 +348,12 @@ export class MessageService implements PluginMessagePort {
     const rawOffset = options.offset;
     const limit =
       typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 100) : 50;
-    const offset = typeof rawOffset === 'number' && Number.isFinite(rawOffset) ? Math.max(Math.trunc(rawOffset), 0) : 0;
+    // Capped at the largest safe integer: a driver refuses an OFFSET of 2^63 or more, and any offset that
+    // large is past the last row anyway.
+    const offset =
+      typeof rawOffset === 'number' && Number.isFinite(rawOffset)
+        ? Math.min(Math.max(Math.trunc(rawOffset), 0), Number.MAX_SAFE_INTEGER)
+        : 0;
 
     const tiebreak = messageTimeOrder ? 'id' : this.orderTiebreak;
     // Match across dialects: a stored chatId may be `@s.whatsapp.net` (e.g. an outbound send addressed
@@ -343,13 +388,23 @@ export class MessageService implements PluginMessagePort {
       query.skip(offset);
     }
 
+    // The filters a page's rows are read against again once its ids are picked (readPageSpendingBudget). Not the
+    // whole query: that also carries the order, the page bounds and the cursor, which the picked ids encode.
+    const cursorQuery = query.clone();
+    const rowFilters: Array<[clause: string, parameters?: ObjectLiteral]> = [];
+    const narrow = (clause: string, parameters?: ObjectLiteral, includeInCursor = true): void => {
+      query.andWhere(clause, parameters);
+      if (includeInCursor) cursorQuery.andWhere(clause, parameters);
+      rowFilters.push([clause, parameters]);
+    };
+
     if (chatIds) {
-      query.andWhere('message.chatId IN (:...chatIds)', { chatIds });
+      narrow('message.chatId IN (:...chatIds)', { chatIds }, false);
     }
     if (options.direction !== undefined) {
-      query.andWhere('message.direction = :direction', { direction: options.direction });
+      narrow('message.direction = :direction', { direction: options.direction });
     }
-    if (options.type !== undefined) query.andWhere('message.type = :messageType', { messageType: options.type });
+    if (options.type !== undefined) narrow('message.type = :messageType', { messageType: options.type });
 
     if (from) {
       // Resolve the filter through the lid->phone table so a phone matches not just the stored
@@ -361,15 +416,22 @@ export class MessageService implements PluginMessagePort {
       // within the (sessionId, createdAt)-narrowed scan exactly as the from-only filter did, so the
       // OR costs nothing the old plan didn't already pay. No new index: per-session narrowing
       // dominates selectivity and a single btree cannot serve an OR across two columns anyway.
-      const froms = await this.resolveJidCandidates(from);
-      query.andWhere('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
-        froms,
-        authorFroms: froms,
-      });
+      const candidates = await this.resolveJidCandidates(from);
+      // An API send stored by an earlier version names the account by its bare phone digits, so a filter on the
+      // account's JID still matches those rows.
+      const froms = [...new Set([...candidates, ...candidates.flatMap(bareUserDigits)])];
+      narrow(
+        '(message.from IN (:...froms) OR message.author IN (:...authorFroms))',
+        {
+          froms,
+          authorFroms: froms,
+        },
+        false,
+      );
     }
 
     if (options.messageId !== undefined) {
-      query.andWhere('message.waMessageId = :messageId', { messageId: options.messageId });
+      narrow('message.waMessageId = :messageId', { messageId: options.messageId });
     }
     const hasTimeSelection = messageTimeOrder || options.since !== undefined || options.until !== undefined;
     // Unknown times cannot belong to a verified time window. Count the gap within the same
@@ -377,13 +439,13 @@ export class MessageService implements PluginMessagePort {
     const unknownTimestampTotal = hasTimeSelection
       ? await query.clone().andWhere('message.timestamp IS NULL').getCount()
       : undefined;
-    if (messageTimeOrder) query.andWhere('message.timestamp IS NOT NULL');
+    if (messageTimeOrder) narrow('message.timestamp IS NOT NULL');
     // Integer seconds preserve both boundaries with ceil; fractional bigint parameters fail on PostgreSQL.
     if (options.since !== undefined) {
-      query.andWhere('message.timestamp >= :since', { since: messageTimeBoundarySeconds(options.since) });
+      narrow('message.timestamp >= :since', { since: messageTimeBoundarySeconds(options.since) });
     }
     if (options.until !== undefined) {
-      query.andWhere('message.timestamp < :until', { until: messageTimeBoundarySeconds(options.until) });
+      narrow('message.timestamp < :until', { until: messageTimeBoundarySeconds(options.until) });
     }
 
     // A budget of 0 means "never inline" and grants no single-payload allowance, which is exactly
@@ -395,7 +457,9 @@ export class MessageService implements PluginMessagePort {
 
     if (after !== undefined) {
       // A selection cursor must name a row inside this same selection, not merely a row from the
-      // session. Otherwise an unrelated chat/time/direction could silently truncate a valid walk.
+      // session. Otherwise an unrelated time/direction/type could silently truncate a valid walk. A chat or
+      // sender filter is left out: its candidate set can change between pages (a lid mapping learned or lost),
+      // and the cursor is only a position in time, so checking cursorQuery keeps keyset pagination valid.
       if (
         (messageTimeOrder ||
           options.since !== undefined ||
@@ -403,7 +467,7 @@ export class MessageService implements PluginMessagePort {
           options.direction !== undefined ||
           options.type !== undefined ||
           options.messageId !== undefined) &&
-        !(await query.clone().andWhere('message.id = :cursorId', { cursorId: after }).getCount())
+        !(await cursorQuery.clone().andWhere('message.id = :cursorId', { cursorId: after }).getCount())
       ) {
         throw new BadRequestException('Unknown cursor for this message selection');
       }
@@ -443,7 +507,7 @@ export class MessageService implements PluginMessagePort {
     // base64 in metadata.media.data. Spent newest-first in the selected order, so the
     // most recently viewed media still arrives inline and the rest keeps its omitted marker.
     return {
-      messages: await this.readPageSpendingBudget(sessionId, page, inlineMediaBudget),
+      messages: await this.readPageSpendingBudget(sessionId, rowFilters, page, inlineMediaBudget),
       total,
       ...(unknownTimestampTotal !== undefined ? { unknownTimestampTotal } : {}),
     };
@@ -464,7 +528,7 @@ export class MessageService implements PluginMessagePort {
       .select('message.id', 'id')
       .addSelect('OCTET_LENGTH(message.metadata)', 'metadataLength')
       .where('message.id IN (:...pageIds)', { pageIds })
-      .andWhere('message.sessionId = :sessionId', { sessionId })
+      .andWhere(`${this.byPrimaryKey('message.sessionId')} = :sessionId`, { sessionId })
       .getRawMany<{ id: string; metadataLength: number | string | null }>();
     const sizeById = new Map(sizes.map(r => [r.id, r.metadataLength]));
     return pageIds.map(id => ({ id, metadataLength: sizeById.get(id) ?? null }));
@@ -474,10 +538,12 @@ export class MessageService implements PluginMessagePort {
    * Load the rows of a page in its order, in chunks of at most `max(budget, 1 MiB)` stored metadata
    * bytes (at least one row per chunk), spending the inline media budget on each chunk before the
    * next is read. Loading the whole page at once put every payload on the heap before the budget
-   * dropped most of them. A row deleted since the page was picked is left out.
+   * dropped most of them. The rows are re-read against the filters of the selection, so a row deleted or
+   * replaced since the page was picked, and no longer matching, is left out.
    */
   private async readPageSpendingBudget(
     sessionId: string,
+    filters: Array<[clause: string, parameters?: ObjectLiteral]>,
     page: Array<{ id: string; metadataLength: number | string | null }>,
     budgetBytes: number,
   ): Promise<Message[]> {
@@ -488,7 +554,13 @@ export class MessageService implements PluginMessagePort {
     let chunkBytes = 0;
 
     const flush = async (): Promise<void> => {
-      const rows = await this.messageRepository.find({ where: { id: In(chunk), sessionId } });
+      const query = this.messageRepository
+        .createQueryBuilder('message')
+        .select('message')
+        .where(`${this.byPrimaryKey('message.sessionId')} = :sessionId`, { sessionId })
+        .andWhere('message.id IN (:...chunkIds)', { chunkIds: chunk });
+      for (const [clause, parameters] of filters) query.andWhere(this.byPrimaryKey(clause), parameters);
+      const rows = await query.getMany();
       const byId = new Map(rows.map(row => [row.id, row]));
       for (const id of chunk) {
         const row = byId.get(id);
@@ -545,6 +617,11 @@ export class MessageService implements PluginMessagePort {
     return engine.getMessageReactions(chatId, messageId);
   }
 
+  async getMessageReceipts(sessionId: string, chatId: string, messageId: string) {
+    const engine = this.getEngine(sessionId);
+    return engine.getMessageReceipts(chatId, messageId);
+  }
+
   /**
    * Read a message's media: the archived file when one exists, else the inline copy persisted on
    * the message row. The fallback is what makes media sent BY the account retrievable here — the
@@ -563,12 +640,15 @@ export class MessageService implements PluginMessagePort {
     sessionId: string,
     chatId: string,
     messageId: string,
-  ): Promise<{ buffer: Buffer; mimetype: string }> {
+  ): Promise<{ stream: Readable; size?: number; mimetype: string }> {
     const chatIds = await this.resolveJidCandidates(chatId);
     const media = await this.chatMediaArchive?.getMedia(sessionId, chatIds, messageId);
     if (media && this.storageService) {
       try {
-        return { buffer: await this.storageService.getFile(media.path), mimetype: inertMimetype(media.mimetype) };
+        // Streamed, not read whole: an archived video can be as large as CHAT_MEDIA_ARCHIVE_MAX_BYTES.
+        // A missing or unreadable file rejects here, before anything is answered.
+        const { stream, size } = await this.storageService.openFile(media.path);
+        return { stream, size, mimetype: inertMimetype(media.mimetype) };
       } catch (error) {
         // The row outlived its file: the retention purge (or a concurrent delete) removed it
         // between the DB read and this read. Not a server fault — try the inline copy instead.
@@ -601,7 +681,8 @@ export class MessageService implements PluginMessagePort {
     ) {
       throw new NotFoundException('No media stored for this message');
     }
-    return { buffer: Buffer.from(inline.data, 'base64'), mimetype: inertMimetype(inline.mimetype) };
+    const bytes = Buffer.from(inline.data, 'base64');
+    return { stream: Readable.from([bytes]), size: bytes.length, mimetype: inertMimetype(inline.mimetype) };
   }
 
   /** Maximum messages a single getChatHistory call may request from the engine. */
@@ -635,9 +716,92 @@ export class MessageService implements PluginMessagePort {
     const ceiling = deep ? MessageService.MAX_DEEP_CHAT_HISTORY_LIMIT : MessageService.MAX_CHAT_HISTORY_LIMIT;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), ceiling) : 50;
     const media = deep ? false : includeMedia;
-    return signal
+    const page = await (signal
       ? engine.getChatHistory(chatId, safeLimit, media, undefined, signal)
-      : engine.getChatHistory(chatId, safeLimit, media);
+      : engine.getChatHistory(chatId, safeLimit, media));
+    await this.nameDeletedByStoredId(sessionId, chatId, page);
+    return page;
+  }
+
+  /**
+   * Report each deleted message of a history page under the id its stored row has. The engine names it as its
+   * delete notice does, and a notice can write a person's chat by phone number where the stored row has the
+   * lid, or the reverse, and in a group it can do the same to the author. The other forms tried are the ones
+   * the lid mapping knows, the one the engine holds the chat under, the ones the ids of the page itself use
+   * for the chat, and the account's own id for a message it sent and deleted. An id changes only to one a
+   * stored row has. Best effort: the page stays as the engine gave it when the store cannot be read.
+   */
+  async nameDeletedByStoredId(sessionId: string, chatId: string, page: IncomingMessage[]): Promise<void> {
+    const deleted = page.filter(message => message.type === 'revoked');
+    if (deleted.length === 0) return;
+    try {
+      const chats = new Set(await this.resolveJidCandidates(chatId));
+      const held = chatOfPage(page);
+      if (held) chats.add(held);
+      for (const message of page) {
+        const chat = SERIALIZED_MESSAGE_ID.exec(message.id)?.[2];
+        if (chat) chats.add(chat);
+      }
+      // Every other id the same message can go by, per deleted entry: a person's chat in its other form, and
+      // in a group the author in theirs, as the lid mapping knows it. A channel's ids have one form.
+      const otherForms = await this.otherFormsOfAuthors(deleted.map(message => authorOfMessageId(message.id)));
+      const others = new Map<IncomingMessage, string[]>();
+      for (const message of deleted) {
+        const forms = new Set([...chats].map(chat => messageIdInChat(message.id, chat)));
+        const author = authorOfMessageId(message.id);
+        if (author) {
+          for (const other of otherForms(author)) forms.add(messageIdByAuthor(message.id, other));
+          // The entry carries the fields of the delete notice, not of the message, so its `author` and
+          // `from` name whoever deleted it: in a group that can be an admin. Only a message the account
+          // both sent and deleted is known to be by `from`.
+          if (message.fromMe && message.id.startsWith('true_')) {
+            forms.add(messageIdByAuthor(message.id, message.from));
+          }
+        }
+        forms.delete(message.id);
+        if (forms.size > 0) others.set(message, [...forms]);
+      }
+      const wanted = [...new Set([...others].flatMap(([message, forms]) => [message.id, ...forms]))];
+      const stored = new Set<string>();
+      for (let from = 0; from < wanted.length; from += STORED_ID_LOOKUP_CHUNK) {
+        const rows = await this.messageRepository.find({
+          select: { waMessageId: true },
+          where: { sessionId, waMessageId: In(wanted.slice(from, from + STORED_ID_LOOKUP_CHUNK)) },
+        });
+        for (const row of rows) stored.add(row.waMessageId);
+      }
+      for (const [message, forms] of others) {
+        if (!stored.has(message.id)) message.id = forms.find(id => stored.has(id)) ?? message.id;
+      }
+    } catch (error) {
+      this.logger.warn('Could not match the deleted messages of a chat history to their stored rows', {
+        sessionId,
+        chatId,
+        error: String(error),
+      });
+    }
+  }
+
+  /**
+   * The other id forms of the authors given, as the lid mapping knows them: a phone number for a lid, the lids
+   * of a phone number. Two batched reads however many authors there are, so a page of a busy group costs no
+   * more than a short one.
+   */
+  private async otherFormsOfAuthors(authors: (string | undefined)[]): Promise<(author: string) => string[]> {
+    const parts = { lid: new Set<string>(), phone: new Set<string>() };
+    for (const author of authors) {
+      if (!author) continue;
+      const { kind, userPart } = parseWaId(author);
+      parts[kind === 'lid' ? 'lid' : 'phone'].add(userPart);
+    }
+    const phones = parts.lid.size > 0 ? await this.lidMappingStore.phonesForLidsPersisted([...parts.lid]) : {};
+    const lids = parts.phone.size > 0 ? await this.lidMappingStore.lidsForPhonesPersisted([...parts.phone]) : {};
+    // Looked up by the user part, so every spelling of one author (a device suffix, a hosted dialect) gets them.
+    return author => {
+      const { kind, userPart } = parseWaId(author);
+      if (kind !== 'lid') return (lids[userPart] ?? []).map(lid => `${lid}@lid`);
+      return phones[userPart] ? [`${phones[userPart]}@c.us`] : [];
+    };
   }
 
   // ========== Delete Message ==========
@@ -688,12 +852,20 @@ export class MessageService implements PluginMessagePort {
     dto: { chatId: string; messageId: string; forEveryone?: boolean },
   ): Promise<void> {
     const engine = this.getEngine(sessionId);
-    await engine.deleteMessage(dto.chatId, dto.messageId, dto.forEveryone ?? true);
+    const deleted = await engine.deleteMessage(dto.chatId, dto.messageId, dto.forEveryone ?? true);
 
     // Clear the stored message the same way an engine revoke does (body, media and metadata), on
     // its mutation chain. Best-effort: never rejects. No localized display string is persisted
     // here; the dashboard renders the localized "message deleted" text.
-    await this.messageProjector.recordRevoke(sessionId, dto.messageId, { kind: 'revoke', chatId: dto.chatId });
+    //
+    // Under the id the caller named (Baileys keys its rows by it, and so does a row an earlier engine stored) and,
+    // when the engine found the message under another form of that id, under the one it keys it by: whatsapp-web.js
+    // also takes the bare key id of a message it stores under the serialized id.
+    const source = { kind: 'revoke', chatId: dto.chatId } as const;
+    await this.messageProjector.recordRevoke(sessionId, dto.messageId, source);
+    if (typeof deleted === 'string' && deleted && deleted !== dto.messageId) {
+      await this.messageProjector.recordRevoke(sessionId, deleted, source);
+    }
   }
 
   // ========== Edit Message ==========

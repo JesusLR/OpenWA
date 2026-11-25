@@ -1,10 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { TemplateService } from './template.service';
 import { Template } from './entities/template.entity';
-import { Session } from '../session/entities/session.entity';
+import { Session, SessionStatus } from '../session/entities/session.entity';
 import { renderTemplate } from '../../common/utils/template-render';
 
 function createMockTemplate(overrides: Partial<Template> = {}): Template {
@@ -34,6 +34,7 @@ describe('TemplateService', () => {
       create: jest.fn().mockImplementation((data: Partial<Template>) => ({ id: 'tpl-uuid-1', ...data }) as Template),
       save: jest.fn().mockImplementation((tpl: Template) => Promise.resolve(tpl)),
       remove: jest.fn().mockResolvedValue(undefined),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
 
     sessionRepository = { exists: jest.fn().mockResolvedValue(true) };
@@ -188,10 +189,11 @@ describe('TemplateService', () => {
 
       await service.update('sess-1', 'tpl-uuid-1', { body: 'Updated body' });
 
-      expect(repository.save).toHaveBeenCalledWith(
-        expect.objectContaining({ body: 'Updated body', name: template.name }),
-        { transaction: false },
+      expect(repository.update).toHaveBeenCalledWith(
+        { id: 'tpl-uuid-1', sessionId: 'sess-1' },
+        { body: 'Updated body' },
       );
+      expect(repository.save).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundException for an unknown template', async () => {
@@ -210,7 +212,7 @@ describe('TemplateService', () => {
 
       await service.delete('sess-1', 'tpl-uuid-1');
 
-      expect(repository.remove).toHaveBeenCalledWith(template);
+      expect(repository.remove).toHaveBeenCalledWith(template, { transaction: false });
     });
 
     it('should throw NotFoundException when deleting a missing template', async () => {
@@ -235,7 +237,7 @@ describe('TemplateService', () => {
 
     it('translates a duplicate-name violation on update into 409 Conflict', async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(createMockTemplate());
-      (repository.save as jest.Mock).mockRejectedValueOnce(uniqueViolation());
+      (repository.update as jest.Mock).mockRejectedValueOnce(uniqueViolation());
       await expect(service.update('sess-1', 'tpl-uuid-1', { name: 'dup' })).rejects.toThrow(ConflictException);
     });
 
@@ -283,5 +285,40 @@ describe('renderTemplate', () => {
     // must return content of the same magnitude when no placeholders are present.
     const body = 'x'.repeat(4096);
     expect(renderTemplate(body, {})).toHaveLength(4096);
+  });
+});
+
+describe('TemplateService.delete beside other writes on one SQLite connection', () => {
+  it('does not roll back a concurrent sibling write when remove fails after the write', async () => {
+    const ds = await new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [Session, Template],
+      synchronize: true,
+    }).initialize();
+    try {
+      const sessions = ds.getRepository(Session);
+      await sessions.save({ id: 'sessA', name: 'sessA', status: SessionStatus.READY, config: {} });
+      await sessions.save({ id: 'sessB', name: 'sessB', status: SessionStatus.READY, config: {} });
+      const svc = new TemplateService(ds.getRepository(Template), sessions);
+      const tpl = await svc.create('sessA', { name: 't1', body: 'hi' });
+
+      let beside = Promise.resolve();
+      ds.subscribers.push({
+        listenTo: () => Template,
+        beforeRemove: () => {
+          beside = (async () => {
+            await sessions.update('sessB', { status: SessionStatus.FAILED });
+          })();
+          throw new Error('abort template remove');
+        },
+      });
+
+      await expect(svc.delete('sessA', tpl.id)).rejects.toThrow('abort template remove');
+      await beside;
+      expect((await sessions.findOneByOrFail({ id: 'sessB' })).status).toBe(SessionStatus.FAILED);
+    } finally {
+      await ds.destroy();
+    }
   });
 });

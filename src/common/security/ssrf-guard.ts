@@ -3,6 +3,9 @@ import { lookup } from 'dns/promises';
 import { type LookupAddress, type LookupOptions } from 'dns';
 import { Agent, fetch as undiciFetch, Headers, type Dispatcher, type RequestInit, type Response } from 'undici';
 import { createProxyDispatcher } from './proxy-dispatcher';
+import { createLogger } from '../services/logger.service';
+
+const logger = createLogger('SsrfGuard');
 
 /** Thrown when an outbound URL is blocked by the SSRF guard. */
 export class SsrfBlockedError extends Error {
@@ -19,6 +22,26 @@ export class SsrfBlockedError extends Error {
  * server-side and return this instead. Shared by the single-send, bulk, and webhook-registration paths.
  */
 export const SSRF_BLOCKED_CLIENT_MESSAGE = 'Destination address is not allowed';
+
+/** The text of the refusal of a URL that carries credentials: it repeats nothing of the URL. */
+export const URL_CREDENTIALS_MESSAGE = 'URL must not contain credentials (userinfo)';
+
+/**
+ * Whether a URL carries a user name or a password: the exact condition undici refuses to build a request for, with a
+ * TypeError whose text repeats the URL, credentials included. An empty userinfo (`http://@host/`) is accepted by
+ * undici. An unparsable URL is read by hand, because the guard and undici name it in their refusal too: one with a
+ * userinfo counts, and one with none is left to the guard.
+ */
+export function urlCarriesCredentials(url: string): boolean {
+  const trimmed = url.trim();
+  try {
+    const { username, password } = new URL(trimmed);
+    return username !== '' || password !== '';
+  } catch {
+    const userinfo = /^(?:[a-z][a-z0-9+.-]*:[/\\]{2,}|[/\\]{2,})([^/\\?#]*)@/i.exec(trimmed)?.[1] ?? '';
+    return userinfo !== '' && userinfo !== ':';
+  }
+}
 
 /**
  * Map an error to a client/surfaced message, redacting SSRF detail. An `SsrfBlockedError`'s message
@@ -37,7 +60,7 @@ export function redactSsrfError(error: unknown, logger?: { warn: (message: strin
   // internal topology an API consumer has no business reading out of a delivery-failure row.
   // The error code stays (actionable), the address goes.
   return (error instanceof Error ? error.message : String(error)).replace(
-    /\b(ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|ECONNRESET|EAI_AGAIN)\s+[\w.-]+(?::\d+)?(?=\s|$)/g,
+    /\b(ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|ECONNRESET|EAI_AGAIN)\s+(?:\[[0-9a-fA-F:.]+(?:%[^\]\s]+)?\](?::\d+)?|[\w.:%@-]*[\w:%@-])(?=$|[\s,;.)\]}>'"!])/g,
     '$1 [redacted]',
   );
 }
@@ -58,7 +81,14 @@ export function isSsrfProtectionEnabled(): boolean {
  * bypass the block. Matched case-insensitively against the URL hostname.
  */
 function getAllowedHosts(): Set<string> {
-  return new Set(
+  const entries = allowedHostEntries();
+  warnUnusableAllowedHosts(entries);
+  return new Set(entries.filter(Boolean));
+}
+
+/** The SSRF_ALLOWED_HOSTS entries in written order, blanks kept so an entry's position is the one the operator sees. */
+function allowedHostEntries(): string[] {
+  return (
     (process.env.SSRF_ALLOWED_HOSTS ?? '')
       .split(',')
       // Strip IPv6 brackets so an entry copied from a URL (e.g. "[::1]") matches the
@@ -69,8 +99,63 @@ function getAllowedHosts(): Set<string> {
           .replace(/^\[|\]$/g, '')
           .toLowerCase(),
       )
-      .filter(Boolean),
   );
+}
+
+/** What the URL parser makes of an entry used as a host, brackets stripped; null when the parser rejects it. */
+function parsedHostname(entry: string): string | null {
+  try {
+    return new URL(`http://${entry.includes(':') ? `[${entry}]` : entry}/`).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Why an entry can never equal the hostname of a URL, or undefined when it can. The reason is a shape and never the
+ * value, which may carry credentials. An IP address has to be written the way the URL parser prints it: `http://127.1/`
+ * is compared as `127.0.0.1`, so the entry `127.1` (or `0:0:0:0:0:0:0:1` for `::1`) is never equal.
+ */
+function unusableAllowedHostReason(entry: string): string | undefined {
+  if (entry.includes('@') || entry.includes('://')) return 'a scheme or credentials';
+  if (entry.includes('*')) return 'a wildcard';
+  if (/[/?#]/.test(entry)) return 'a path';
+  if (/^[^:]+:\d*$/.test(entry)) return 'a port';
+  const parsed = parsedHostname(entry);
+  if (parsed === null) return 'a value the URL parser rejects';
+  return parsed === entry ? undefined : 'a spelling the URL parser rewrites';
+}
+
+let warnedUnusableHosts = '';
+
+/** The most entries one warning lists, so a long list of unusable entries cannot flood the log. */
+const MAX_LISTED_UNUSABLE_HOSTS = 20;
+
+/**
+ * An entry is compared with the hostname of the URL, so one the check above names never matches, and the refusal it
+ * was meant to lift only says the destination is not allowed. Name such entries once, by position and reason, at most
+ * MAX_LISTED_UNUSABLE_HOSTS of them, and count the rest.
+ */
+export function warnUnusableAllowedHosts(entries: readonly string[] = allowedHostEntries()): void {
+  const listed: string[] = [];
+  let unusable = 0;
+  entries.forEach((entry, index) => {
+    const reason = entry ? unusableAllowedHostReason(entry) : undefined;
+    if (!reason) return;
+    unusable++;
+    if (listed.length < MAX_LISTED_UNUSABLE_HOSTS) listed.push(`entry ${index + 1} (${reason})`);
+  });
+  const more = unusable - listed.length;
+  const key = more > 0 ? `${listed.join(', ')}; ${more} more are not listed` : listed.join(', ');
+  if (key === warnedUnusableHosts) return;
+  warnedUnusableHosts = key;
+  if (unusable > 0) {
+    logger.warn(
+      'SSRF_ALLOWED_HOSTS entries must be a bare host name or an IP address written as the URL parser prints it ' +
+        `(127.0.0.1, ::1); these never match and are ignored: ${key}` +
+        (more > 0 ? ` (the list shows at most ${MAX_LISTED_UNUSABLE_HOSTS})` : ''),
+    );
+  }
 }
 
 // IPv4 ranges that must never be reachable by an outbound webhook (SSRF targets). Membership is
@@ -83,8 +168,13 @@ const BLOCKED_V4_RANGES: ReadonlyArray<readonly [string, number]> = [
   ['169.254.0.0', 16], // link-local (incl. 169.254.169.254 cloud metadata)
   ['172.16.0.0', 12], // RFC1918 private
   ['192.0.0.0', 24], // IETF protocol assignments
+  ['192.0.2.0', 24], // documentation, TEST-NET-1 (RFC 5737)
+  ['192.88.99.2', 32], // 6a44 relay anycast (RFC 6751), not globally reachable; the rest of 192.88.99.0/24 is
+  // reachable and stays allowed
   ['192.168.0.0', 16], // RFC1918 private
   ['198.18.0.0', 15], // benchmarking
+  ['198.51.100.0', 24], // documentation, TEST-NET-2 (RFC 5737)
+  ['203.0.113.0', 24], // documentation, TEST-NET-3 (RFC 5737)
   ['224.0.0.0', 4], // multicast
   ['240.0.0.0', 4], // reserved
 ];
@@ -102,6 +192,12 @@ const BLOCKED_V6_RANGES: ReadonlyArray<readonly [string, number]> = [
   ['fc00::', 7], // ULA (RFC 4193)
   ['fe80::', 10], // link-local
   ['fec0::', 10], // deprecated site-local (RFC 3879)
+  // Not globally reachable per the IANA IPv6 special-purpose registry. 2001::/23 is not blocked whole: the registry
+  // marks several allocations inside it (AMT, AS112, ORCHIDv2, the 2001:1::/32 anycast addresses) globally reachable.
+  ['2001:2::', 48], // benchmarking (RFC 5180)
+  ['2001:10::', 28], // ORCHID (RFC 4843, deprecated; not globally reachable)
+  ['2001:db8::', 32], // documentation (RFC 3849)
+  ['3fff::', 20], // documentation (RFC 9637)
 ];
 
 const BLOCKED_V4 = new BlockList();
@@ -152,7 +248,8 @@ function expandIPv6(lower: string): number[] | null {
 /**
  * Whether an IP literal points at an internal/reserved range that an outbound
  * webhook must not be allowed to reach (loopback, RFC1918, link-local/metadata,
- * CGNAT, multicast, IPv6 loopback/ULA/link-local, IPv4-mapped variants).
+ * CGNAT, multicast, documentation and benchmarking blocks, IPv6 loopback/ULA/link-local,
+ * IPv4-mapped variants).
  * Anything that isn't a recognizable public IP is treated as blocked (fail-closed).
  */
 export function isBlockedAddress(ip: string): boolean {
@@ -189,6 +286,14 @@ export function isBlockedAddress(ip: string): boolean {
     if (hextets) {
       if (hextets[0] === 0x2002) {
         return isBlockedAddress(hextetsToV4(hextets[1], hextets[2])); // 6to4
+      }
+      // Teredo (2001:0000::/32, RFC 4380): hextets 2..3 hold the Teredo server IPv4 and hextets
+      // 6..7 hold the XOR-inverted client IPv4. Both must be globally routable (RFC 4380 s4/s5.1.1).
+      if (hextets[0] === 0x2001 && hextets[1] === 0) {
+        return (
+          isBlockedAddress(hextetsToV4(hextets[2], hextets[3])) ||
+          isBlockedAddress(hextetsToV4(hextets[6] ^ 0xffff, hextets[7] ^ 0xffff))
+        );
       }
       // NAT64 /96: the well-known 64:ff9b::/96 and the local-use 64:ff9b:1::/96 (RFC 8215). Any other
       // 64:ff9b layout (a /48 local-use prefix embeds the IPv4 in the middle hextets) falls through to
@@ -519,6 +624,9 @@ export async function withSafeFetch<T>(
   use: (response: Response) => Promise<T> | T,
   opts: { guard?: boolean; followRedirects?: boolean; proxyUrl?: string } = {},
 ): Promise<T> {
+  // undici would refuse the URL itself, with a text that repeats the credentials, and the callers carry the text of a
+  // failure into a response body or a stored delivery failure. Refuse it first, with a text that repeats nothing.
+  if (urlCarriesCredentials(rawUrl)) throw new Error(URL_CREDENTIALS_MESSAGE);
   const guard = opts.guard ?? true;
   if (!guard) {
     // Redirect-following is a separate decision from SSRF protection: an operator who disabled the
@@ -578,7 +686,14 @@ export async function withSafeFetch<T>(
           // blocked-address rejection, so it must survive redactSsrfError verbatim.
           throw new Error(`Too many redirects while fetching ${rawUrl}`);
         }
-        const nextUrl = new URL(location, currentUrl).toString();
+        if (urlCarriesCredentials(location)) throw new Error(URL_CREDENTIALS_MESSAGE);
+        let nextUrl: string;
+        try {
+          nextUrl = new URL(location, currentUrl).toString();
+        } catch {
+          throw new SsrfBlockedError('Invalid redirect URL');
+        }
+        if (urlCarriesCredentials(nextUrl)) throw new Error(URL_CREDENTIALS_MESSAGE);
         hopInit = nextRedirectHopInit(hopInit, response.status, nextUrl, initialOrigin);
         currentUrl = nextUrl;
       } finally {

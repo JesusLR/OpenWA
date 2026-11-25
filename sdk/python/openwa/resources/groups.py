@@ -43,7 +43,7 @@ class GroupsResource:
         return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}")
 
     def create(self, session_id: str, body: CreateGroupRequest) -> GroupSummary:
-        """Create a group.
+        """Create a group. Baileys only; whatsapp-web.js answers 501.
 
         Answers the group SUMMARY, not the detail shape ``get()`` returns -- no participant list,
         description, owner or creation time.
@@ -85,6 +85,17 @@ class GroupsResource:
             body={"description": description},
         )
 
+    def set_member_label(self, session_id: str, group_id: str, label: str) -> SuccessResult:
+        """Set this account's member label in the group (empty string clears it).
+
+        Baileys only; whatsapp-web.js answers 501. A 200 means the label message was
+        handed to WhatsApp; it cannot be read back.
+        """
+        return self._http.request(
+            "PUT", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}/member-label",
+            body={"label": label},
+        )
+
     def leave(self, session_id: str, group_id: str) -> SuccessResult:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}/leave")
 
@@ -95,13 +106,13 @@ class GroupsResource:
         )
 
     def set_picture(self, session_id: str, group_id: str, body: SetGroupPictureRequest) -> SuccessResult:
-        """Set the group's picture. Requires admin rights on the group."""
+        """Set the group's picture. Requires the right to edit the group info: an admin, or any member of a group whose info is not restricted to admins."""
         return self._http.request(
             "PUT", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}/picture", body=body
         )
 
     def delete_picture(self, session_id: str, group_id: str) -> SuccessResult:
-        """Remove the group's picture. Requires admin rights on the group."""
+        """Remove the group's picture. Requires the right to edit the group info: an admin, or any member of a group whose info is not restricted to admins."""
         return self._http.request(
             "DELETE", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}/picture"
         )
@@ -131,13 +142,13 @@ class GroupsResource:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/groups/join", body=body)
 
     def get_group_settings(self, session_id: str, group_id: str) -> GroupSettings:
-        """Read the group's announce/locked/ephemeral settings."""
+        """Read the group's announce/locked/ephemeral/memberAddMode settings."""
         return self._http.request(
             "GET", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}/settings"
         )
 
     def update_group_settings(self, session_id: str, group_id: str, body: GroupSettings) -> SuccessResult:
-        """Update group settings — at least one of announce/locked/ephemeralSeconds is required.
+        """Update group settings — at least one of announce/locked/ephemeralSeconds/memberAddMode is required.
 
         Requires an OPERATOR-level key. ``ephemeralSeconds`` is unsupported on the
         whatsapp-web.js engine (the request then fails with 501).

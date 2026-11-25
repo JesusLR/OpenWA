@@ -75,6 +75,8 @@ class MessagesResourceTest {
             "s", SendPollRequest.builder().chatId("c@c.us").name("Question").options(List.of("A", "B")).build(), key));
         sends.put("reply", key -> client.messages.reply(
             "s", ReplyMessageRequest.builder().chatId("c@c.us").quotedMessageId("q").text("reply").build(), key));
+        sends.put("click-button", key -> client.messages.clickButton(
+            "s", ClickButtonRequest.builder().chatId("c@c.us").messageId("p").buttonId("yes").text("Yes").build(), key));
         sends.put("forward", key -> client.messages.forward(
             "s", ForwardMessageRequest.builder().fromChatId("a@c.us").toChatId("b@c.us").messageId("m").build(), key));
 
@@ -251,6 +253,20 @@ class MessagesResourceTest {
         assertEquals("http://h/api/sessions/s/messages/send-location", tx.lastRequest().url());
         assertEquals(HttpMethod.POST, tx.lastRequest().method());
         assertTrue(tx.lastRequest().body().contains("12.5"));
+    }
+
+    @Test
+    void locationBuilderRefusesAnUnsetCoordinateButKeepsZero() {
+        // 0.0 is a real place, so a coordinate left unset must not become a pin there.
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> SendLocationRequest.builder().chatId("628@c.us").longitude(98.7).build());
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> SendLocationRequest.builder().chatId("628@c.us").latitude(12.5).build());
+        SendLocationRequest origin = SendLocationRequest.builder().chatId("628@c.us").latitude(0).longitude(0).build();
+        assertEquals(0.0, origin.latitude());
+        assertEquals(0.0, origin.longitude());
     }
 
     @Test
@@ -438,6 +454,14 @@ class MessagesResourceTest {
         tx.respond(200, "[]");
         client.messages.reactions("s", "chat1", "msg1");
         assertEquals("http://h/api/sessions/s/messages/chat1/msg1/reactions", tx.lastRequest().url());
+        assertEquals(HttpMethod.GET, tx.lastRequest().method());
+    }
+
+    @Test
+    void receiptsHitsReceiptsPath() {
+        tx.respond(200, "{\"delivery\":[],\"read\":[],\"played\":[]}");
+        client.messages.receipts("s", "chat1", "msg1");
+        assertEquals("http://h/api/sessions/s/messages/chat1/msg1/receipts", tx.lastRequest().url());
         assertEquals(HttpMethod.GET, tx.lastRequest().method());
     }
 

@@ -1,4 +1,6 @@
+import { POLL_MAX_OPTIONS, POLL_TEXT_MAX_LENGTH } from './message-mapper';
 import {
+  BaileysBodyContent,
   BaileysContextContent,
   BaileysIncomingFields,
   baileysChatJid,
@@ -14,11 +16,26 @@ import {
   BUTTON_TEXT_MAX_LENGTH,
   extractBaileysCommerce,
   extractBaileysContext,
+  type ContentTypeLib,
+  contentTypeOf,
+  droppedMessageTime,
   isBaileysCatalogShare,
+  isNonContent,
+  isNoiseOnly,
   mapBaileysMessageType,
   mapBaileysStatus,
   setBaileysText,
+  storedKeyInChatPersisted,
+  withoutFastRatchetDistribution,
+  withoutMergedNonContentMessage,
+  withoutNonContentMessage,
+  withoutNonContentOnlyFlush,
+  countedChatId,
+  countedMessageKind,
+  mayCountSeveralNonContent,
+  mayHoldOnlyNonContent,
 } from './baileys-message-mapper';
+import type { Chat, proto } from '@whiskeysockets/baileys';
 
 describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', () => {
   it.each([
@@ -53,6 +70,10 @@ describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', 
     ['pollCreationMessage', false, 'poll'],
     ['pollCreationMessageV2', false, 'poll'],
     ['pollCreationMessageV3', false, 'poll'],
+    ['pollCreationMessageV4', false, 'poll'],
+    ['pollCreationMessageV5', false, 'poll'],
+    // A vote changes a poll and carries nothing of its own; it is never a poll itself.
+    ['pollUpdateMessage', false, 'unknown'],
     // Regression trap: calls arrive via the `call` socket event, never as a message content type,
     // so any call-ish token must stay 'unknown' (no accidental mapping).
     ['callLogMessage', false, 'unknown'],
@@ -169,6 +190,23 @@ describe('extractBaileysBody (inbound text/caption + interactive shapes)', () =>
     expect(extractBaileysBody({ pollCreationMessage: { name: 'Lunch order?' } })).toBe('Lunch order?');
     expect(extractBaileysBody({ pollCreationMessageV2: { name: 'Team offsite?' } })).toBe('Team offsite?');
     expect(extractBaileysBody({ pollCreationMessageV3: { name: 'Standup time?' } })).toBe('Standup time?');
+    expect(extractBaileysBody({ pollCreationMessageV5: { name: 'Quiz?' } })).toBe('Quiz?');
+    expect(
+      extractBaileysBody({ pollCreationMessageV4: { message: { pollCreationMessage: { name: 'Wrapped?' } } } }),
+    ).toBe('Wrapped?');
+  });
+
+  it('reads a V4 poll one level down only, and nothing but a poll from inside it', () => {
+    expect(
+      extractBaileysBody({
+        pollCreationMessageV4: {
+          message: { pollCreationMessageV4: { message: { pollCreationMessage: { name: 'Deep' } } } },
+        },
+      } as BaileysBodyContent),
+    ).toBe('');
+    expect(
+      extractBaileysBody({ pollCreationMessageV4: { message: { conversation: 'not a poll' } } } as BaileysBodyContent),
+    ).toBe('');
   });
 
   it('returns empty for a poll with no name rather than falling through to other sources', () => {
@@ -268,6 +306,13 @@ describe('extractBaileysContext (quoted body shares the live body extractor)', (
   ])('reads the disappearing-messages timer off a %s', type => {
     const content = { [type]: { contextInfo: { expiration: 86400 } } } as BaileysContextContent;
     expect(extractBaileysContext(content).ephemeralDuration).toBe(86400);
+  });
+
+  it('reads the disappearing-messages timer off the poll inside a pollCreationMessageV4', () => {
+    const content = {
+      pollCreationMessageV4: { message: { pollCreationMessage: { contextInfo: { expiration: 604800 } } } },
+    } as BaileysContextContent;
+    expect(extractBaileysContext(content).ephemeralDuration).toBe(604800);
   });
 
   it('reads no timer when no content node carries one', () => {
@@ -484,6 +529,19 @@ describe('buildIncomingMessageFromBaileys', () => {
       normalize,
     );
     expect(r.mentionedIds).toEqual(['111@c.us', '222@c.us']);
+  });
+
+  it('maps isForwarded and forwardingScore for a forwarded message', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, isForwarded: true, forwardingScore: 2 });
+    expect(r.isForwarded).toBe(true);
+    expect(r.forwardingScore).toBe(2);
+    expect(buildIncomingMessageFromBaileys(base)).not.toHaveProperty('isForwarded');
+  });
+
+  it('omits forwardingScore when a forwarded message reports none', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, isForwarded: true, forwardingScore: 0 });
+    expect(r.isForwarded).toBe(true);
+    expect(r).not.toHaveProperty('forwardingScore');
   });
 
   it('omits mentionedIds when absent or empty', () => {
@@ -1168,20 +1226,56 @@ describe('isBaileysCatalogShare (the productMessage arm with no product)', () =>
 });
 
 describe('native poll choice metadata', () => {
-  it.each(['pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3'] as const)(
-    'reads %s without changing option texts',
-    key => {
-      expect(
-        extractBaileysPoll({
-          [key]: {
-            name: 'Where?',
-            options: [{ optionName: ' Park ' }, { optionName: 'Beach' }],
-            selectableOptionsCount: 1,
-          },
+  type PollNode = { name?: string; options?: Array<{ optionName?: string }>; selectableOptionsCount?: number };
+  // Every content key a poll travels under. pollCreationMessageV4 wraps a whole message, with the poll inside it.
+  const shapes: Array<[string, (poll: PollNode) => Record<string, unknown>]> = [
+    ['pollCreationMessage', poll => ({ pollCreationMessage: poll })],
+    ['pollCreationMessageV2', poll => ({ pollCreationMessageV2: poll })],
+    ['pollCreationMessageV3', poll => ({ pollCreationMessageV3: poll })],
+    ['pollCreationMessageV5', poll => ({ pollCreationMessageV5: poll })],
+    ...(
+      ['pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3', 'pollCreationMessageV5'] as const
+    ).map((inner): [string, (poll: PollNode) => Record<string, unknown>] => [
+      `pollCreationMessageV4 around ${inner}`,
+      poll => ({ pollCreationMessageV4: { message: { [inner]: poll } } }),
+    ]),
+  ];
+
+  it.each(shapes)('reads %s without changing option texts', (_label, wrap) => {
+    expect(
+      extractBaileysPoll(
+        wrap({
+          name: 'Where?',
+          options: [{ optionName: ' Park ' }, { optionName: 'Beach' }],
+          selectableOptionsCount: 1,
         }),
-      ).toEqual({ name: 'Where?', options: [' Park ', 'Beach'], allowMultipleAnswers: false });
-    },
-  );
+      ),
+    ).toEqual({ name: 'Where?', options: [' Park ', 'Beach'], allowMultipleAnswers: false });
+  });
+
+  it('reads a V5 quiz as its question and options, with the correct answer kept out of the options', () => {
+    expect(
+      extractBaileysPoll({
+        pollCreationMessageV5: {
+          name: 'Capital of France?',
+          options: [{ optionName: 'Paris' }, { optionName: 'Lyon' }],
+          selectableOptionsCount: 1,
+          pollType: 1,
+          correctAnswer: { optionName: 'Paris' },
+        },
+      }),
+    ).toEqual({ name: 'Capital of France?', options: ['Paris', 'Lyon'], allowMultipleAnswers: false });
+  });
+
+  it('opens a V4 wrapper one level only', () => {
+    const poll = { name: 'Deep', options: [{ optionName: 'a' }, { optionName: 'b' }] };
+    expect(
+      extractBaileysPoll({
+        pollCreationMessageV4: { message: { pollCreationMessageV4: { message: { pollCreationMessage: poll } } } },
+      }),
+    ).toBeUndefined();
+    expect(extractBaileysPoll({ pollCreationMessageV4: {} })).toBeUndefined();
+  });
   it('reports multiple choices and omits unavailable poll data', () => {
     expect(
       extractBaileysPoll({
@@ -1194,5 +1288,606 @@ describe('native poll choice metadata', () => {
     ).toBe(true);
     expect(extractBaileysPoll({})).toBeUndefined();
     expect(extractBaileysPoll({ pollCreationMessage: {} })).toBeUndefined();
+  });
+
+  describe.each(shapes)('bounds on %s', (_label, wrap) => {
+    const content = (name: string, optionNames: string[]) =>
+      wrap({ name, options: optionNames.map(optionName => ({ optionName })), selectableOptionsCount: 1 });
+
+    it('keeps a poll WhatsApp itself could send exactly as it is', () => {
+      const question = 'q'.repeat(255);
+      const options = Array.from({ length: 12 }, (_, i) => `${i}`.padEnd(100, 'o'));
+      expect(extractBaileysPoll(content(question, options))).toEqual({
+        name: question,
+        options,
+        allowMultipleAnswers: false,
+      });
+      expect(extractBaileysBody(content(question, options) as BaileysBodyContent)).toBe(question);
+    });
+
+    // The numbers are written out here, not read from the constants, so moving either by one shows up.
+    it('keeps a poll of 32 options with 1024 characters in each text whole', () => {
+      const text = (i: number) => `${i}`.padEnd(1024, 'x');
+      const options = Array.from({ length: 32 }, (_, i) => text(i));
+      expect(extractBaileysPoll(content(text(99), options))).toEqual({
+        name: text(99),
+        options,
+        allowMultipleAnswers: false,
+      });
+      expect(extractBaileysBody(content(text(99), options) as BaileysBodyContent)).toBe(text(99));
+    });
+
+    it('cuts a poll at its 33rd option and at the 1025th character of a text', () => {
+      const text = (i: number) => `${i}`.padEnd(1025, 'x');
+      const options = Array.from({ length: 33 }, (_, i) => text(i));
+      const poll = extractBaileysPoll(content(text(99), options))!;
+      expect(poll.options).toEqual(options.slice(0, 32).map(option => option.slice(0, 1024)));
+      expect(poll.name).toBe(text(99).slice(0, 1024));
+      expect(extractBaileysBody(content(text(99), options) as BaileysBodyContent)).toBe(text(99).slice(0, 1024));
+    });
+
+    it('truncates an oversized poll, in the poll and in the body, and keeps it a poll', () => {
+      const long = 'x'.repeat(POLL_TEXT_MAX_LENGTH * 3);
+      const optionNames = Array.from({ length: POLL_MAX_OPTIONS * 50 }, (_, i) => `${i}${long}`);
+      const poll = extractBaileysPoll(content(long, optionNames))!;
+      expect(poll.options).toHaveLength(POLL_MAX_OPTIONS);
+      expect(poll.options.every(option => option.length === POLL_TEXT_MAX_LENGTH)).toBe(true);
+      expect(poll.options[1].startsWith('1xxx')).toBe(true);
+      expect(poll.name).toHaveLength(POLL_TEXT_MAX_LENGTH);
+      expect(extractBaileysBody(content(long, optionNames) as BaileysBodyContent)).toHaveLength(POLL_TEXT_MAX_LENGTH);
+    });
+  });
+});
+
+describe('storedKeyInChatPersisted', () => {
+  it('accepts an exact identity without requiring a directory', async () => {
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '111@lid')).toBe(true);
+    expect(await storedKeyInChatPersisted({ remoteJid: '628111@s.whatsapp.net' }, '628111@c.us')).toBe(true);
+  });
+
+  it('refuses cross-form identity when no directory is available', async () => {
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '628111@c.us')).toBe(false);
+    expect(await storedKeyInChatPersisted({ remoteJid: '628111@s.whatsapp.net' }, '111@lid')).toBe(false);
+  });
+
+  it.each([null, '628222', '628111'])('uses only the reported pairing %s in either direction', async phone => {
+    const resolve = () => Promise.resolve(phone);
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '628111@c.us', resolve)).toBe(phone === '628111');
+    expect(await storedKeyInChatPersisted({ remoteJid: '628111@s.whatsapp.net' }, '111@lid', resolve)).toBe(
+      phone === '628111',
+    );
+  });
+
+  it('keeps distinct raw LIDs separate even if a directory maps both to one phone', async () => {
+    expect(await storedKeyInChatPersisted({ remoteJid: '111@lid' }, '222@lid', () => Promise.resolve('628111'))).toBe(
+      false,
+    );
+  });
+});
+
+/**
+ * Baileys 7.0.0-rc14 `getContentType` (lib/Utils/messages.js), copied because the library is ESM-only and stubbed here:
+ * the first key that is `conversation` or contains `Message`, except senderKeyDistributionMessage, by name.
+ */
+const libraryContentType: ContentTypeLib['getContentType'] = content =>
+  Object.keys(content ?? {}).find(
+    key => (key === 'conversation' || key.includes('Message')) && key !== 'senderKeyDistributionMessage',
+  ) as keyof proto.IMessage | undefined;
+
+describe('what is no message of its own', () => {
+  const FAST_RATCHET = 'fastRatchetKeySenderKeyDistributionMessage';
+
+  describe('isNoiseOnly', () => {
+    it.each<[string, Record<string, unknown>]>([
+      ['a sender-key distribution', { senderKeyDistributionMessage: {} }],
+      ['a fast-ratchet sender-key distribution', { [FAST_RATCHET]: {} }],
+      ['a distribution with its context info', { [FAST_RATCHET]: {}, messageContextInfo: {} }],
+      ['a history-sync notice', { messageHistoryNotice: {} }],
+      ['a history bundle', { messageHistoryBundle: {} }],
+    ])('holds for %s', (_what, content) => {
+      expect(isNoiseOnly(content)).toBe(true);
+    });
+
+    it.each<[string, Record<string, unknown> | null | undefined]>([
+      ['nothing', undefined],
+      ['null', null],
+      ['an empty message', {}],
+      ['a message context info alone, which real content and a newer type carry', { messageContextInfo: {} }],
+      ['a text', { conversation: 'hi' }],
+      ['a text bundled with a distribution', { conversation: 'hi', [FAST_RATCHET]: {} }],
+      ['a distribution bundled with a text', { [FAST_RATCHET]: {}, conversation: 'hi' }],
+    ])('does not hold for %s', (_what, content) => {
+      expect(isNoiseOnly(content)).toBe(false);
+    });
+
+    it.each<[string, Record<string, unknown> | undefined]>([
+      ['a message context info alone', { messageContextInfo: {} }],
+      ['an empty message', {}],
+      ['nothing', undefined],
+    ])('holds for %s once part of its stanza failed to decrypt', (_what, content) => {
+      expect(isNoiseOnly(content, true)).toBe(true);
+    });
+
+    it('still keeps real content that survived a failed decryption', () => {
+      expect(isNoiseOnly({ conversation: 'hi', messageContextInfo: {} }, true)).toBe(false);
+    });
+  });
+
+  describe('contentTypeOf', () => {
+    it.each<[string, Record<string, unknown> | undefined, string | undefined]>([
+      ['a text', { conversation: 'hi' }, 'conversation'],
+      ['an image with its context info', { messageContextInfo: {}, imageMessage: {} }, 'imageMessage'],
+      [
+        'a text after a sender-key distribution, which the library skips by name',
+        { senderKeyDistributionMessage: {}, conversation: 'hi' },
+        'conversation',
+      ],
+      ['a text after a fast-ratchet distribution', { [FAST_RATCHET]: {}, conversation: 'hi' }, 'conversation'],
+      ['a text before a fast-ratchet distribution', { conversation: 'hi', [FAST_RATCHET]: {} }, 'conversation'],
+      ['a pin after a fast-ratchet distribution', { [FAST_RATCHET]: {}, pinInChatMessage: {} }, 'pinInChatMessage'],
+      ['a fast-ratchet distribution alone', { [FAST_RATCHET]: {} }, undefined],
+      ['a distribution with a message with no type, which nothing names', { [FAST_RATCHET]: {}, call: {} }, undefined],
+      ['no content', undefined, undefined],
+    ])('names %s', (_what, content, expected) => {
+      expect(contentTypeOf(content as proto.IMessage | undefined, libraryContentType)).toBe(expected);
+    });
+
+    it('asks the library once unless it answered with a noise key', () => {
+      const ask = jest.fn(libraryContentType);
+      expect(contentTypeOf({ conversation: 'hi' }, ask)).toBe('conversation');
+      expect(ask).toHaveBeenCalledTimes(1);
+      ask.mockClear();
+      expect(contentTypeOf({ [FAST_RATCHET]: {}, conversation: 'hi' }, ask)).toBe('conversation');
+      expect(ask).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('withoutFastRatchetDistribution', () => {
+    const SECRET = { messageSecret: 'c2VjcmV0' };
+    const stored = (message: Record<string, unknown> | null) =>
+      ({ key: { id: 'X1', remoteJid: '628111@s.whatsapp.net' }, messageTimestamp: 1700000040, message }) as {
+        key: { id: string; remoteJid: string };
+        messageTimestamp: number;
+        message: proto.IMessage | null;
+      };
+
+    it.each<[string, Record<string, unknown>]>([
+      ['before', { [FAST_RATCHET]: {}, imageMessage: { url: 'u' }, messageContextInfo: SECRET }],
+      ['after', { imageMessage: { url: 'u' }, [FAST_RATCHET]: {}, messageContextInfo: SECRET }],
+    ])('takes out a distribution that merged %s the content, and keeps the rest in its order', (_where, message) => {
+      const msg = stored(message);
+      const out = withoutFastRatchetDistribution(msg);
+      expect(Object.keys(out.message ?? {})).toEqual(['imageMessage', 'messageContextInfo']);
+      expect(out.message?.messageContextInfo).toBe(message.messageContextInfo);
+      expect(out.key).toBe(msg.key);
+      expect(out.messageTimestamp).toBe(1700000040);
+      // Baileys types the message it hands on by its content, as the adapter does.
+      expect(libraryContentType(out.message ?? undefined)).toBe('imageMessage');
+    });
+
+    it('is a copy: the message it is given keeps the distribution', () => {
+      const msg = stored({ [FAST_RATCHET]: { groupId: 'g' }, conversation: 'hi' });
+      const out = withoutFastRatchetDistribution(msg);
+      expect(out).not.toBe(msg);
+      expect(out.message).not.toBe(msg.message);
+      expect(Object.keys(msg.message ?? {})).toEqual([FAST_RATCHET, 'conversation']);
+    });
+
+    it('takes out nothing but the fast-ratchet distribution', () => {
+      const out = withoutFastRatchetDistribution(
+        stored({
+          senderKeyDistributionMessage: {},
+          [FAST_RATCHET]: {},
+          messageHistoryNotice: {},
+          conversation: 'hi',
+          messageContextInfo: SECRET,
+        }),
+      );
+      expect(Object.keys(out.message ?? {})).toEqual([
+        'senderKeyDistributionMessage',
+        'messageHistoryNotice',
+        'conversation',
+        'messageContextInfo',
+      ]);
+    });
+
+    it.each<[string, ReturnType<typeof stored> | null | undefined]>([
+      ['a message with no distribution', stored({ conversation: 'hi', messageContextInfo: SECRET })],
+      ['a message whose distribution is only inherited', stored(Object.create({ [FAST_RATCHET]: null }) as never)],
+      ['a message with no content', stored(null)],
+      ['no message', null],
+      ['nothing', undefined],
+    ])('returns what it is given for %s', (_what, msg) => {
+      expect(withoutFastRatchetDistribution(msg)).toBe(msg);
+    });
+  });
+
+  describe('isNonContent', () => {
+    it.each<[string, Record<string, unknown>]>([
+      ['a pin', { pinInChatMessage: {} }],
+      ['a keep-in-chat toggle', { keepInChatMessage: {} }],
+      ['an album header', { albumMessage: {} }],
+      ['an encrypted comment', { encCommentMessage: {} }],
+      ['a fast-ratchet distribution alone', { [FAST_RATCHET]: {} }],
+      ['a pin that merged after a fast-ratchet distribution', { [FAST_RATCHET]: {}, pinInChatMessage: {} }],
+    ])('holds for %s', (_what, content) => {
+      expect(isNonContent(content as proto.IMessage, libraryContentType)).toBe(true);
+    });
+
+    it.each<[string, Record<string, unknown>]>([
+      ['a text', { conversation: 'hi' }],
+      ['a text that merged after a fast-ratchet distribution', { [FAST_RATCHET]: {}, conversation: 'hi' }],
+      ['a message with no type that is not noise', { [FAST_RATCHET]: {}, call: {} }],
+      ['a message context info alone, which reaches consumers as unknown', { messageContextInfo: {} }],
+    ])('does not hold for %s', (_what, content) => {
+      expect(isNonContent(content as proto.IMessage, libraryContentType)).toBe(false);
+    });
+  });
+
+  describe('withoutNonContentMessage', () => {
+    const lib = { getContentType: libraryContentType, normalizeMessageContent: (content: unknown) => content } as never;
+    const CHAT_ID = '628111@s.whatsapp.net';
+    /** The update Baileys raises for one message: its count (a received one), its time and the message. */
+    const raised = (
+      content: Record<string, unknown>,
+      over: { unreadCount?: number | null; fromMe?: boolean; stub?: number } = {},
+    ): Partial<Chat> => ({
+      id: CHAT_ID,
+      ...(over.fromMe === true ? {} : { unreadCount: over.unreadCount ?? 1 }),
+      conversationTimestamp: 1700000040,
+      messages: [
+        {
+          message: {
+            key: { remoteJid: CHAT_ID, fromMe: over.fromMe === true, id: 'X1' },
+            message: content,
+            ...(over.stub ? { messageStubType: over.stub } : {}),
+          },
+        },
+      ],
+    });
+    const PIN = { pinInChatMessage: {} };
+
+    it.each<[string, Record<string, unknown>]>([
+      ['an encrypted edit', { secretEncryptedMessage: {} }],
+      ['an encrypted reaction', { encReactionMessage: {} }],
+      ['a pin', PIN],
+      ['a keep-in-chat toggle', { keepInChatMessage: {} }],
+      ['an album header', { albumMessage: {} }],
+      ['an event RSVP', { encEventResponseMessage: {} }],
+      ['an encrypted comment', { encCommentMessage: {} }],
+      ['a fast-ratchet distribution alone', { [FAST_RATCHET]: {} }],
+      ['a pin that merged after a fast-ratchet distribution', { [FAST_RATCHET]: {}, pinInChatMessage: {} }],
+    ])('leaves nothing of the update of %s received from a contact but its id', (_what, content) => {
+      expect(withoutNonContentMessage(raised(content), lib)).toBeUndefined();
+    });
+
+    it("leaves nothing of the update of a message of the account's own but its id", () => {
+      expect(withoutNonContentMessage(raised(PIN, { fromMe: true }), lib)).toBeUndefined();
+    });
+
+    it('takes out the count, the time and the message, and keeps what else the update carries', () => {
+      const others = {
+        ephemeralExpiration: 86_400,
+        ephemeralSettingTimestamp: 1700000000,
+        name: 'Rina',
+        muteEndTime: 5,
+        pinned: 3,
+        archived: false,
+        readOnly: false,
+      };
+      for (const update of [
+        { ...raised(PIN), ...others },
+        { ...raised(PIN, { fromMe: true }), ...others },
+      ]) {
+        const before = { ...update };
+        expect(withoutNonContentMessage(update, lib)).toEqual({ id: CHAT_ID, ...others });
+        expect(update).toEqual(before);
+      }
+    });
+
+    it('treats a condition Baileys put on the update as nothing', () => {
+      const update = Object.assign(raised(PIN), { conditional: () => true });
+      expect(withoutNonContentMessage(update, lib)).toBeUndefined();
+    });
+
+    it.each<[string, Record<string, unknown>]>([
+      ['a text', { conversation: 'hi' }],
+      ['a text that merged after a fast-ratchet distribution', { [FAST_RATCHET]: {}, conversation: 'hi' }],
+      ['a text that merged before a fast-ratchet distribution', { conversation: 'hi', [FAST_RATCHET]: {} }],
+    ])('leaves the update of %s whole', (_what, content) => {
+      for (const update of [raised(content), raised(content, { fromMe: true })]) {
+        expect(withoutNonContentMessage(update, lib)).toBe(update);
+      }
+    });
+
+    it.each<[string, Partial<Chat>]>([
+      ['a count above one, which may hold a message of its own', raised(PIN, { unreadCount: 2 })],
+      ['a mark set by hand in place of the count', raised(PIN, { unreadCount: -1 })],
+      ['a stub type', raised(PIN, { stub: 2 })],
+      [
+        "a count beside the account's own message, which is not the message's",
+        { ...raised(PIN, { fromMe: true }), unreadCount: 1 },
+      ],
+      [
+        "a cancelled mark beside the account's own message",
+        { ...raised(PIN, { fromMe: true }), unreadCount: undefined },
+      ],
+      ['no message', { ...raised(PIN), messages: [] }],
+      ['a message with no content', { ...raised(PIN), messages: [{ message: { key: { id: 'X1' } } }] }],
+      ['nothing but its id, which Baileys sent', { id: CHAT_ID }],
+    ])('leaves the update whole for %s', (_what, update) => {
+      expect(withoutNonContentMessage(update, lib)).toBe(update);
+    });
+
+    it('leaves an update alone before the library is loaded', () => {
+      const update = raised(PIN);
+      expect(withoutNonContentMessage(update, undefined)).toBe(update);
+    });
+  });
+
+  // The library's event buffer adds the counts of one flush, lowers the sum for a message read elsewhere and emits the
+  // chat updates before the messages, so an update that does not count exactly one message is settled with the messages
+  // of its flush: the chat holds none of its own when every message the library counted for it is none of its own.
+  describe('settling an update with its flush', () => {
+    // The parts of the library that file a message under a chat, as process-message.ts has them.
+    const filing = {
+      getChatId: ({ remoteJid, participant, fromMe }: proto.IMessageKey) => {
+        if (!remoteJid) throw new Error('Cannot derive chat id: message key is missing remoteJid');
+        return remoteJid.endsWith('@broadcast') && remoteJid !== 'status@broadcast' && !fromMe
+          ? (participant as string)
+          : remoteJid;
+      },
+      jidNormalizedUser: (jid: string) => jid.replace(/:\d+@/, '@').replace('@c.us', '@s.whatsapp.net'),
+    };
+    const lib = {
+      getContentType: libraryContentType,
+      normalizeMessageContent: (content: unknown) => content,
+      isRealMessage: () => true,
+      ...filing,
+    } as never;
+    const CHAT_ID = '628111@s.whatsapp.net';
+    const raised = (content: Record<string, unknown>, unreadCount: number, fromMe = false): Partial<Chat> => ({
+      id: CHAT_ID,
+      ...(fromMe ? {} : { unreadCount }),
+      conversationTimestamp: 1700000040,
+      messages: [{ message: { key: { remoteJid: CHAT_ID, fromMe, id: 'X1' }, message: content } }],
+    });
+    const PIN = { pinInChatMessage: {} };
+    /** The update once the library's buffer lowered its count to zero, which it takes away. */
+    const withoutCount = (update: Partial<Chat>): Partial<Chat> => {
+      delete update.unreadCount;
+      return update;
+    };
+    const wire = (content: Record<string, unknown> | null, over: Partial<proto.IWebMessageInfo> = {}) =>
+      ({
+        key: { remoteJid: CHAT_ID, fromMe: false, id: 'M1' },
+        ...(content ? { message: content } : {}),
+        ...over,
+      }) as never;
+
+    it.each<[string, Partial<Chat>]>([
+      ['a count above one', raised(PIN, 2)],
+      ['a count the library lowered to nothing', { ...raised(PIN, 2), unreadCount: undefined }],
+      ['a count the library took away', withoutCount(raised(PIN, 2))],
+      ['a mark set by hand', raised(PIN, -1)],
+      ['a read', raised(PIN, 0)],
+    ])('holds an update that ends in a message of no content and has %s', (_what, update) => {
+      expect(mayHoldOnlyNonContent(update, lib)).toBe(true);
+    });
+
+    it.each<[string, Partial<Chat>]>([
+      ['a count of one, which needs no flush', raised(PIN, 1)],
+      ['a message of the account itself', raised(PIN, 0, true)],
+      ['a last message with content', raised({ conversation: 'hi' }, 2)],
+      ['no message at all', { id: CHAT_ID, unreadCount: 2 }],
+    ])('does not hold an update with %s', (_what, update) => {
+      expect(mayHoldOnlyNonContent(update, lib)).toBe(false);
+    });
+
+    it('holds a chunk that ends in a message of no content and counts more than one, and no other', () => {
+      expect(mayCountSeveralNonContent(raised(PIN, 2), lib)).toBe(true);
+      expect(mayCountSeveralNonContent(raised(PIN, 1), lib)).toBe(false);
+      expect(mayCountSeveralNonContent(raised(PIN, -1), lib)).toBe(false);
+      expect(mayCountSeveralNonContent(raised({ conversation: 'hi' }, 2), lib)).toBe(false);
+    });
+
+    it.each([1, 2, 3])('takes the message, the time and a count of 1 to 3 the messages explain: %i', count => {
+      expect(withoutNonContentOnlyFlush(raised(PIN, count), lib, 3)).toBeUndefined();
+    });
+
+    it('takes the message and the time of an update whose count the library took away', () => {
+      expect(withoutNonContentOnlyFlush(withoutCount(raised(PIN, 2)), lib, 3)).toBeUndefined();
+    });
+
+    it.each<[string, number | null | undefined]>([
+      ['more than the messages add up to', 4],
+      ['a mark set by hand', -1],
+      ['the zero of a read', 0],
+      ['a mark cancelled', null],
+    ])('takes the message and the time but keeps a count that is %s', (_what, unreadCount) => {
+      const kept = withoutNonContentOnlyFlush({ ...raised(PIN, 1), unreadCount }, lib, 3);
+      expect(kept).toEqual({ id: CHAT_ID, unreadCount });
+    });
+
+    it('leaves the update of a message of the account itself, and one with no message, whole', () => {
+      const own = raised(PIN, 0, true);
+      expect(withoutNonContentOnlyFlush(own, lib, 2)).toBe(own);
+      const bare = { id: CHAT_ID, unreadCount: 2 };
+      expect(withoutNonContentOnlyFlush(bare, lib, 2)).toBe(bare);
+      const text = raised({ conversation: 'hi' }, 2);
+      expect(withoutNonContentOnlyFlush(text, lib, 2)).toBe(text);
+    });
+
+    it('names what the library counts a message of the flush as', () => {
+      expect(countedMessageKind(wire(PIN), lib)).toBe('noContent');
+      expect(countedMessageKind(wire({ conversation: 'hi' }), lib)).toBe('content');
+      expect(
+        countedMessageKind(wire(PIN, { key: { remoteJid: CHAT_ID, fromMe: true, id: 'M1' } }), lib),
+      ).toBeUndefined();
+      expect(countedMessageKind(wire(PIN, { messageStubType: 2 }), lib)).toBeUndefined();
+      expect(countedMessageKind(wire(null), lib)).toBeUndefined();
+      const notReal = { ...(lib as object), isRealMessage: () => false } as never;
+      expect(countedMessageKind(wire({ conversation: 'hi' }), notReal)).toBeUndefined();
+    });
+
+    it('files a message under the chat the library gives its update', () => {
+      expect(countedChatId({ remoteJid: CHAT_ID, fromMe: false }, lib)).toBe(CHAT_ID);
+      expect(countedChatId({ remoteJid: '628111@c.us', fromMe: false }, lib)).toBe(CHAT_ID);
+      expect(countedChatId({ remoteJid: '120363@g.us', participant: '628222:12@s.whatsapp.net' }, lib)).toBe(
+        '120363@g.us',
+      );
+      // The sender chat of a broadcast list, with the device suffix the library takes off.
+      expect(
+        countedChatId({ remoteJid: '12345@broadcast', participant: '628222:12@s.whatsapp.net', fromMe: false }, lib),
+      ).toBe('628222@s.whatsapp.net');
+      expect(
+        countedChatId({ remoteJid: 'status@broadcast', participant: '628222@s.whatsapp.net', fromMe: false }, lib),
+      ).toBe('status@broadcast');
+    });
+
+    it('files no message under a chat when the library cannot', () => {
+      expect(countedChatId({ fromMe: false }, lib)).toBeUndefined();
+      expect(countedChatId({ remoteJid: '12345@broadcast', fromMe: false }, lib)).toBeUndefined();
+    });
+  });
+
+  describe('withoutMergedNonContentMessage', () => {
+    const lib = { getContentType: libraryContentType, normalizeMessageContent: (content: unknown) => content } as never;
+    const CHAT_ID = '628111@s.whatsapp.net';
+    const PIN = { pinInChatMessage: {} };
+    /** A history chunk's chat after the library merged a chat update into it: its last message, its time, the summed count. */
+    const merged = (
+      content: Record<string, unknown>,
+      over: { time?: unknown; messageTime?: unknown; stub?: number; count?: number; fromMe?: boolean } = {},
+    ): Partial<Chat> => ({
+      id: CHAT_ID,
+      name: 'Rina',
+      unreadCount: over.count ?? 1,
+      conversationTimestamp: 'time' in over ? (over.time as number) : 1700000040,
+      messages: [
+        {
+          message: {
+            key: { remoteJid: CHAT_ID, fromMe: over.fromMe === true, id: 'X1' },
+            message: content,
+            messageTimestamp: 'messageTime' in over ? (over.messageTime as number) : 1700000040,
+            ...(over.stub ? { messageStubType: over.stub } : {}),
+          },
+        },
+      ],
+    });
+
+    it('takes out the message and its time, and keeps the count and the rest of the chunk', () => {
+      const chat = merged(PIN);
+      const before = { ...chat };
+      expect(withoutMergedNonContentMessage(chat, lib)).toEqual({ id: CHAT_ID, name: 'Rina', unreadCount: 1 });
+      expect(chat).toEqual(before);
+    });
+
+    it.each<[string, unknown, unknown]>([
+      ['a Long', { low: 1700000040, high: 0, unsigned: false, toString: () => '1700000040' }, 1700000040],
+      ['a string', '1700000040', 1700000040],
+    ])('finds the time of the message under %s', (_what, messageTime, time) => {
+      expect(withoutMergedNonContentMessage(merged(PIN, { messageTime, time }), lib)).not.toHaveProperty(
+        'conversationTimestamp',
+      );
+    });
+
+    it('keeps a time that is not the message', () => {
+      expect(withoutMergedNonContentMessage(merged(PIN, { time: 1700000010 }), lib)).toEqual({
+        id: CHAT_ID,
+        name: 'Rina',
+        unreadCount: 1,
+        conversationTimestamp: 1700000010,
+      });
+    });
+
+    it.each<[string, Partial<Chat>]>([
+      ['a message with a time of its own', merged({ conversation: 'hi' })],
+      ['a stub type', merged(PIN, { stub: 2 })],
+      ['a count above one, which may hold a text or a count of the chunk', merged(PIN, { count: 2 })],
+      ['a count the chunk held, with a pin of the account after it', merged(PIN, { count: 3, fromMe: true })],
+      // A contact's text, then the account's own pin, in one flush: the one count is the text's, not the pin's.
+      ["the count of one a contact's text left beside a pin of the account", merged(PIN, { count: 1, fromMe: true })],
+      ['no message', { ...merged(PIN), messages: [] }],
+      ['no messages key', { id: CHAT_ID, conversationTimestamp: 1700000040, unreadCount: 3 }],
+      ['a message with no content', { ...merged(PIN), messages: [{ message: { key: { id: 'X1' } } }] }],
+    ])('leaves the chat whole for %s', (_what, chat) => {
+      expect(withoutMergedNonContentMessage(chat, lib)).toBe(chat);
+    });
+
+    it.each<[string, Partial<Chat>]>([
+      ['a count of zero', merged(PIN, { count: 0, fromMe: true })],
+      ['no count', { ...merged(PIN, { fromMe: true }), unreadCount: undefined }],
+      ['a mark in place of the count', merged(PIN, { count: -1, fromMe: true })],
+    ])('recognises a pin of the account beside %s', (_what, chat) => {
+      const { messages, conversationTimestamp, ...rest } = withoutMergedNonContentMessage(chat, lib);
+      expect([messages, conversationTimestamp]).toEqual([undefined, undefined]);
+      expect(rest).toEqual({
+        id: CHAT_ID,
+        name: 'Rina',
+        ...('unreadCount' in chat ? { unreadCount: chat.unreadCount } : {}),
+      });
+    });
+
+    describe('droppedMessageTime', () => {
+      it('names the time that was taken out, for the chat the filter returned', () => {
+        const chat = merged(PIN);
+        expect(droppedMessageTime(withoutMergedNonContentMessage(chat, lib))).toBe(1700000040);
+        expect(droppedMessageTime(withoutMergedNonContentMessage(merged(PIN, { count: 0, fromMe: true }), lib))).toBe(
+          1700000040,
+        );
+      });
+
+      it('names the time of a Long as a number', () => {
+        const messageTime = { low: 1700000040, high: 0, unsigned: false, toString: () => '1700000040' };
+        expect(droppedMessageTime(withoutMergedNonContentMessage(merged(PIN, { messageTime }), lib))).toBe(1700000040);
+      });
+
+      it('names nothing when the chat kept its time, or was left whole, or is not what the filter returned', () => {
+        const kept = withoutMergedNonContentMessage(merged(PIN, { time: 1700000010 }), lib);
+        const whole = merged({ conversation: 'hi' });
+        expect(droppedMessageTime(kept)).toBeUndefined();
+        expect(droppedMessageTime(withoutMergedNonContentMessage(whole, lib))).toBeUndefined();
+        expect(droppedMessageTime(merged(PIN))).toBeUndefined();
+        expect(droppedMessageTime({ ...withoutMergedNonContentMessage(merged(PIN), lib) })).toBeUndefined();
+      });
+    });
+
+    it('takes out the time of a message that has none of its own, only when the chat has one', () => {
+      const noTime = merged(PIN, { messageTime: null });
+      expect(withoutMergedNonContentMessage(noTime, lib)).toHaveProperty('conversationTimestamp', 1700000040);
+      expect(
+        withoutMergedNonContentMessage({ ...merged(PIN), conversationTimestamp: undefined }, lib),
+      ).not.toHaveProperty('messages');
+    });
+
+    it('leaves a chat alone before the library is loaded', () => {
+      const chat = merged(PIN);
+      expect(withoutMergedNonContentMessage(chat, undefined)).toBe(chat);
+    });
+  });
+
+  describe('isLidSender fromMe guard', () => {
+    it('sets isLidSender only when !fromMe on an @lid sender', () => {
+      const base: BaileysIncomingFields = {
+        id: 'MSG-LID-1',
+        remoteJid: '123456@lid',
+        fromMe: false,
+        body: 'hi',
+        contentType: 'conversation',
+        timestamp: 1_700_000_000,
+        selfJid: '628999@s.whatsapp.net',
+      };
+      expect(buildIncomingMessageFromBaileys({ ...base, fromMe: false }).isLidSender).toBe(true);
+      expect(buildIncomingMessageFromBaileys({ ...base, fromMe: true }).isLidSender).toBeUndefined();
+      expect(
+        buildIncomingMessageFromBaileys({
+          ...base,
+          remoteJid: '120363000@g.us',
+          participant: '999@lid',
+          fromMe: true,
+        }).isLidSender,
+      ).toBeUndefined();
+    });
   });
 });

@@ -2,6 +2,7 @@ import { ConflictException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { Session } from './entities/session.entity';
 import { SessionService } from './session.service';
+import { EngineRegistry } from '../../engine/engine-registry.service';
 
 /**
  * PATCH /config merges into the stored blob. Two overlapping requests that each read the same blob
@@ -21,7 +22,7 @@ describe('SessionService.updateConfig under concurrent requests', () => {
       ds.getRepository(Session),
       unused, // messages
       ds,
-      unused, // engine registry
+      new EngineRegistry(),
       unused, // watchdog
       attach, // session errors
       attach, // session restrictions
@@ -63,6 +64,22 @@ describe('SessionService.updateConfig under concurrent requests', () => {
 
     const stored = await ds.getRepository(Session).findOneByOrFail({ id });
     expect(stored.config).toEqual({ operatorKey: 'keep', autoRejectCalls: true });
+  });
+
+  // A restore writes the column as the backup holds it, and JSON that parses is not always an object.
+  // Spreading a string or an array would write its characters or items back as keys.
+  it.each([
+    ['a JSON string', '"legacy"'],
+    ['a JSON array', '["a","b"]'],
+    ['empty text', ''],
+  ])('starts from an empty config when the stored one is %s', async (kind, text) => {
+    const { id } = await ds.getRepository(Session).save({ name: `cfg ${kind}`, config: {} });
+    await ds.query(`UPDATE sessions SET config = ? WHERE id = ?`, [text, id]);
+
+    await expect(service.updateConfig(id, { linkPreview: false })).resolves.toMatchObject({ linkPreview: false });
+
+    const stored = await ds.getRepository(Session).findOneByOrFail({ id });
+    expect(stored.config).toEqual({ linkPreview: false });
   });
 
   // A request that keeps losing the race must not loop for ever.

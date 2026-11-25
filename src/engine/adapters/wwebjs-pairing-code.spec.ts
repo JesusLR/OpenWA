@@ -53,6 +53,21 @@ describe('requestPairingCode retries a mid-navigation page', () => {
     expect(requestPairingCode).toHaveBeenCalledTimes(2);
   });
 
+  // A request that lands on the reloaded document dies on a WhatsApp Web bundle that has not booted yet.
+  it('retries a request that lands on a page that has not booted yet', async () => {
+    jest.useFakeTimers();
+    const fresh = new Error('window.require is not a function');
+    fresh.name = 'TypeError';
+    const requestPairingCode = jest.fn().mockRejectedValueOnce(fresh).mockResolvedValueOnce('WXYZ1234');
+    const lc = makeLifecycle(requestPairingCode);
+
+    const pending = lc.requestPairingCode('628111');
+    await jest.advanceTimersByTimeAsync(PAIRING_CODE_RETRY_DELAY_MS + 10);
+
+    await expect(pending).resolves.toBe('WXYZ1234');
+    expect(requestPairingCode).toHaveBeenCalledTimes(2);
+  });
+
   // An exhausted budget is a transport failure, not a broken gateway: it answers 503 so a caller
   // knows the request is worth retrying, and carries the last attempt's reason as the detail.
   it('bounds a hanging attempt and gives up after the attempt budget', async () => {

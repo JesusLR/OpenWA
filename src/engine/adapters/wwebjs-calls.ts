@@ -22,9 +22,7 @@ export class WwebjsCalls {
    *  covers the ringing window with margin without pinning dead calls for long. */
   private static readonly LIVE_CALL_TTL_MS = 2 * 60_000;
 
-  /** Expiry time of each ringing call, by call id. Public so the adapter's `liveCalls` alias keeps
-   *  working (the spec reads `adapter.liveCalls` through a cast) and lifecycle teardown can clear it
-   *  when the client goes away. */
+  /** Expiry time of each ringing call, by call id. Cleared when the client goes away (clearLiveCalls). */
   readonly liveCalls = new Map<string, number>();
 
   constructor(private readonly host: WwebjsCallsHost) {}
@@ -92,14 +90,14 @@ export class WwebjsCalls {
 
   /**
    * Not available on this engine, despite `Call.reject()` existing and being typed `Promise<void>`
-   * (`index.d.ts:2417`).
+   * (`index.d.ts`).
    *
    * Measured live on 2026-09-17 on OpenWA 0.23.4 with WhatsApp Web `2.3000.1047471845-alpha`: the
    * reject resolved and OpenWA logged the call as auto-rejected, but the caller's phone kept ringing
    * until it timed out, while a Baileys auto-reject stopped the caller's phone at once that day. Why
    * the rejection has no effect is not established. The page function it runs, `WWebJS.rejectCall`,
-   * is modified by OpenWA's install-time patch (`scripts/wwebjs-201832.patch`), which reads the own
-   * user id as `getMaybeMePnUser()._serialized || $1`.
+   * carries upstream whatsapp-web.js#201832 (shipped in 1.34.8), which reads the own user id as
+   * `getMaybeMePnUser()._serialized || $1`.
    *
    * A 501 tells the caller the truth where a 200 claimed a rejection that did not stop the call.
    * Restoring support needs a live call proving that a rejection stops the ringing.

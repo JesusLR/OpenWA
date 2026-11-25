@@ -20,6 +20,13 @@ export interface WwebjsReadyReconcileHost {
   getCallbacks(): EngineEventCallbacks;
   /** Promote to READY off the live client's info — the lifecycle's own ready path. */
   markReadyFromClientInfo(): void;
+  /** The page navigations stamped so far: a probe reads it before it asks the page, to tell a newer navigation. */
+  stampedNavigations(): number;
+  /**
+   * Close the reload window of the navigations stamped up to `navigationsBefore`, which a probe has found the page
+   * through. A navigation stamped since is a newer one, and leaves the window as it is.
+   */
+  closeRecoveredEpisode(navigationsBefore: number): void;
   /** Whether this engine showed a QR before authenticating: a fresh pairing, not a restored session. */
   wasFreshPairing(): boolean;
   /** The deadline's fresh-pairing branch: clear the broken auth and let the lifecycle re-pair. */
@@ -30,9 +37,10 @@ const READY_RECONCILE_INTERVAL_MS = 2000;
 export const READY_RECONCILE_TIMEOUT_MS = 90_000;
 
 // How long after `authenticated` the event bridge is allowed to still be attaching before a reload is
-// considered. whatsapp-web.js clears `eventsAttached` in its constructor (Client.js:109) and sets it
-// only once attachEventListeners() resolves (Client.js:373); in between it evaluates LoadUtils, polls
-// up to 30s for window.WWebJS (Client.js:334), then builds ClientInfo and InterfaceController. So a
+// considered. whatsapp-web.js clears `eventsAttached` in its constructor (and, with the ready-sync patch, again
+// whenever its post-auth callback starts attaching for a page without the helpers) and sets it only once
+// attachEventListeners() resolves; in between it evaluates LoadUtils, polls up to 30s for window.WWebJS, then
+// builds ClientInfo and InterfaceController. So a
 // false flag is the NORMAL reading for most of a minute on a loaded host, and reloading on it aborts
 // a healthy attach — the page navigates out from under the in-flight inject(), which then dies before
 // re-exposing the bridge and cannot be retried (#1081). Must exceed upstream's own 30s poll with room
@@ -136,10 +144,15 @@ export class WwebjsReadyReconcile {
 
       if (this.readyReconcileProbeInFlight) return;
       this.readyReconcileProbeInFlight = true;
+      const navigationsBefore = this.host.stampedNavigations();
       void this.isClientRuntimeReady()
         .then(ready => {
           if (ready && this.host.getClient() && this.host.getStatus() === EngineStatus.AUTHENTICATING) {
             this.host.logger.warn('WhatsApp Web ready event was missed; reconciling from connected runtime state');
+            // The library's own `ready` closes the reload window a navigation opened while the session authenticated,
+            // and this promotion is the one that stands in for it. The probe found the helpers in the page it asked,
+            // which is what the window waits for; a navigation stamped while it was out is a newer one.
+            this.host.closeRecoveredEpisode(navigationsBefore);
             this.host.markReadyFromClientInfo();
           } else if (this.host.getStatus() === EngineStatus.AUTHENTICATING) {
             this.maybeReloadDeadBridge();
@@ -195,8 +208,9 @@ export class WwebjsReadyReconcile {
   /**
    * One-shot self-heal for a CONNECTED page whose event bridge never attached: reload the page.
    * whatsapp-web.js re-runs its injection on every `framenavigated`, and a fresh page walks the
-   * whole auth->synced->attach pipeline again (with the level-check patch closing the missed-edge
-   * race), so a reload is the cheapest full reinjection that keeps the saved session intact.
+   * whole auth->synced->attach pipeline again (whatsapp-web.js 1.34.8 fires its post-auth callback once on
+   * the hasSynced level as well, which closes the missed-edge race), so a reload is the cheapest full
+   * reinjection that keeps the saved session intact.
    */
   private maybeReloadDeadBridge(): void {
     if (this.readyReconcileReloadAttempted) return;

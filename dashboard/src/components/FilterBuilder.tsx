@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Plus, X } from 'lucide-react';
 import {
@@ -10,7 +10,10 @@ import {
   type WebhookFilterOperator,
 } from '../services/api';
 import { filterValueLabel } from '../utils/enumLabels';
+import { chatTitle } from '../utils/formatPhone';
+import { normalizePhoneText, phoneQueryDigits } from '../utils/phone';
 import { MAX_FILTER_CONDITIONS, MAX_FILTER_TEXT_LENGTH } from '../utils/webhookFilters';
+import { isComposingKey } from '../utils/composition';
 import './FilterBuilder.css';
 
 type FieldKind = 'id' | 'idArray' | 'text' | 'enum' | 'boolean';
@@ -55,13 +58,21 @@ function defaultValueFor(kind: FieldKind): WebhookFilterCondition['value'] {
   return [];
 }
 
-/** Accepts a full JID or a phone number; normalizes bare numbers to `<digits>@c.us`. */
+const PHONE_MAX_DIGITS = 15;
+const phoneDigits = (value: string) => normalizePhoneText(value).replace(/[^0-9]/g, '');
+// A typed number that cannot be added, so the field says why instead of ignoring Enter.
+const isTooLong = (raw: string) => !raw.includes('@') && phoneDigits(raw).length > PHONE_MAX_DIGITS;
+
+/**
+ * Accepts a full JID or a phone number; normalizes bare numbers to `<digits>@c.us`. More than 15 digits (E.164) is no
+ * phone number, such as two numbers typed with a space between them, so it is not added.
+ */
 function normalizeToJid(raw: string): string | null {
   const value = raw.trim();
   if (!value) return null;
   if (value.includes('@')) return value.toLowerCase();
-  const digits = value.replace(/[^0-9]/g, '');
-  return digits ? `${digits}@c.us` : null;
+  const digits = phoneDigits(value);
+  return digits && digits.length <= PHONE_MAX_DIGITS ? `${digits}@c.us` : null;
 }
 
 interface ContactChipsInputProps {
@@ -74,24 +85,41 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
   const { t } = useTranslation();
   const [text, setText] = useState('');
   const [open, setOpen] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const blurTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(blurTimer.current), []);
 
   const suggestions = useMemo(() => {
     const query = text.trim().toLowerCase();
+    // A number typed as it is written, with its spaces, plus sign or parentheses, is compared by its digits.
+    const digits = phoneQueryDigits(text);
     const chosen = new Set(value);
     return (
       chats
         .filter(c => !chosen.has(c.id))
-        .filter(c => !query || c.name.toLowerCase().includes(query) || c.id.toLowerCase().includes(query))
+        .filter(
+          c =>
+            !query ||
+            c.name.toLowerCase().includes(query) ||
+            c.id.toLowerCase().includes(query) ||
+            (digits !== '' && (c.id.includes(digits) || c.phone?.includes(digits))),
+        )
         // The dropdown scrolls, so this only bounds how much of an account with up to 1000 chats is
         // rendered on every keystroke. Typing narrows the list further.
         .slice(0, 50)
     );
   }, [text, chats, value]);
 
-  const labelFor = (jid: string) => chats.find(c => c.id === jid)?.name ?? jid;
+  // A chat with no name (Baileys lists an unnamed privacy-id chat with `''`) is called by its number, as the list does.
+  const labelFor = (jid: string) => {
+    const chat = chats.find(c => c.id === jid);
+    return chat ? chatTitle(chat) : jid;
+  };
   const add = (jid: string) => {
     if (jid && !value.includes(jid)) onChange([...value, jid]);
     setText('');
+    // A suggestion picked with the keyboard holds focus and is about to leave the list; keep focus in the field.
+    inputRef.current?.focus();
   };
   const addTyped = () => {
     const jid = normalizeToJid(text);
@@ -99,24 +127,45 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
   };
 
   return (
-    <div className="chips-input">
+    <div
+      className="chips-input"
+      // The list closes only when focus leaves the whole widget: Tab from the field lands on the first suggestion,
+      // which a close on the field's own blur would remove from under the keyboard.
+      onFocus={() => clearTimeout(blurTimer.current)}
+      onBlur={e => {
+        if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+        blurTimer.current = setTimeout(() => setOpen(false), 120);
+      }}
+    >
       <div className="chips-row">
         {value.map(jid => (
           <span key={jid} className="chip" title={jid}>
-            {labelFor(jid)}
-            <button type="button" className="chip-remove" onClick={() => onChange(value.filter(v => v !== jid))}>
+            <bdi>{labelFor(jid)}</bdi>
+            <button
+              type="button"
+              className="chip-remove"
+              onClick={e => {
+                // A focused X is about to leave the page, and focus with it, unseen by the widget's blur; keep it in
+                // the field. An X clicked without taking focus (Safari) leaves focus where it was.
+                if (document.activeElement === e.currentTarget) inputRef.current?.focus();
+                onChange(value.filter(v => v !== jid));
+              }}
+              aria-label={t('webhooks.filters.removeValue', { value: labelFor(jid) })}
+              title={t('webhooks.filters.removeValue', { value: labelFor(jid) })}
+            >
               <X size={12} />
             </button>
           </span>
         ))}
         <input
+          ref={inputRef}
           className="chips-text"
           value={text}
           placeholder={t('webhooks.filters.contactPlaceholder')}
           onChange={e => setText(e.target.value)}
           onFocus={() => setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 120)}
           onKeyDown={e => {
+            if (isComposingKey(e.nativeEvent)) return;
             if (e.key === 'Enter') {
               e.preventDefault();
               addTyped();
@@ -136,8 +185,10 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
               onMouseDown={e => e.preventDefault()}
               onClick={() => add(c.id)}
             >
-              <span className="chips-suggestion-name">{c.name || c.id}</span>
-              <span className="chips-suggestion-id">{c.id}</span>
+              <span className="chips-suggestion-name">{chatTitle(c)}</span>
+              <span className="chips-suggestion-id">
+                <bdi dir="ltr">{c.id}</bdi>
+              </span>
             </button>
           ))}
           {text.trim() && normalizeToJid(text) && (
@@ -149,6 +200,11 @@ function ContactChipsInput({ value, onChange, chats }: ContactChipsInputProps) {
             >
               {t('webhooks.filters.addValue', { value: normalizeToJid(text) })}
             </button>
+          )}
+          {isTooLong(text) && (
+            <div className="chips-suggestion-note" role="status">
+              {t('messageTester.tooLong', { max: PHONE_MAX_DIGITS })}
+            </div>
           )}
         </div>
       )}
@@ -242,6 +298,7 @@ export function FilterBuilder({ filters, onChange, chats }: FilterBuilderProps) 
                       <button
                         key={option}
                         type="button"
+                        aria-pressed={selected}
                         className={`enum-tag ${selected ? 'selected' : ''}`}
                         onClick={() => {
                           const current = Array.isArray(condition.value) ? (condition.value as string[]) : [];

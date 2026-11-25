@@ -10,10 +10,10 @@ import {
   warnUnauthenticatedIngressRoutes,
   warnUnsignedTimestampRoutes,
 } from './plugin.interfaces';
-import { validatePluginManifest } from './plugin-manifest';
+import { dropMalformedConfigFields, dropMalformedDisplayFields, validatePluginManifest } from './plugin-manifest';
 import { PluginStorageService } from './plugin-storage.service';
 import { seedConfigDefaults } from './config-defaults.util';
-import { resolvePluginMainPath, pluginUpdateStagingDirName } from './plugin-paths';
+import { resolvePluginMainPath, pluginUpdateStagingDirName, assertPathContainedNoSymlinkEscape } from './plugin-paths';
 
 // Plugin ids whose bundled-extension code was permanently removed (v0.7 — superseded by the
 // marketplace chat-flow / group-translate; also reserved in plugin-installer). A leftover
@@ -39,6 +39,25 @@ function hasPluginPackages(dir: string): boolean {
           !entry.name.startsWith('.') &&
           fs.existsSync(path.join(dir, entry.name, 'manifest.json')),
       );
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the symbolic link at `p` leads to a directory (a dangling link, or one to a file, does not). */
+function isLinkToDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `dir` holds the package of plugin `pluginId`: a manifest.json that names that id. */
+function holdsPackageOf(dir: string, pluginId: string): boolean {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf-8')) as { id?: unknown } | null;
+    return manifest?.id === pluginId;
   } catch {
     return false;
   }
@@ -76,17 +95,16 @@ export class PluginPackageScanner {
   ) {}
 
   /**
-   * The loader's onModuleInit: load built-in plugins (programmatic registration point), then every
-   * user plugin package found on disk — the configured directory first, the legacy tree in addition —
+   * The loader's onModuleInit: load every user plugin package found on disk — the configured directory first, the legacy tree in addition —
    * and report registry entries whose code the scan did not find.
    */
   scanAtBoot(): void {
-    // Load built-in plugins first (synchronous registration)
-    this.loadBuiltInPlugins();
-
-    // Then load user plugins if directory exists
+    // Packages this scan found on disk but could not load, already logged with their reason.
+    const failedLoads = new Set<string>();
+    const missingCode = new Map<string, string>();
+    // User plugins, if the directory exists. Built-in plugins register themselves programmatically.
     if (fs.existsSync(this.pluginsDir)) {
-      this.loadPluginsFromDirectory(this.pluginsDir);
+      this.loadPluginsFromDirectory(this.pluginsDir, failedLoads, missingCode);
     }
 
     // COMPATIBILITY PATH — hosts that installed plugins before the package dir moved under <dataDir>.
@@ -106,7 +124,18 @@ export class PluginPackageScanner {
           `volume is destroyed on the next container recreate.`,
         { action: 'plugins_legacy_dir', legacyDir: this.legacyPluginsDir, pluginsDir: this.pluginsDir },
       );
-      this.loadPluginsFromDirectory(this.legacyPluginsDir);
+      this.loadPluginsFromDirectory(this.legacyPluginsDir, failedLoads, missingCode);
+    }
+
+    for (const [pluginId, pluginPath] of missingCode) {
+      if (this.plugins.has(pluginId) || failedLoads.has(pluginId)) continue;
+      this.logger.warn(
+        `Plugin ${pluginId} is installed but its code is missing from ${pluginPath} (no manifest.json) ` +
+          `while its stored data is still there. Reinstall it: its config and stored data are kept, unless ` +
+          `an uninstall stopped part-way and left the entry with no config, in which case repeat that uninstall. ` +
+          `Plugin code kept outside the data volume does not survive a container recreate.`,
+        { pluginPath, pluginId, action: 'plugin_code_missing' },
+      );
     }
 
     this.logger.log(`Loaded ${this.plugins.size} plugins`, {
@@ -114,7 +143,7 @@ export class PluginPackageScanner {
       count: this.plugins.size,
     });
 
-    this.warnOnRegistryEntriesWithoutCode();
+    this.warnOnRegistryEntriesWithoutCode(failedLoads);
   }
 
   /**
@@ -125,30 +154,26 @@ export class PluginPackageScanner {
    * makes the divergence self-diagnosing.
    *
    * Built-ins are excluded: they are registered programmatically at bootstrap (after this runs) and
-   * never have a package directory at all.
+   * never have a package directory at all. So is a package that is there but failed to load: its code
+   * is not missing, and a reinstall is refused for the reason already logged.
    */
-  private warnOnRegistryEntriesWithoutCode(): void {
-    const orphaned = this.pluginStorage.getAllEntries().filter(e => !e.builtIn && !this.plugins.has(e.id));
+  private warnOnRegistryEntriesWithoutCode(failedLoads: ReadonlySet<string>): void {
+    const orphaned = this.pluginStorage
+      .getAllEntries()
+      .filter(e => !e.builtIn && !this.plugins.has(e.id) && !failedLoads.has(e.id));
     if (orphaned.length === 0) return;
 
     const missingDir = fs.existsSync(this.pluginsDir) ? '' : ' (that directory does not exist)';
     this.logger.warn(
       `The plugin registry lists ${orphaned.length} installed plugin(s) with no loaded code in ` +
-        `${this.pluginsDir}${missingDir}: ${orphaned.map(e => e.id).join(', ')}. Their config and stored ` +
-        `data are intact — reinstall them, or set PLUGINS_DIR to the directory that holds their code.`,
+        `${this.pluginsDir}${missingDir}: ${orphaned.map(e => e.id).join(', ')}. Reinstall them, or set ` +
+        `PLUGINS_DIR to the directory that holds their code. Their config and stored data are kept, except ` +
+        `for an entry an unfinished uninstall left behind, which holds no config; repeat that uninstall.`,
       { action: 'plugin_registry_without_code', count: orphaned.length, pluginsDir: this.pluginsDir },
     );
   }
 
-  private loadBuiltInPlugins(): void {
-    // Built-in plugins are registered programmatically
-    // This will be used by Phase 4 to register engine plugins
-    this.logger.debug('Built-in plugins loading point (Phase 4)', {
-      action: 'builtin_plugins_init',
-    });
-  }
-
-  private loadPluginsFromDirectory(dir: string): void {
+  private loadPluginsFromDirectory(dir: string, failedLoads: Set<string>, missingCode: Map<string, string>): void {
     // Reconcile any interrupted-update leftovers BEFORE scanning, so a crash mid-swap can't make a
     // plugin silently vanish while its registry entry still claims it is installed.
     this.recoverInterruptedUpdates(dir);
@@ -159,6 +184,16 @@ export class PluginPackageScanner {
       // Skip non-directories and dot-prefixed dirs (e.g. a crash-leftover `.<id>.bak` update backup or
       // `.<id>.new` staging tree), so a half-finished update can't be re-loaded as a duplicate-id
       // plugin on the next boot. recoverInterruptedUpdates has already reconciled them by this point.
+      // A symbolic link is not a directory to Dirent, so a plugin directory that is a link lands here too: it is
+      // not followed, and without a line in the log the plugin would just not appear.
+      if (entry.isSymbolicLink() && !entry.name.startsWith('.') && isLinkToDirectory(path.join(dir, entry.name))) {
+        this.logger.warn(
+          `Skipped ${entry.name}: it is a symbolic link, and a plugin directory is not followed through one. ` +
+            `Put the package itself in ${path.join(dir, entry.name)} (a copy or a bind mount).`,
+          { pluginPath: path.join(dir, entry.name), action: 'plugin_symlink_skipped' },
+        );
+        continue;
+      }
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
 
       // Already loaded by an earlier scan. Only reachable through the legacy-directory compatibility
@@ -183,10 +218,14 @@ export class PluginPackageScanner {
               `or add a manifest.json if it is meant to load.`,
             { pluginPath, action: 'manifest_missing' },
           );
-          this.pluginStorage.deletePluginEntry(entry.name);
-          this.logger.log(`Pruned stale registry entry for removed built-in plugin: ${entry.name}`, {
-            action: 'registry_ghost_pruned',
-          });
+          try {
+            this.pluginStorage.deletePluginEntry(entry.name);
+            this.logger.log(`Pruned stale registry entry for removed built-in plugin: ${entry.name}`, {
+              action: 'registry_ghost_pruned',
+            });
+          } catch {
+            // Logged by the storage service; the entry is pruned on a later boot. A disk fault must not stop the scan.
+          }
           continue;
         }
 
@@ -205,12 +244,7 @@ export class PluginPackageScanner {
             action: 'builtin_storage_dir_skipped',
           });
         } else if (registryEntry) {
-          this.logger.warn(
-            `Plugin ${entry.name} is installed but its code is missing from ${pluginPath} (no manifest.json) ` +
-              `while its stored data is still there. Reinstall it — its config and stored data are kept. ` +
-              `Plugin code kept outside the data volume does not survive a container recreate.`,
-            { pluginPath, pluginId: entry.name, action: 'plugin_code_missing' },
-          );
+          missingCode.set(entry.name, pluginPath);
         } else {
           // Operators do drop unrelated directories in here, and this fires on every boot for each one.
           // The old bare "missing manifest.json" wording read like an internal fault — #981's reporter
@@ -239,6 +273,14 @@ export class PluginPackageScanner {
         // re-enables it (ensureRegistryEntry resets the status on a successful load). No-op when
         // no entry exists (a hand-placed dir that never loaded).
         this.pluginStorage.setPluginStatus(entry.name, PluginStatus.ERROR);
+        // Keyed by folder and by manifest id, which differ for a hand-placed folder.
+        failedLoads.add(entry.name);
+        try {
+          const { id } = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { id?: unknown };
+          if (typeof id === 'string') failedLoads.add(id);
+        } catch {
+          // A manifest that does not parse names no id; the folder name stands for it.
+        }
       }
     }
   }
@@ -266,9 +308,15 @@ export class PluginPackageScanner {
       if (!match) continue;
       const pluginId = match[1];
       const leftover = path.join(dir, entry.name);
+      const isStaging = entry.name === pluginUpdateStagingDirName(pluginId);
+      // The dot-name proves nothing: an operator's own `.cache.bak` fits it, and would be renamed or deleted below.
+      // Only a tree that holds the package of that plugin is an update leftover; any other is left as it is. A
+      // staging tree a crash cut short may not hold its manifest yet, so the registry entry of an installed plugin
+      // vouches for that one.
+      if (!holdsPackageOf(leftover, pluginId) && !(isStaging && this.pluginStorage.getPluginEntry(pluginId))) continue;
       const liveDir = path.join(dir, pluginId);
       try {
-        if (entry.name === pluginUpdateStagingDirName(pluginId)) {
+        if (isStaging) {
           fs.rmSync(leftover, { recursive: true, force: true });
           this.logger.warn(`Dropped stale update staging for plugin ${pluginId}`, {
             pluginId,
@@ -299,6 +347,7 @@ export class PluginPackageScanner {
 
   loadPlugin(pluginPath: string): PluginInstance {
     const manifestPath = path.join(pluginPath, 'manifest.json');
+    assertPathContainedNoSymlinkEscape(pluginPath, manifestPath, detail => new Error(`Plugin manifest path ${detail}`));
     const manifestContent = fs.readFileSync(manifestPath, 'utf-8');
     const manifest = JSON.parse(manifestContent) as unknown;
 
@@ -309,6 +358,8 @@ export class PluginPackageScanner {
     // manifest the installer would have rejected loads anyway and only fails (or worse, runs
     // unexpected code) at enable time.
     validatePluginManifest(manifest);
+    dropMalformedConfigFields(manifest.configSchema);
+    dropMalformedDisplayFields(manifest);
 
     // Anchor `main` inside THIS on-disk directory: the lexical check above is forward-slash only,
     // so a platform-separator escape (e.g. Windows-style `..\x`) would slip past it — resolve and

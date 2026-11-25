@@ -3,14 +3,20 @@ import { AsyncLocalStorage } from 'async_hooks';
 import type { HookManager, HookEvent } from '../hooks';
 import type { LidMappingStore } from '../../engine/identity/lid-mapping-store.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
-import { toNeutralJid } from '../../engine/identity/wa-id';
+import { parseWaId, toNeutralJid } from '../../engine/identity/wa-id';
 import { ConversationMappingConflict } from '../../modules/integration/conversation-mapping.service';
-import { createLogger } from '../../common/services/logger.service';
-import { isPluginActiveForSession, resolvePluginConfig } from './plugin-activation';
+import { createLogger, UNPRINTABLE } from '../../common/services/logger.service';
+import {
+  isAllSessionsScope,
+  isPluginActiveForSession,
+  resolveInstanceConfig,
+  resolvePluginConfig,
+  sessionScopeKey,
+} from './plugin-activation';
 import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
 import { buildConversationSendFacade, type ConversationMediaType } from './conversation-send-facade';
 import { PluginHostServices } from './plugin-host-services';
-import type { PluginMessagePort } from './plugin-host-ports';
+import type { PluginInstanceRecord, PluginMessagePort } from './plugin-host-ports';
 import { PluginStorageService } from './plugin-storage.service';
 import {
   PluginCapabilityError,
@@ -56,6 +62,46 @@ export function dispatchConversationMedia(
   }
 }
 
+// Plugin code can pass anything to its logger, and reading a value can throw (a Proxy trap, a getter, a toString): what
+// cannot be read is written as a marker, never thrown into the plugin.
+
+/** The text of a plugin's log message: what String gives for it (a Symbol included), or the marker. */
+const messageText = (message: unknown): string => {
+  try {
+    return String(message);
+  } catch {
+    return UNPRINTABLE;
+  }
+};
+
+/** The trace for a plugin's ctx.logger.error: an Error's message, or the text of whatever else was passed. */
+const errorText = (error: unknown): string => {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return UNPRINTABLE;
+  }
+};
+
+/** A prototype that is the root of a chain (Object.prototype of any realm, or none): what a plain record has. */
+const isRootPrototype = (prototype: object | null): boolean =>
+  prototype === null || Object.getPrototypeOf(prototype) === null;
+
+/**
+ * A plugin's log meta as the fields of the line: a plain record as it is, nothing as no fields, else as one field. An
+ * object whose prototype cannot be read (a Proxy whose getPrototypeOf trap throws, or a revoked one) is taken as a
+ * record, as spreading it took it: the logger copies it by its own properties or writes it as [Unreadable].
+ */
+const metaFields = (meta: unknown): Record<string, unknown> => {
+  if (meta === undefined || meta === null) return {};
+  if (typeof meta !== 'object') return { meta };
+  try {
+    return isRootPrototype(Object.getPrototypeOf(meta) as object | null) ? (meta as Record<string, unknown>) : { meta };
+  } catch {
+    return meta as Record<string, unknown>;
+  }
+};
+
 /**
  * The capability surface a plugin actually touches: ctx.messages, ctx.engine, ctx.net, ctx.storage,
  * ctx.conversations, ctx.handover, ctx.mappings — and the gates in front of every one of them.
@@ -68,10 +114,17 @@ export function dispatchConversationMedia(
  * It holds no plugin registry and no worker hosts: the loader owns those. Everything here is derived
  * from the PluginInstance passed in.
  */
+/** Host-authoritative dispatch context active on an async call tree (hook session or ingress instance). */
+export interface PluginDispatchContext {
+  sessionId?: string;
+  instanceId?: string;
+}
+
 export class PluginCapabilityContext {
-  // Carries the firing event's sessionId across an in-process hook handler so ctx.config (a getter)
-  // resolves the per-session slice. Per async call tree, so concurrent sessions don't cross over.
-  private readonly hookSession = new AsyncLocalStorage<{ sessionId?: string }>();
+  // Carries the firing dispatch's sessionId (and ingress instanceId, when applicable) across hook and
+  // sandboxed capability handlers so ctx.config and ctx.net.fetch resolve strictly for that dispatch.
+  // Per async call tree, so concurrent dispatches never cross over.
+  private readonly hookSession = new AsyncLocalStorage<PluginDispatchContext>();
 
   constructor(
     // The LOADER's logger, deliberately — a plugin's ctx.logger lines are prefixed with it, and that
@@ -83,6 +136,14 @@ export class PluginCapabilityContext {
     private readonly pluginStorage: PluginStorageService,
     private readonly lidMappingStore?: LidMappingStore,
   ) {}
+
+  /**
+   * Run `fn` inside a host-authoritative dispatch context so capabilities (such as `ctx.net.fetch`)
+   * scope their checks to the active hook session or ingress instance.
+   */
+  runWithDispatchContext<T>(ctx: PluginDispatchContext, fn: () => T): T {
+    return this.hookSession.run(ctx, fn);
+  }
 
   /**
    * Enforce a plugin's declared manifest permissions at the capability boundary. A plugin may only
@@ -105,13 +166,18 @@ export class PluginCapabilityContext {
     }
   }
 
+  /** Whether `manifest.sessions` permits `sessionId` (absent = ['*']). */
+  private isSessionAllowed(manifest: PluginManifest, sessionId: string): boolean {
+    const allowed = manifest.sessions ?? ['*'];
+    return allowed.includes('*') || allowed.includes(sessionId);
+  }
+
   /**
-   * Enforce a plugin's manifest session scope. Runs BEFORE any engine/message resolution —
+   * Enforce a plugin's manifest session scope. Runs BEFORE any engine/message resolution -
    * sessionId is supplied by the plugin, so this is the security boundary. Absent = ['*'].
    */
   private assertSessionAllowed(manifest: PluginManifest, sessionId: string): void {
-    const allowed = manifest.sessions ?? ['*'];
-    if (!allowed.includes('*') && !allowed.includes(sessionId)) {
+    if (!this.isSessionAllowed(manifest, sessionId)) {
       throw new PluginCapabilityError(`Plugin ${manifest.id} is not permitted to act on session ${sessionId}`);
     }
   }
@@ -184,6 +250,7 @@ export class PluginCapabilityContext {
           plugin.sessionConfig,
           hookSession.getStore()?.sessionId,
           plugin.manifest.sessionScoped !== false,
+          plugin.manifest,
         );
       },
       hookManager: this.hookManager,
@@ -220,19 +287,27 @@ export class PluginCapabilityContext {
     };
   }
 
+  // The plugin id is the host's field, passed apart from the plugin's meta so that a meta the logger cuts keeps it.
   private buildPluginLogger(plugin: PluginInstance): PluginLogger {
     return {
       log: (message, meta) =>
-        this.logger.log(`[${plugin.manifest.id}] ${message}`, { ...meta, pluginId: plugin.manifest.id }),
+        this.logger.log(`[${plugin.manifest.id}] ${messageText(message)}`, metaFields(meta), {
+          pluginId: plugin.manifest.id,
+        }),
       debug: (message, meta) =>
-        this.logger.debug(`[${plugin.manifest.id}] ${message}`, { ...meta, pluginId: plugin.manifest.id }),
+        this.logger.debug(`[${plugin.manifest.id}] ${messageText(message)}`, metaFields(meta), {
+          pluginId: plugin.manifest.id,
+        }),
       warn: (message, meta) =>
-        this.logger.warn(`[${plugin.manifest.id}] ${message}`, { ...meta, pluginId: plugin.manifest.id }),
+        this.logger.warn(`[${plugin.manifest.id}] ${messageText(message)}`, metaFields(meta), {
+          pluginId: plugin.manifest.id,
+        }),
       error: (message, error, meta) =>
         this.logger.error(
-          `[${plugin.manifest.id}] ${message}`,
-          error instanceof Error ? error.message : String(error),
-          { ...meta, pluginId: plugin.manifest.id },
+          `[${plugin.manifest.id}] ${messageText(message)}`,
+          error === undefined ? undefined : errorText(error),
+          metaFields(meta),
+          { pluginId: plugin.manifest.id },
         ),
     };
   }
@@ -264,21 +339,37 @@ export class PluginCapabilityContext {
         this.resolveEngineRead(plugin, sessionId).getContactById(contactId),
       checkNumberExists: async (sessionId, phone) => this.resolveEngineRead(plugin, sessionId).checkNumberExists(phone),
       getChats: async sessionId => this.resolveEngineRead(plugin, sessionId).getChats(),
-      getChatHistory: async (sessionId, chatId, limit, includeMedia) =>
-        this.resolveEngineRead(plugin, sessionId).getChatHistory(
+      getChatHistory: async (sessionId, chatId, limit, includeMedia) => {
+        const page = await this.resolveEngineRead(plugin, sessionId).getChatHistory(
           chatId,
           // Clamp to the REST non-deep ceiling (MessageService.MAX_CHAT_HISTORY_LIMIT = 100) so an
           // untrusted plugin can't request an unbounded history fetch. A non-finite limit (a sandboxed
           // caller's arg is unvalidated) takes the default: NaN would reach the engine as "no limit".
           Math.min(Math.max(typeof limit === 'number' && Number.isFinite(limit) ? Math.trunc(limit) : 50, 1), 100),
           includeMedia ?? false,
-        ),
-      canonicalChatId: (sessionId, chatId) => {
-        // resolveEngineRead is the gate only (engine:read permission + live session); the resolution
-        // itself is a synchronous host lid->phone lookup, not an engine call, mirroring the webhook
-        // from-filter. Not `async` (nothing to await) — a resolved promise satisfies the signature.
+        );
+        // As the REST history does: a deleted message goes by the id of its stored row, the id the plugin
+        // was handed when the message arrived. Best effort, and asked only for a page that holds one: a
+        // host without the message module still reads history.
+        if (page.some(message => message.type === 'revoked')) {
+          try {
+            await this.hostServices.getMessagePort().nameDeletedByStoredId(sessionId, chatId, page);
+          } catch (error) {
+            this.logger.warn(
+              `[${plugin.manifest.id}] Could not match the deleted messages of a chat history to their stored rows`,
+              { sessionId, error: String(error) },
+              { pluginId: plugin.manifest.id },
+            );
+          }
+        }
+        return page;
+      },
+      canonicalChatId: async (sessionId, chatId) => {
         this.resolveEngineRead(plugin, sessionId);
-        return Promise.resolve(toNeutralJid(chatId, jid => this.lidMappingStore?.resolveLid(jid) ?? null));
+        const parsed = parseWaId(chatId);
+        const phone =
+          parsed.kind === 'lid' ? await this.lidMappingStore?.findPhoneForLid?.(chatId).catch(() => null) : null;
+        return toNeutralJid(chatId, () => phone ?? null);
       },
     } satisfies PluginEngineReadCapability;
   }
@@ -320,55 +411,129 @@ export class PluginCapabilityContext {
     } satisfies PluginStorage;
   }
 
+  /** Whether `sessionId` is both manifest-permitted and operator-activated for net host admission. */
+  private isSessionActiveForNet(plugin: PluginInstance, sessionId: string): boolean {
+    return this.isSessionAllowed(plugin.manifest, sessionId) && this.isHookActive(plugin, sessionId);
+  }
+
+  /** Whether an enabled PluginInstance row's scope is currently admissible for `plugin`. */
+  private isInstanceRowScopeActive(plugin: PluginInstance, row: Pick<PluginInstanceRecord, 'sessionScope'>): boolean {
+    if (isAllSessionsScope(row.sessionScope)) return true;
+    if (plugin.manifest.sessionScoped === false) return false;
+    return this.isSessionActiveForNet(plugin, row.sessionScope as string);
+  }
+
   /**
-   * Config of every ENABLED instance of a plugin, for the outbound-host allowlist. A disabled
-   * instance is not a tenant the operator is running, so its host is not admitted.
+   * Enabled instances of a plugin, for the outbound-host allowlist. A disabled instance is not a
+   * tenant the operator is running, so its host is never admitted.
    *
    * Best-effort: a plugin may be loaded in a host that exposes no instance service (and the store
    * can fail), and neither is a reason to refuse a fetch the base config already allows.
    */
-  private async enabledInstanceConfigs(pluginId: string): Promise<Record<string, unknown>[]> {
+  private async enabledInstanceRows(pluginId: string): Promise<{ rows: PluginInstanceRecord[]; listed: boolean }> {
     try {
       const rows = await this.hostServices.getPluginInstancePort().list(pluginId);
-      return rows.filter(row => row.enabled).map(row => row.config ?? {});
+      return { rows: rows.filter(row => row.enabled), listed: true };
     } catch {
-      return [];
+      return { rows: [], listed: false };
     }
+  }
+
+  /** Look up one specific enabled instance for an ingress dispatch. */
+  private async resolveEnabledInstance(
+    pluginId: string,
+    instanceId: string,
+    listedRows: PluginInstanceRecord[],
+  ): Promise<PluginInstanceRecord | null> {
+    try {
+      const port = this.hostServices.getPluginInstancePort();
+      if (typeof port.resolve === 'function') {
+        const row = await port.resolve(pluginId, instanceId);
+        return row?.enabled ? row : null;
+      }
+      const found = listedRows.find(
+        row => (row as PluginInstanceRecord & { instanceId?: string }).instanceId === instanceId,
+      );
+      return found ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async collectConcreteSessionNetConfigs(
+    plugin: PluginInstance,
+    sessionId: string,
+    scoped: boolean,
+  ): Promise<Record<string, unknown>[]> {
+    if (!this.isSessionActiveForNet(plugin, sessionId)) return [];
+    const { rows } = await this.enabledInstanceRows(plugin.manifest.id);
+    const configs: Record<string, unknown>[] = [
+      resolvePluginConfig(plugin.config ?? {}, plugin.sessionConfig, sessionId, scoped, plugin.manifest),
+    ];
+    for (const row of rows) {
+      if (isAllSessionsScope(row.sessionScope) || (scoped && row.sessionScope === sessionId)) {
+        configs.push(row.config ?? {});
+      }
+    }
+    return configs;
   }
 
   private buildNetCapability(plugin: PluginInstance): PluginNetCapability {
     return {
-      fetch: async (url, init) => {
-        // Two gates: the declared permission, then the effective host allowlist = manifest net.allow
-        // UNION the https origins of net.allowConfigHosts keys across the base config AND every per-session
-        // override. The host gate has no firing-session context for a sandboxed plugin's cap round-trip,
-        // so admit every operator-configured tenant host (all public + still SSRF-guarded at connect)
-        // rather than resolving a single, possibly wrong (base-only), one. The SSRF guard inside
-        // performPluginFetch still blocks internal IPs even when the host is allowlisted.
+      fetch: async (url, init, signal) => {
+        // Two gates: the declared permission, then strict Layer 2 per-dispatch host allowlisting.
+        // Inside an active hook or ingress dispatch, scope config-derived hosts strictly to the firing
+        // concrete session or ingress instance. Outside dispatch (e.g. background timers), allow an
+        // explicit concrete init.sessionId only after verifying manifest scope and operator activation;
+        // otherwise restrict strictly to static manifest net.allow so tenants never leak across sessions.
         this.assertPermission(plugin.manifest, PluginCapabilityPermission.NET_FETCH);
-        const netConfigs = [
-          plugin.config ?? {},
-          ...Object.values(plugin.sessionConfig ?? {}),
-          // The instance rows, because the scope-keyed store above holds only the LAST instance
-          // projected onto a scope. Dispatch hands each instance its own config, so without this a
-          // second instance sharing that scope is told to call a host the allowlist never saw and
-          // its fetch is refused — a config that is correct and unusable. Same policy as the slice:
-          // an operator-provisioned tenant host, still gated by allowConfigHosts and the SSRF guard.
-          ...(await this.enabledInstanceConfigs(plugin.manifest.id)),
-        ];
+        const scoped = plugin.manifest.sessionScoped !== false;
+        const store = this.hookSession.getStore();
+        const netConfigs: Record<string, unknown>[] = [];
+
+        if (store?.instanceId) {
+          const { rows, listed } = await this.enabledInstanceRows(plugin.manifest.id);
+          const sid = store.sessionId;
+          const hasConcreteSession = sid !== undefined && !isAllSessionsScope(sid);
+          const sessionActive = hasConcreteSession ? this.isSessionActiveForNet(plugin, sid) : true;
+          const match = await this.resolveEnabledInstance(plugin.manifest.id, store.instanceId, rows);
+          const matchValid =
+            match !== null &&
+            this.isInstanceRowScopeActive(plugin, match) &&
+            sessionScopeKey(match.sessionScope) === sessionScopeKey(sid);
+          if (sessionActive && matchValid) {
+            const scopeIsAttributable =
+              !hasConcreteSession || (listed && rows.filter(row => row.sessionScope === sid).length <= 1);
+            const resolvedBase =
+              hasConcreteSession && scopeIsAttributable
+                ? resolvePluginConfig(plugin.config ?? {}, plugin.sessionConfig, sid, scoped, plugin.manifest)
+                : (plugin.config ?? {});
+            netConfigs.push(resolveInstanceConfig(resolvedBase, match.config, plugin.manifest, plugin.config));
+          }
+        } else if (store?.sessionId && !isAllSessionsScope(store.sessionId)) {
+          netConfigs.push(...(await this.collectConcreteSessionNetConfigs(plugin, store.sessionId, scoped)));
+        } else if (
+          !store &&
+          typeof init?.sessionId === 'string' &&
+          init.sessionId.trim().length > 0 &&
+          init.sessionId === init.sessionId.trim() &&
+          !isAllSessionsScope(init.sessionId)
+        ) {
+          netConfigs.push(...(await this.collectConcreteSessionNetConfigs(plugin, init.sessionId, scoped)));
+        }
+
         const allow = [
-          ...new Set(
-            netConfigs.flatMap(cfg =>
-              effectiveNetAllow(plugin.manifest.net?.allow, plugin.manifest.net?.allowConfigHosts, cfg),
-            ),
-          ),
+          ...new Set([
+            ...(plugin.manifest.net?.allow ?? []),
+            ...netConfigs.flatMap(cfg => effectiveNetAllow(undefined, plugin.manifest.net?.allowConfigHosts, cfg)),
+          ]),
         ];
         if (!isNetHostAllowed(allow, url)) {
           throw new PluginCapabilityError(
-            `Plugin ${plugin.manifest.id} may not fetch ${url} — add its host to net.allow or net.allowConfigHosts`,
+            `Plugin ${plugin.manifest.id} may not fetch ${url} - add its host to net.allow or net.allowConfigHosts`,
           );
         }
-        return performPluginFetch(url, init);
+        return signal ? performPluginFetch(url, init, { signal }) : performPluginFetch(url, init);
       },
     } satisfies PluginNetCapability;
   }
@@ -425,10 +590,10 @@ export class PluginCapabilityContext {
       // `inFlight.length > 0` check): a send from an ingress handler or any other top-level context
       // carries none, and must NOT suppress message:sending for observers (audit/moderation, or the
       // adapter's own mirror hook), which then see the reply.
-      runGuarded: (events, run) =>
-        (events as HookEvent[]).some(e => this.hookManager.isInFlight(e))
-          ? this.hookManager.runInFlight(events as HookEvent[], run)
-          : run(),
+      runGuarded: (events, run) => {
+        const active = (events as HookEvent[]).filter(e => this.hookManager.isInFlight(e));
+        return active.length > 0 ? this.hookManager.runInFlight(active, run) : run();
+      },
       sendText: (sessionId, opts) => this.hostServices.getMessagePort().sendText(sessionId, opts),
       reply: (sessionId, opts) => this.hostServices.getMessagePort().reply(sessionId, opts),
       sendMedia: (sessionId, opts) => dispatchConversationMedia(this.hostServices.getMessagePort(), sessionId, opts),
@@ -503,7 +668,10 @@ export class PluginCapabilityContext {
           pluginId: plugin.manifest.id,
           instanceId: key.instanceId,
         });
-        return m ? { providerConversationId: m.providerConversationId, handoverState: m.handoverState } : null;
+        if (!m) return null;
+        // The handover the instance holds for the chat, not this row's alone: see effectiveHandover.
+        const handoverState = await this.hostServices.getConversationMappingPort().effectiveHandover(m);
+        return { providerConversationId: m.providerConversationId, handoverState };
       },
       getByProvider: async (instanceId, providerConversationId) => {
         this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
@@ -511,8 +679,10 @@ export class PluginCapabilityContext {
           .getConversationMappingPort()
           .getByProvider(plugin.manifest.id, instanceId, providerConversationId);
         // Parity with get/upsert: a plugin may only read a mapping for a session it is activated for.
-        if (m) this.assertSessionActive(plugin, m.sessionId);
-        return m ? { sessionId: m.sessionId, chatId: m.chatId, handoverState: m.handoverState } : null;
+        if (!m) return null;
+        this.assertSessionActive(plugin, m.sessionId);
+        const handoverState = await this.hostServices.getConversationMappingPort().effectiveHandover(m);
+        return { sessionId: m.sessionId, chatId: m.chatId, handoverState };
       },
     } satisfies PluginMappingsCapability;
   }
