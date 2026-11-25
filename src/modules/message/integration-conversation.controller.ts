@@ -141,10 +141,24 @@ export class IntegrationConversationController {
   async media(@Param('sessionId') id: string, @Query() query: ChatRequest) {
     if (!query.messageId) throw new BadRequestException('Missing message id');
     const media = await this.messages.getChatMedia(id, query.chatId, query.messageId);
-    if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(media.mimetype))
+    if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(media.mimetype)) {
+      media.stream.destroy();
       throw new BadRequestException('Not a supported image');
-    if (media.buffer.length > 15 * 1024 * 1024) throw new PayloadTooLargeException();
-    return { data: media.buffer.toString('base64'), mimetype: media.mimetype };
+    }
+    const limit = 15 * 1024 * 1024;
+    if (media.size !== undefined && media.size > limit) {
+      media.stream.destroy();
+      throw new PayloadTooLargeException();
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of media.stream) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += bytes.length;
+      if (size > limit) throw new PayloadTooLargeException();
+      chunks.push(bytes);
+    }
+    return { data: Buffer.concat(chunks, size).toString('base64'), mimetype: media.mimetype };
   }
   @Post('read')
   async read(@Param('sessionId') id: string, @Body() dto: ChatRequest) {

@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -79,7 +80,8 @@ describe('Isolated PDF document sends', () => {
         {
           provide: MessageService,
           useValue: {
-            getChatMedia: () => Promise.resolve({buffer:Buffer.from('image bytes'),mimetype:'image/png'}),
+            getChatMedia: () =>
+              Promise.resolve({ stream: Readable.from([Buffer.from('image bytes')]), mimetype: 'image/png' }),
             sendText: send,
             sendImage: send,
             sendDocument: send,
@@ -166,13 +168,67 @@ describe('Isolated PDF document sends', () => {
       .expect(400);
   });
   it('accepts images and other files through the isolated attachment endpoint', async () => {
-    for (const [filename,mimetype] of [['foto.png','image/png'],['lista.txt','text/plain']]) {
-      await request(app.getHttpServer()).post(endpoint(own)+'/files').auth(key,{type:'bearer'}).send({chatId:payload.chatId,filename,mimetype,base64:Buffer.from('test bytes').toString('base64')}).expect(201);
+    for (const [filename, mimetype] of [
+      ['foto.png', 'image/png'],
+      ['lista.txt', 'text/plain'],
+    ]) {
+      await request(app.getHttpServer())
+        .post(endpoint(own) + '/files')
+        .auth(key, { type: 'bearer' })
+        .send({ chatId: payload.chatId, filename, mimetype, base64: Buffer.from('test bytes').toString('base64') })
+        .expect(201);
     }
     expect(send).toHaveBeenCalledTimes(2);
-    await request(app.getHttpServer()).post(endpoint(foreign)+'/files').auth(key,{type:'bearer'}).send({chatId:payload.chatId,filename:'x.txt',mimetype:'text/plain',base64:'YQ=='}).expect(404);
-  });  it('fences image reads and read receipts to the integration session', async () => {
-    await request(app.getHttpServer()).get(endpoint(own)+'/media').query({chatId:payload.chatId,messageId:'wa-image'}).auth(key,{type:'bearer'}).expect(200);
-    await request(app.getHttpServer()).get(endpoint(foreign)+'/media').query({chatId:payload.chatId,messageId:'wa-image'}).auth(key,{type:'bearer'}).expect(404);
-    await request(app.getHttpServer()).post(endpoint(own)+'/read').auth(key,{type:'bearer'}).send({chatId:payload.chatId}).expect(201);
-  });});
+    await request(app.getHttpServer())
+      .post(endpoint(foreign) + '/files')
+      .auth(key, { type: 'bearer' })
+      .send({ chatId: payload.chatId, filename: 'x.txt', mimetype: 'text/plain', base64: 'YQ==' })
+      .expect(404);
+  });
+  it('fences image reads and read receipts to the integration session', async () => {
+    await request(app.getHttpServer())
+      .get(endpoint(own) + '/media')
+      .query({ chatId: payload.chatId, messageId: 'wa-image' })
+      .auth(key, { type: 'bearer' })
+      .expect(200);
+    await request(app.getHttpServer())
+      .get(endpoint(foreign) + '/media')
+      .query({ chatId: payload.chatId, messageId: 'wa-image' })
+      .auth(key, { type: 'bearer' })
+      .expect(404);
+    await request(app.getHttpServer())
+      .post(endpoint(own) + '/read')
+      .auth(key, { type: 'bearer' })
+      .send({ chatId: payload.chatId })
+      .expect(201);
+  });
+});
+
+describe('Integration image stream limits', () => {
+  it('rejects an oversized stream without a declared length and closes it', async () => {
+    const stream = Readable.from([Buffer.alloc(15 * 1024 * 1024), Buffer.from('x')]);
+    const controller = new IntegrationConversationController(
+      {} as SessionService,
+      {
+        getChatMedia: async () => ({ stream, mimetype: 'image/png' }),
+      } as unknown as MessageService,
+    );
+    await expect(
+      controller.media('session', { chatId: '529991234567@c.us', messageId: 'image' }),
+    ).rejects.toMatchObject({ status: 413 });
+    expect(stream.destroyed).toBe(true);
+  });
+  it('rejects a declared oversized image before reading it', async () => {
+    const stream = Readable.from([Buffer.from('small')]);
+    const controller = new IntegrationConversationController(
+      {} as SessionService,
+      {
+        getChatMedia: async () => ({ stream, size: 16 * 1024 * 1024, mimetype: 'image/png' }),
+      } as unknown as MessageService,
+    );
+    await expect(
+      controller.media('session', { chatId: '529991234567@c.us', messageId: 'image' }),
+    ).rejects.toMatchObject({ status: 413 });
+    expect(stream.destroyed).toBe(true);
+  });
+});

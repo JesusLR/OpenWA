@@ -25,7 +25,9 @@ export function Login({ onLogin }: LoginProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const currentLang = resolveSupportedLanguage(i18n.resolvedLanguage || i18n.language);
-  const changeLanguage = (language: SupportedLanguage) => { void i18n.changeLanguage(language); };
+  const changeLanguage = (language: SupportedLanguage) => {
+    void i18n.changeLanguage(language);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

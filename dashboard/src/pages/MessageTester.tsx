@@ -672,10 +672,10 @@ export function MessageTester() {
   const batchPercent =
     batchStatus && batchStatus.progress.total > 0
       ? Math.round(
-        ((batchStatus.progress.sent + batchStatus.progress.failed + batchStatus.progress.cancelled) /
-          batchStatus.progress.total) *
-        100,
-      )
+          ((batchStatus.progress.sent + batchStatus.progress.failed + batchStatus.progress.cancelled) /
+            batchStatus.progress.total) *
+            100,
+        )
       : 0;
 
   const optionalInBulk = messageType === 'bulk' ? ` (${t('common.optional')})` : '';
@@ -738,9 +738,9 @@ export function MessageTester() {
           <span className={bulkMediaTooLarge ? 'hint error' : 'hint'} role="status">
             {bulkMediaTooLarge
               ? t('messageTester.bulkMediaTooLarge', {
-                count: bulkRecipientList.length,
-                size: formatFileSize(inlineMediaBudgetBytes(bulkRecipientList.length)),
-              })
+                  count: bulkRecipientList.length,
+                  size: formatFileSize(inlineMediaBudgetBytes(bulkRecipientList.length)),
+                })
               : t('messageTester.bulkMediaHint')}
           </span>
         )}

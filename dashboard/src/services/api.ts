@@ -62,14 +62,14 @@ export interface Session {
   id: string;
   name: string;
   status:
-  | 'created'
-  | 'initializing'
-  | 'authenticating'
-  | 'qr_ready'
-  | 'ready'
-  | 'disconnected'
-  | 'action_required'
-  | 'failed';
+    | 'created'
+    | 'initializing'
+    | 'authenticating'
+    | 'qr_ready'
+    | 'ready'
+    | 'disconnected'
+    | 'action_required'
+    | 'failed';
   /**
    * Whether the gateway holds a live engine for this session right now. The precondition the
    * lifecycle routes enforce, and not derivable from `status`: `disconnected` covers both a session

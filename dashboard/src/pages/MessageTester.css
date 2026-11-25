@@ -44,7 +44,7 @@
 }
 
 .message-tester .form-group label,
-.message-tester .form-group>.group-label {
+.message-tester .form-group > .group-label {
   display: block;
   font-size: 0.7rem;
   font-weight: 700;
