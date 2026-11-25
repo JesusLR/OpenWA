@@ -59,7 +59,12 @@ COPY . .
 # Drop the incremental-build cache afterwards: it is pinned inside dist/ (so nest's deleteOutDir
 # wipes it with the output), and the production stage copies dist/ wholesale — it would otherwise
 # ship dead compiler metadata in every image.
-RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:build && rm -f dist/*.tsbuildinfo
+# Node's automatic heap budget on a 2 GB VPS can be below what TypeScript needs.
+# This ceiling applies only to compilation; the production stage keeps its own defaults.
+# Override with --build-arg NODE_BUILD_MAX_OLD_SPACE_SIZE=3072 on larger build hosts.
+ARG NODE_BUILD_MAX_OLD_SPACE_SIZE=2048
+RUN export NODE_OPTIONS="--max-old-space-size=${NODE_BUILD_MAX_OLD_SPACE_SIZE}" \
+    && npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:build && rm -f dist/*.tsbuildinfo
 
 # ===== Stage 2: Production =====
 # Same digest-pinned node:22-slim base as the builder stage.
